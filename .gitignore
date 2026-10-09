@@ -1,0 +1,25 @@
+# Rust / Anchor build output
+target/
+**/*.rs.bk
+.anchor/
+test-ledger/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# Logs (e.g. crank.log from the daily settlement cron)
+*.log
+
+# Secrets: never commit wallets or program keypairs
+*-keypair.json
+id.json
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

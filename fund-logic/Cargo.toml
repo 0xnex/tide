@@ -1,0 +1,10 @@
+[package]
+name = "fund-logic"
+version = "0.1.0"
+edition = "2021"
+description = "BTC 50-day moving-average fund: pure accounting logic (no Solana dependencies)"
+
+[dependencies]
+
+# 独立 workspace：可以在没有 Solana 工具链的机器上直接 cargo test
+[workspace]
