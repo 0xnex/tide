@@ -1,57 +1,178 @@
 # tide
 
-**A pooled Bitcoin fund on Solana that follows one rule: hold BTC when the price is above its 50-day moving average, hold USDC when it is below.**
+**A pooled Bitcoin fund on Solana: hold cbBTC when BTC is above its 50-day moving average, hold USDC when it is below.**
 
-Anyone can deposit USDC and receive fund shares. Once a day, after 01:00 UTC, anyone can trigger settlement: the program records the price published at 01:00 UTC, checks the 50-day moving average, prices all queued deposits and withdrawals at the same net asset value (NAV), and rebalances the whole fund into BTC or USDC.
+> **Devnet prototype. Do not use with real money.** The oracle and exchange are mocks. Mainnet needs a security audit and legal advice: pooling other people's money and charging a performance fee is regulated in many jurisdictions.
 
-> **Status: devnet prototype. Do not use with real money.**
-> Prices come from an admin-controlled mock oracle and swaps go through a mock exchange. Before any mainnet use you need a real oracle (e.g. Pyth), a real swap route (e.g. Jupiter), a professional security audit, and legal advice. Pooling other people's money into a managed strategy is a regulated activity in many jurisdictions.
-
-[中文说明](README.zh-CN.md)
+> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code still runs the original design: one atomic `settle`, with `deposit` / `withdraw` naming. Sections marked *(current code)* describe what runs today.
 
 ---
 
 ## Why this rule
 
-The strategy came out of a backtest study on Binance data (included in the research that led to this project):
+Backtest on Binance data, BTC, Mar 2018 – Sep 2026:
 
-| Approach (BTC, Mar 2018 – Sep 2026) | Total return | Max drawdown |
+| Approach | Total return | Max drawdown |
 |---|---|---|
 | Buy and hold | +872% | −77% |
 | 50-day MA filter | +2,719% | −58% |
 | 100-day MA filter | +2,076% | −39% |
 | 200-day MA filter | +1,083% | −64% |
 
-All three filters cut the deepest drawdowns, mainly by sitting in cash through the 2018 and 2022 bear markets. Which window worked best changed between periods, so treat 50 days as a reasonable default, not an optimum. Past results do not predict future returns, and drawdowns of 40–60% still happened with the filter on.
-
-The same study found that short-term momentum and breakout strategies on altcoins lost money and did worse than random coin selection, which is why this fund holds only BTC.
+- The filters cut drawdowns mainly by holding cash through the 2018 and 2022 bear markets.
+- The best window changed between periods, so treat 50 days as a default, not an optimum.
+- Short-term altcoin strategies lost money in the same study, so the fund holds only BTC.
+- Past results do not predict future returns.
 
 ---
 
 ## How it works
 
-```
- before 01:00 UTC         daily, after 01:00 UTC                  after settlement
-┌──────────────────┐     ┌──────────────────────────────────┐    ┌──────────────────┐
-│ request_deposit  │     │ settle                           │    │ claim            │
-│ request_withdraw │ ──▶ │ 1. read the 01:00 oracle price   │──▶ │ receive shares   │
-│ (queued)         │     │ 2. 50-day MA → BTC or USDC       │    │ or USDC          │
-└──────────────────┘     │ 3. NAV → process queue           │    └──────────────────┘
-                         │ 4. swap with slippage guard      │
-                         └──────────────────────────────────┘
+### One day
+
+```mermaid
+flowchart LR
+  A["Any time<br/>subscribe · redeem<br/>cancel before 01:00"] --> B["01:00 UTC<br/>fixing step"]
+  B --> C["01:00–01:30<br/>keeper trades"]
+  C --> D["After 01:30<br/>anyone trades<br/>tighter slippage"]
+  D --> E["Claim<br/>shares or USDC"]
+  D -. "unfinished at next 01:00" .-> B
 ```
 
-### Design decisions
+### Fixing step (01:00 UTC)
 
-- **Forward pricing.** Deposits and withdrawals are queued and filled at the *next* settlement's NAV. Nobody can buy in at a stale price after BTC has already moved.
-- **Fixed pricing time.** NAV and the BTC/USDC signal use the oracle price published in the first 60 seconds after 01:00 UTC, no matter when `settle` is called, so the caller cannot pick a favourable moment. The swap itself is sized from the latest price, which may differ from the 01:00 price by at most 1%; otherwise settlement reverts and that day is skipped.
-- **Queue closes at the fixing time.** Between 01:00 UTC and that day's settlement, `request_deposit` and `request_withdraw` are rejected, because the 01:00 price is already public. Requests reopen right after settlement (for the next day) or at 00:00 UTC the next day if nobody settled.
-- **Internal accounting.** NAV is computed from the program's own records, not token-account balances, so tokens sent directly to a vault cannot manipulate the share price.
-- **Exact pro-rata claims.** Each epoch's shares and payouts are split pro-rata; the last claimant receives the exact remainder. No rounding dust accumulates. (An earlier version left dust shares that could permanently lock the fund once all real holders exited — caught by randomized tests and fixed.)
-- **Slippage guard.** A swap that returns less than the oracle price minus `max_slippage_bps` (default 0.3%: Binance's 0.075% fee plus about 0.1% slippage, with headroom for oracle-vs-exchange price differences) reverts the whole settlement.
-- **Full exits never get stuck.** If selling BTC to pay withdrawals leaves USDC slightly short because of trading costs, that period's withdrawers absorb the shortfall pro-rata.
-- **Optional fees.** Deposit and withdrawal fees (default 0) stay inside the fund, so the people generating trades pay their own trading costs.
-- **Permissionless settlement.** Anyone can call `settle`; a cron job (`scripts/crank.ts`) does it daily on devnet. With the mock oracle there is only one price, so it must be written and settled within 60 seconds of 01:00 UTC; a real oracle (Pyth) can supply the 01:00 price later in the day.
+```mermaid
+flowchart TD
+  BTC["Pyth BTC/USD<br/>signal price"] --> MA["50-day moving average"]
+  BTC --> SIG{"price > MA?"}
+  MA --> SIG
+  SIG -- yes --> T1["target: all cbBTC"]
+  SIG -- no --> T2["target: all USDC"]
+  CB["Pyth cbBTC/USD<br/>valuation price"] --> NAV["NAV"]
+  NAV --> FEE["performance fee<br/>(gains above high-water mark)"]
+  FEE --> SL["set aside redemption slice"]
+  SL --> NET["net against subscriptions"]
+```
+
+### Where the money goes
+
+```mermaid
+flowchart LR
+  SUB["Subscribers' USDC"] -- "netted part" --> RED["Redeemers"]
+  SLICE["Redemption slice<br/>(cbBTC + USDC)"] -- "netted part" --> FUND["Fund<br/>→ shares for subscribers"]
+  SUB -- "remainder: buy on Jupiter" --> FUND
+  SLICE -- "remainder: sell on Jupiter" --> RED
+```
+
+Netting uses the valuation price. Only the difference trades on Jupiter, and each side pays for its own trades ([ADR 0002](docs/adr/0002-flows-pay-their-own-execution.md)).
+
+### Trade order
+
+```mermaid
+flowchart LR
+  A["1. Unsold redemption slices<br/>oldest first"] --> B["2. Pending subscriptions<br/>oldest first"] --> C["3. Fund toward target"]
+```
+
+### Every trade
+
+```mermaid
+flowchart TD
+  S["trade requested"] --> W{"01:00–01:30?"}
+  W -- yes --> K{"caller is keeper?"}
+  K -- no --> R["reject"]
+  K -- yes --> I
+  W -- no --> I{"≥ 60 s since last trade?"}
+  I -- no --> R
+  I -- yes --> D{"buying cbBTC while<br/>cbBTC/BTC gap > 2%?"}
+  D -- yes --> R
+  D -- no --> Z["size = min(remaining, 200K USDC)"]
+  Z --> J["Jupiter swap"]
+  J --> M{"out ≥ min_out?<br/>valuation price now − bound<br/>keeper 0.3% · others 0.1%"}
+  M -- no --> V["revert this trade"]
+  M -- yes --> OK["record fill"]
+```
+
+See [ADR 0001](docs/adr/0001-multi-step-settlement.md).
+
+### Subscription
+
+```mermaid
+flowchart LR
+  A["subscribe"] --> Q["Queued"]
+  Q -- "cancel" --> X["USDC refunded"]
+  Q -- "01:00" --> P["Pending<br/>fills part by part"]
+  P -- "filled" --> D["Done"]
+  P -- "cancel rest" --> D
+  D -- "claim" --> SH["Shares"]
+```
+
+| Step | Rule |
+|---|---|
+| subscribe | At most 1M USDC per epoch, including pending |
+| cancel | Until 01:00 |
+| partial fill | Filled part becomes shares at that day's NAV |
+| filled | Fully bought, or target is USDC (no trade needed) |
+| cancel rest | Any time; unfilled USDC refunded, no shares for it |
+
+### Redemption
+
+```mermaid
+flowchart LR
+  A["redeem"] --> Q["Queued"]
+  Q -- "cancel" --> X["Shares returned"]
+  Q -- "01:00" --> S["Selling<br/>part by part"]
+  S -- "sold out" --> C["Claimable"]
+  C -- "claim" --> U["USDC"]
+```
+
+| Step | Rule |
+|---|---|
+| redeem | No cap, can never be paused |
+| cancel | Until 01:00 |
+| 01:00 | Pro-rata redemption slice set aside |
+| sell part | Netting first, then Jupiter, oldest slices first |
+| claim | Actual USDC proceeds, only after the whole slice is sold |
+
+### Prices
+
+```mermaid
+flowchart LR
+  BTC["Pyth BTC/USD"] --> MA["moving average"] & SIG["signal"]
+  CB["Pyth cbBTC/USD"] --> NAV["NAV"] & MIN["trade min_out"]
+  BTC & CB --> G{"gap > 2%?"}
+  G -- "yes: depeg" --> NB["no cbBTC buys<br/>sells and settlement continue"]
+```
+
+Both use prices published in `[01:00, 01:01)` UTC. A missed day is backfilled with that day's Pyth price ([ADR 0003](docs/adr/0003-btc-signal-cbbtc-valuation.md)).
+
+### Performance fee
+
+```mermaid
+flowchart LR
+  N["NAV at 01:00"] --> Q{"NAV > high-water mark?"}
+  Q -- no --> X["no fee"]
+  Q -- yes --> F["5% of gain above mark<br/>→ new shares to fee address"]
+  F --> H["mark := NAV after fee<br/>(never reset)"]
+```
+
+The fee is charged before that epoch's subscriptions and redemptions and is capped at 20% in code ([ADR 0004](docs/adr/0004-performance-fee-high-water-mark.md)).
+
+### Governance
+
+```mermaid
+flowchart LR
+  MS["Admin multisig"] -- "48 h timelock" --> CFG["config: caps, interval, slippage,<br/>depeg threshold, fee rate,<br/>keeper, fee address"]
+  MS -- "immediate" --> P["pause subscriptions"]
+  MS -. "never" .-> N["move fund assets<br/>pause redemptions"]
+```
+
+### Other guarantees
+
+| Guarantee | How |
+|---|---|
+| Donations can't move the share price | NAV comes from internal records, not token balances |
+| No rounding dust | The last claimant of an epoch gets the exact remainder |
+| Settlement never gets stuck | Unfinished work carries into the next settlement; a depeg only blocks buys |
 
 ---
 
@@ -59,105 +180,94 @@ The same study found that short-term momentum and breakout strategies on altcoin
 
 ```
 tide/
-├── fund-logic/              Pure-Rust accounting (no dependencies) + 18 unit tests
-│   └── src/lib.rs
-├── programs/tide/           Anchor program: account validation and token transfers
-│   └── src/lib.rs
-├── tests/tide.ts            End-to-end test using bankrun (time-travels across 4 days)
-├── scripts/crank.ts         Daily settlement script for devnet
-├── Anchor.toml
-├── Cargo.toml               Workspace (the program)
-├── package.json
-├── AGENTS.md                Guide for AI coding agents and contributors
-└── README.zh-CN.md          Chinese README
+├── fund-logic/          Pure-Rust accounting + unit tests
+├── programs/tide/       Anchor program: accounts and token transfers
+├── tests/tide.ts        End-to-end test (bankrun, time travel)
+├── scripts/crank.ts     Daily settlement script (devnet)
+├── docs/adr/            Architecture decisions
+├── docs/agents/         Agent skill configuration
+├── CONTEXT.md           Domain vocabulary
+└── AGENTS.md            Rules for agents and contributors
 ```
 
-All money logic lives in `fund-logic` so it can be tested without any Solana tooling. The Anchor program only moves tokens and calls into it.
+```mermaid
+flowchart LR
+  P["programs/tide<br/>accounts · CPIs"] -- "calls" --> L["fund-logic<br/>all money math"]
+  T["tests/tide.ts"] --> P
+  C["scripts/crank.ts"] --> P
+```
 
 ---
 
-## Getting started
+## Getting started *(current code)*
 
-### Prerequisites
-
-- Rust (stable)
-- Solana CLI 2.x
-- Anchor 0.31.1 (install via `avm`)
-- Node.js 20+ and Yarn
-
-### Build and test
+Needs Rust (stable), Solana CLI 2.x, Anchor 0.31.1 (via `avm`), Node.js 20+ and Yarn.
 
 ```bash
-# 1. Pure logic tests — no Solana toolchain needed
-cd fund-logic && cargo test && cd ..
-
-# 2. Generate a program ID and write it into the code
-anchor keys sync
-
-# 3. Build the program
+cd fund-logic && cargo test && cd ..   # logic tests, no Solana toolchain
+anchor keys sync                       # write program ID
 anchor build
-
-# 4. End-to-end tests
-yarn install
-anchor test
+yarn install && anchor test            # end-to-end
 ```
 
-> The Anchor program has not yet been compiled by the original author's environment (it had no access to crates.io or the Solana toolchain). `fund-logic` tests all pass. If `anchor build` fails, the error is most likely a small API mismatch in the wrapper, not in the accounting.
+> The Anchor program has never been compiled in the original author's environment. If `anchor build` fails, the cause is most likely a small API mismatch in the wrapper, not in the accounting.
 
 ### Deploy to devnet
 
 ```bash
-solana config set --url devnet
-solana airdrop 2
+solana config set --url devnet && solana airdrop 2
 anchor deploy --provider.cluster devnet
 ```
 
-Then initialize in this order (see `before()` in `tests/tide.ts`):
+```mermaid
+flowchart LR
+  A["mock USDC (6)<br/>mock BTC (8) mints"] --> B["init_mock_oracle"] --> C["init_mock_market<br/>+ liquidity"] --> D["initialize"] --> E["init_vaults"] --> F["seed_prices<br/>last 49 days"]
+```
 
-1. Create mock USDC (6 decimals) and mock BTC (8 decimals) mints
-2. `init_mock_oracle` with the current BTC price
-3. `init_mock_market` and fund its two vaults with liquidity
-4. `initialize` with your config
-5. `init_vaults`
-6. `seed_prices` with the last 49 daily closing prices, so the moving average works from day one
-
-Run settlement daily at 01:00 UTC (server clock in UTC; the mock price must be posted within 60 seconds of 01:00):
+Run the crank daily at 01:00 UTC. The mock price must be posted within 60 s:
 
 ```cron
 0 1 * * * cd /path/to/tide && ANCHOR_PROVIDER_URL=https://api.devnet.solana.com ANCHOR_WALLET=$HOME/.config/solana/id.json yarn ts-node scripts/crank.ts >> crank.log 2>&1
 ```
 
-The crank script reads the BTC price from Binance's public API, writes it to the mock oracle (admin wallet required), and calls `settle`.
+```mermaid
+flowchart LR
+  BN["Binance API<br/>BTC price"] --> CR["crank.ts"] -- "set_mock_price" --> O["mock oracle"]
+  CR -- "settle" --> P["tide program"]
+```
 
 ---
 
-## Program reference
-
-### Instructions
+## Program reference *(current code)*
 
 | Instruction | Who | Purpose |
 |---|---|---|
-| `initialize(config)` | admin | Create the fund account and share mint |
+| `initialize(config)` | admin | Create fund account and share mint |
 | `init_vaults` | admin | Create the five fund-owned token accounts |
-| `seed_prices(prices)` | admin | Pre-load up to `window` historical prices; only before the first settlement |
-| `request_deposit(amount)` | anyone | Queue a USDC deposit for the current epoch |
-| `request_withdraw(shares)` | holder | Queue a share redemption for the current epoch |
-| `settle` | anyone | Daily settlement after `settle_offset_secs` past 00:00 UTC |
-| `claim` | depositor / withdrawer | Collect shares or USDC from a settled epoch |
-| `init_mock_oracle`, `set_mock_price` | admin | Devnet only |
-| `init_mock_market` | admin | Devnet only |
+| `seed_prices(prices)` | admin | Pre-load historical prices, before the first settlement only |
+| `request_deposit(amount)` | anyone | Queue a subscription |
+| `request_withdraw(shares)` | holder | Queue a redemption |
+| `settle` | anyone | Daily settlement after `settle_offset_secs` |
+| `claim` | subscriber / redeemer | Collect shares or USDC |
+| `init_mock_oracle`, `set_mock_price`, `init_mock_market` | admin | Devnet only |
 
 ### Configuration
 
-| Field | Default | Meaning |
-|---|---|---|
-| `window` | 50 | Moving-average length in days (max 64) |
-| `settle_offset_secs` | 3600 | Seconds after 00:00 UTC before settlement is allowed |
-| `max_slippage_bps` | 30 | Max swap shortfall vs. oracle price |
-| `deposit_fee_bps` | 0 | Retained by the fund |
-| `withdraw_fee_bps` | 0 | Retained by the fund |
-| `min_deposit` | 1 USDC | Minimum deposit |
-| `max_staleness_secs` | 600 | Max oracle price age at settlement |
+| Field | Default | Meaning | |
+|---|---|---|---|
+| `window` | 50 | Moving-average days (max 64) | current |
+| `settle_offset_secs` | 3600 | Fixing time after 00:00 UTC | current |
+| `max_slippage_bps` | 30 | Keeper slippage bound | current |
+| `deposit_fee_bps` / `withdraw_fee_bps` | 0 | Subscription / redemption fee, kept in fund | current |
+| `min_deposit` | 1 USDC | Minimum subscription | current |
+| `max_staleness_secs` | 600 | Max oracle price age | current |
+| Trade cap | 200,000 USDC | Max notional per trade | planned |
+| Min trade interval | 60 s | Time between trades | planned |
+| Public slippage bound | 10 bps | Non-keeper callers after 01:30 | planned |
+| Depeg threshold | 200 bps | cbBTC vs BTC gap that stops buys | planned |
+| Subscription cap | 1,000,000 USDC | Per epoch, incl. pending | planned |
+| Performance fee | 500 bps (max 2,000) | Above high-water mark | planned |
+| Keeper, fee address | set at creation | Change via 48 h timelock | planned |
 
 ### Accounts (PDAs)
 
@@ -177,47 +287,46 @@ The crank script reads the BTC price from Binance's public API, writes it to the
 | Quantity | Unit |
 |---|---|
 | USDC | 6 decimals |
-| BTC (wrapped, e.g. cbBTC) | 8 decimals |
+| cbBTC | 8 decimals |
 | Shares | 6 decimals; first share = 1 USDC |
-| Price | micro-USD per 1 BTC (USD × 10⁶) |
+| Price | micro-USD per 1 BTC |
 | NAV | USDC base units per share base unit × 10¹² |
 
 ---
 
 ## Trade execution
 
-A fund that trades at a fixed time on public rules can be front-run, can move the price on large orders, and can see pool prices drift from the oracle.
-
 | Technique | Purpose | Status |
 |---|---|---|
-| Oracle-based minimum output | Reject bad fills and sandwiches | Implemented |
-| Deposit / withdrawal fees | Flows pay their own trading cost | Implemented (default 0) |
-| TWAP (split into several trades) | Reduce price impact and predictability | Planned, once size warrants it |
+| Oracle-based `min_out` | Reject bad fills and sandwiches | Implemented (per trade in target design) |
+| Capped, spaced trades | Reduce price impact | Designed, ADR 0001 |
+| Flows pay their own execution | Holders who stay don't pay for others | Designed, ADR 0002 |
+| Keeper window + tighter public bound | Limit what third-party callers can extract | Designed |
 | Randomized execution time | Harder to anticipate | Optional |
-| MEV-protected submission (e.g. Jito) | Avoid public mempool exposure | Mainnet |
-| Limit orders (e.g. Jupiter) | Price control | Mainnet |
+| MEV-protected submission (Jito) | Avoid public mempool | Mainnet |
+| Limit orders (Jupiter) | Price control | Mainnet |
 
 ---
 
 ## Roadmap to mainnet
 
-- [ ] Replace mock oracle with Pyth BTC/USD (check confidence interval and publish time)
-- [ ] Replace mock market with Jupiter (route off-chain, verify min-out on-chain against the oracle)
-- [ ] `cancel_request` instruction
-- [ ] Pause switch, multisig admin, timelock on config changes
-- [ ] Monitoring and alerting for missed settlements
-- [ ] TWAP execution
-- [ ] Independent security audit
-- [ ] Legal review in every jurisdiction where the fund is offered
+```mermaid
+flowchart LR
+  A["Rename deposit / withdraw<br/>→ subscription / redemption"] --> B["Migrate fund-logic<br/>ADRs 0001–0004"]
+  B --> C["Pyth BTC/USD +<br/>cbBTC/USD"] & D["Jupiter<br/>route off-chain,<br/>min_out on-chain"]
+  B --> E["Keeper · cancel ·<br/>MA backfill"]
+  B --> F["Multisig · timelock ·<br/>subscription pause"]
+  C & D & E & F --> G["Monitoring"] --> H["Security audit"] --> I["Legal review"]
+```
 
 ### Known limitations
 
-- If nobody calls `settle` on a given day, that day's price is missing; the moving average is computed over the last `window` *observed* prices.
-- Wrapped BTC on Solana (e.g. cbBTC) carries custodian risk on top of BTC price risk.
-- When the fund sells BTC with a margin to cover withdrawals, any leftover USDC stays in cash until the next settlement.
+- *(current code)* A day without `settle` leaves a gap; the average covers the last 50 *observed* prices.
+- cbBTC carries custodian risk. The depeg rule stops new buys but cannot recover lost value.
+- Redemptions pay out only after the slice is fully sold, which can take more than a day in thin liquidity or a depeg.
 
 ---
 
 ## Disclaimer
 
-This software is an experimental prototype provided for educational purposes. It is not investment advice, has not been audited, and may contain bugs that lead to total loss of funds. Historical backtest results do not guarantee future performance.
+Experimental prototype for educational purposes. Not investment advice, not audited, may contain bugs that lose all funds. Backtest results do not guarantee future performance.

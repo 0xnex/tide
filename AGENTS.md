@@ -4,7 +4,9 @@ Guidance for AI coding agents (and human contributors) working on this repositor
 
 ## Project in one paragraph
 
-`tide` is a Solana (Anchor) program for a pooled BTC fund. Users queue USDC deposits and share withdrawals; once a day after 01:00 UTC anyone calls `settle`, which records the oracle price, compares it with the 50-day moving average, fills the queue at a single NAV, and swaps the fund fully into BTC (above the average) or USDC (below). Users then `claim` their shares or USDC. It is a **devnet prototype**: oracle and exchange are mocks.
+`tide` is a Solana (Anchor) program for a pooled BTC fund. Users queue USDC subscriptions and share redemptions; at 01:00 UTC each day the fixing price is recorded, compared with the 50-day moving average, and used to fix that epoch's NAV. Settlement then nets subscriptions against redemptions and rebalances the fund toward all-cbBTC (above the average) or all-USDC (below) through capped trades. Users then `claim` their shares or USDC. It is a **devnet prototype**: oracle and exchange are mocks.
+
+**Design in transition.** The target design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/0001`–`0004` (decisions). The invariants below describe that target design. Until the migration lands, the code still runs the original single-instruction `settle` with `deposit` / `withdraw` naming. Treat any difference between that code and these invariants as migration work to do, not as a rule to restore.
 
 ## Architecture
 
@@ -38,16 +40,33 @@ Before finishing any change: `cd fund-logic && cargo test` must pass. If you tou
 
 ## Invariants — never break these
 
-1. **Forward pricing.** Deposits and withdrawals are only filled inside `settle`, at the NAV computed in that settlement *before* the swap. Never fill at a previously stored NAV.
-2. **Fixed pricing time.** NAV, the moving average and the signal use `SettlePrices.fix`, the price published in `[fix_time, fix_time + FIX_WINDOW_SECS)` where `fix_time` = UTC midnight + `settle_offset_secs`. Never the price at the moment `settle` is called: anyone can call it, so a call-time price lets the caller choose their own fill. `request_deposit` / `request_withdraw` are rejected (`QueueClosed`) from `fix_time` until that day is settled, because the fixing price is already public.
-3. **Internal accounting.** NAV uses `FundState.usdc`, `FundState.btc` and `FundState.share_supply`. Never derive NAV from token-account balances (prevents donation/inflation attacks).
-4. **Exact claims.** `claim` uses `take_pro_rata`, which gives the last claimant the exact remainder. After all tickets of an epoch are claimed, `unclaimed_*` fields are zero and the sum of claims equals the epoch totals.
-5. **Share supply.** `FundState.share_supply` must always equal (shares held by users) + (shares queued for withdrawal). Tests assert this exactly.
-6. **No stuck states.** A settlement must never fail permanently. In particular, a full exit while holding BTC must succeed even with trading costs (`finish_settle` caps the payout to available USDC only when the swap was a `SellBtc`).
-7. **Slippage guard.** Every swap passes `min_out` derived from the latest oracle price (`SettlePrices.exec`); `finish_settle` rejects fills below it, which reverts the whole transaction. `exec` may differ from `fix` by at most `MAX_PRICE_DRIFT_BPS`, otherwise `begin_settle` fails with `PriceDrift` (that day is skipped, the next day settles normally), because in a near-full exit the drift would fall on the holders who stay.
+Use the terms defined in `CONTEXT.md`. Where each invariant applies:
+
+```mermaid
+flowchart LR
+  Q["Queue<br/>never closes<br/>(2)"] --> FX["Fixing step<br/>NAV · fee · slice<br/>(1, 2, 3, 11, 12)"]
+  FX --> TR["Trade steps<br/>(6, 7, 10)"]
+  TR --> CL["Claim<br/>(4, 5)"]
+  TR -. "unfinished at next fixing" .-> FX
+```
+
+1. **Forward pricing.** Subscriptions and redemptions are only filled inside a settlement, against the NAV fixed at the fixing time that closes their epoch, after the performance fee has been accrued. Never fill against a NAV that was public before the request was submitted. Each part of a subscription becomes shares at the valuation price and NAV of the fixing time of the settlement in which it is filled. A redemption receives what its redemption slice actually sells for (ADR 0002).
+2. **Fixed pricing time.** NAV, the moving average and the signal use fixing prices published in `[fix_time, fix_time + FIX_WINDOW_SECS)`, never the price when an instruction is called. A request submitted after a fixing time belongs to the next epoch, so the queue never closes. A request can be cancelled until the fixing time that closes its epoch; a pending subscription can be cancelled at any time.
+3. **Internal accounting.** NAV uses `FundState.usdc`, `FundState.btc` and `FundState.share_supply`. Never derive NAV from token-account balances (prevents donation/inflation attacks). Redemption slices and pending subscriptions are tracked separately and are not fund assets.
+4. **Exact claims.** `claim` uses `take_pro_rata`, which gives the last claimant the exact remainder. After all tickets of an epoch are claimed, `unclaimed_*` fields are zero and the sum of claims equals the epoch totals. Redemptions become claimable only once that epoch's redemption slice is fully sold.
+5. **Share supply.** `FundState.share_supply` must always equal (shares held by users, including the manager) + (shares queued for redemption). Tests assert this exactly.
+6. **No stuck states.** A settlement must never fail permanently. Work left at the next fixing time carries into the next settlement. Unsold redemption slices keep selling first, and pending subscriptions stay the user's until filled or cancelled. A depeg blocks buying cbBTC, never selling it or settling.
+7. **Trade guards.** Every trade:
+   - is at most the trade cap in USDC notional;
+   - comes at least `min_trade_interval_secs` after the previous trade;
+   - passes a depeg check;
+   - passes `min_out` derived from the valuation price at the moment it executes.
+   The keeper uses `max_slippage_bps`. After the keeper window, other callers get a tighter bound. A fill below `min_out` reverts that trade. Trades are not compared with the fixing price (ADR 0001).
 8. **Integer math only.** No floats in `fund-logic` or the program. Use `u128` intermediates and checked arithmetic; round in favor of the fund (down for amounts paid out, up for amounts the fund must sell to cover a payout).
-9. **One settlement per UTC day,** only after `settle_offset_secs`.
-10. **Atomicity.** In `settle`, all token movements and the `finish_settle` check happen in one instruction so any failure rolls everything back.
+9. **One settlement per epoch,** opened at its fixing time. Only the keeper may drive it during the keeper window; after that, anyone may.
+10. **Step atomicity.** Settlement is several instructions (ADR 0001). Within each instruction, all token movements and checks happen together, so a failure rolls that step back. The state between steps must always let the next step resume.
+11. **Two price feeds.** The signal and moving average use Pyth BTC/USD; NAV, `min_out` and the depeg check use Pyth cbBTC/USD (ADR 0003). A missed day's fixing price may be backfilled only with a Pyth update published in that day's fixing window.
+12. **Performance fee.** Accrued at the fixing time before any fills, only on NAV above the high-water mark, which never resets. It is paid as new shares to the fee address fixed at `initialize`. The rate is capped at 20% in code (ADR 0004).
 
 ## Keeping the two layers in sync
 
@@ -107,7 +126,8 @@ Changing seeds breaks existing deployments and the tests/scripts that derive the
 - [ ] Only the fund PDA can move vault tokens; signer seeds are `["fund", admin, bump]`.
 - [ ] No arithmetic that can overflow or underflow without a checked operation.
 - [ ] No path where a user can claim twice, claim another user's ticket, or claim before settlement.
-- [ ] No new instruction lets the admin take user funds. (Currently the admin cannot withdraw from vaults; keep it that way.)
+- [ ] No new instruction lets the admin take user funds. The admin cannot withdraw from vaults. The only value that goes to a non-user is the performance fee, minted as shares to the fee address fixed at `initialize` (ADR 0004).
+- [ ] The admin is a multisig. Config changes (trade cap, trade interval, slippage, depeg threshold, fee rate, keeper, fee address) go through a 48-hour timelock. The only immediate admin action is pausing subscriptions; redemptions can never be paused.
 - [ ] The fund cannot end up in a state where `settle` always fails.
 
 ## Things not to do
@@ -122,3 +142,17 @@ Changing seeds breaks existing deployments and the tests/scripts that derive the
 - Rust: `rustfmt` defaults (edition 2021). Small pure functions in `fund-logic`; return `Result<_, FundError>`.
 - Comments explain *why*, especially around rounding direction and ordering inside `settle`.
 - TypeScript: keep helper functions in tests small; derive PDAs with the same seeds as the program.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues on `0xnex/tide`, managed with the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
