@@ -110,7 +110,7 @@ pub struct Config {
     pub public_slippage_bps: u16,     // 窗口之后其他人交易的滑点上限，比 max_slippage_bps 更严
     pub withdrawal_fee_bps: u16,      // 取款费率（领取赎回款时欠管理人），最多 1%
     pub subscription_cap_usdc: u64,   // 申购上限：还没买完的申购（排队的加待成交的）最多这么多
-    pub signal_feed: SignalFeed,      // 信号价格源，创建时设定，只能通过时间锁修改
+    pub signal_feed: SignalFeed,      // 信号价格源，默认 BTC/USD；创建时设定，只能通过时间锁修改
 }
 
 impl Config {
@@ -129,7 +129,7 @@ impl Config {
             public_slippage_bps: 10,
             withdrawal_fee_bps: 100,
             subscription_cap_usdc: 1_000_000_000_000, // 1,000,000 USDC
-            signal_feed: SignalFeed::CbBtc,
+            signal_feed: SignalFeed::Btc,
         }
     }
 
@@ -1952,6 +1952,7 @@ mod tests {
     #[test]
     fn share_claims_and_refunds_pay_no_withdrawal_fee() {
         let mut h = Harness::seeded(50_000 * USDC);
+        h.c.signal_feed = SignalFeed::CbBtc; // 两个价格源：cbBTC/USD 作信号，BTC/USD 检查脱锚
         let mut ta = Ticket::default();
         h.subscribe(&mut ta, 1_000 * USDC, 10 * DAY);
         h.settle_day(10, 51_000 * USDC, 0);
@@ -2141,6 +2142,11 @@ mod tests {
     #[test]
     fn fix_price_must_be_published_in_fix_window() {
         let s = FundState::new();
+        // 两个价格源：cbBTC/USD 作信号，BTC/USD 是参照
+        let c = Config {
+            signal_feed: SignalFeed::CbBtc,
+            ..cfg()
+        };
         let fix_at = 10 * DAY + ONE_AM;
         let now = fix_at + 5 * 3600;
         // 两个价格的发布时间分别设置
@@ -2155,7 +2161,7 @@ mod tests {
             }),
         };
         let run_both = |now: i64, ts: i64, tv: i64| {
-            fix(&mut s.clone(), now, &at(ts, tv), Caller::Keeper, &cfg()).map(|_| ())
+            fix(&mut s.clone(), now, &at(ts, tv), Caller::Keeper, &c).map(|_| ())
         };
         let run = |now: i64, t: i64| run_both(now, t, t);
         assert_eq!(run(now, fix_at), Ok(()));
@@ -2170,7 +2176,7 @@ mod tests {
         assert_eq!(run(fix_at + 10, fix_at + 20), bad);
         // 选定的 cbBTC/USD 必须在窗口内；BTC/USD 参照不在窗口内时不用它（只是不轧差），定价照常
         assert_eq!(run_both(now, fix_at, now), bad);
-        let r = fix(&mut s.clone(), now, &at(now, fix_at), Caller::Keeper, &cfg()).unwrap();
+        let r = fix(&mut s.clone(), now, &at(now, fix_at), Caller::Keeper, &c).unwrap();
         assert_eq!(r.record.reference_price, 0);
     }
 
@@ -2379,6 +2385,7 @@ mod tests {
     #[test]
     fn subscriptions_are_capped_per_epoch_including_pending() {
         let mut h = Harness::seeded(50_000 * USDC);
+        h.c.signal_feed = SignalFeed::CbBtc; // 两个价格源：cbBTC/USD 作信号，BTC/USD 检查脱锚
         assert_eq!(h.c.subscription_cap_usdc, 1_000_000 * USDC);
         let (mut ta, mut tb, mut holder) =
             (Ticket::default(), Ticket::default(), Ticket::default());
@@ -2441,6 +2448,7 @@ mod tests {
     #[test]
     fn a_pending_cancel_refunds_the_unfilled_usdc_after_the_subscription_fee() {
         let mut h = Harness::seeded(50_000 * USDC);
+        h.c.signal_feed = SignalFeed::CbBtc; // 两个价格源：cbBTC/USD 作信号，BTC/USD 检查脱锚
         h.c.subscription_fee_bps = 100;
         let mut ta = Ticket::default();
         h.subscribe(&mut ta, 1_000 * USDC, 10 * DAY);
@@ -2650,6 +2658,7 @@ mod tests {
         assert_eq!(cfg().public_slippage_bps, 10);
         assert_eq!(cfg().withdrawal_fee_bps, 100);
         assert_eq!(cfg().subscription_cap_usdc, 1_000_000 * USDC);
+        assert_eq!(cfg().signal_feed, SignalFeed::Btc);
     }
 
     #[test]
@@ -2663,10 +2672,10 @@ mod tests {
         let fix11 = 11 * DAY + ONE_AM;
         let p = at_fix2(11, 52_000 * USDC, 51_500 * USDC);
 
-        // 默认用 cbBTC/USD：均线记录 cbBTC 的定价价格，BTC/USD 只作脱锚检查的参照
+        // 用 cbBTC/USD：均线记录 cbBTC 的定价价格，BTC/USD 只作脱锚检查的参照
         let mut cb = h.clone();
+        cb.c.signal_feed = SignalFeed::CbBtc;
         let r = cb.fix_with(fix11, &p).unwrap();
-        assert_eq!(cb.c.signal_feed, SignalFeed::CbBtc);
         assert_eq!(
             (r.signal_price, r.reference_price),
             (51_500 * USDC, 52_000 * USDC)
@@ -2676,8 +2685,8 @@ mod tests {
             (48 * 50_000 + 51_000 + 51_500) * USDC / 50
         );
 
-        // 没有 cbBTC/USD 时用 BTC/USD：均线记录 BTC 的定价价格，没有参照
-        h.c.signal_feed = SignalFeed::Btc;
+        // 默认用 BTC/USD：均线记录 BTC 的定价价格，没有参照
+        assert_eq!(h.c.signal_feed, SignalFeed::Btc);
         let r = h.fix_with(fix11, &p).unwrap();
         assert_eq!((r.signal_price, r.reference_price), (52_000 * USDC, 0));
         assert_eq!(
@@ -2690,6 +2699,7 @@ mod tests {
     #[test]
     fn the_depeg_check_runs_only_when_both_feeds_exist() {
         let mut h = Harness::seeded(50_000 * USDC);
+        h.c.signal_feed = SignalFeed::CbBtc; // 两个价格源：cbBTC/USD 作信号，BTC/USD 检查脱锚
         let mut t = Ticket::default();
         h.subscribe(&mut t, 1_000 * USDC, 10 * DAY);
         h.fix_day(10, 51_000 * USDC);
@@ -2734,6 +2744,7 @@ mod tests {
         // A 持有 cbBTC，赎回一半；B 申购。定价时 BTC/USD 参照缺失或不是定价时刻发布的：
         // 照常定价，但不轧差；赎回资产照常卖出，买入等参照恢复
         let mut h = Harness::seeded(50_000 * USDC);
+        h.c.signal_feed = SignalFeed::CbBtc; // 两个价格源：cbBTC/USD 作信号，BTC/USD 检查脱锚
         let (mut ta, mut tb) = (Ticket::default(), Ticket::default());
         h.subscribe(&mut ta, 1_000 * USDC, 10 * DAY);
         h.settle_day(10, 51_000 * USDC, 0);
@@ -3090,6 +3101,7 @@ mod tests {
         // 长时间脱锚：申购一直买不了。待成交申购满了之后，新一期的申购退款，
         // 定价照常进行，赎回不受影响。
         let mut h = Harness::seeded(50_000 * USDC);
+        h.c.signal_feed = SignalFeed::CbBtc; // 两个价格源：cbBTC/USD 作信号，BTC/USD 检查脱锚
         h.c.subscription_fee_bps = 100;
         let mut holder = Ticket::default();
         h.subscribe(&mut holder, 10_000 * USDC, 9 * DAY);
@@ -3233,6 +3245,7 @@ mod tests {
     #[test]
     fn trade_min_out_uses_the_valuation_price_at_execution() {
         let mut h = Harness::seeded(50_000 * USDC);
+        h.c.signal_feed = SignalFeed::CbBtc; // 两个价格源：cbBTC/USD 作信号，BTC/USD 检查脱锚
         let mut t = Ticket::default();
         h.subscribe(&mut t, 1_000 * USDC, 10 * DAY);
         h.fix_day(10, 51_000 * USDC);
@@ -3272,6 +3285,7 @@ mod tests {
     #[test]
     fn depeg_blocks_buys_but_not_sells_or_fixing() {
         let mut h = Harness::seeded(50_000 * USDC);
+        h.c.signal_feed = SignalFeed::CbBtc; // 两个价格源：cbBTC/USD 作信号，BTC/USD 检查脱锚
         let mut t = Ticket::default();
         h.subscribe(&mut t, 1_000 * USDC, 10 * DAY);
         // 信号要求持有 cbBTC，但 cbBTC 比 BTC 低 3%：定价照常，买入被拒绝
@@ -4019,9 +4033,9 @@ mod tests {
             let mut rng = Rng(seed);
             let mut h = Harness::seeded(50_000 * USDC);
             h.c.trade_cap_usdc = 2_000 * USDC; // 用户的金额相对上限较大，每天多笔交易
-                                               // 一半的种子没有 cbBTC/USD 价格源：信号和成交都用 BTC/USD
-            if seed % 2 == 0 {
-                h.c.signal_feed = SignalFeed::Btc;
+                                               // 一半的种子用 cbBTC/USD 作信号（BTC/USD 检查脱锚），另一半用默认的 BTC/USD
+            if seed % 2 == 1 {
+                h.c.signal_feed = SignalFeed::CbBtc;
             }
             let mut users = Users::new(8);
             let mut tally = Tally::default();
@@ -4122,6 +4136,8 @@ mod tests {
             let mut rng = Rng(seed * 7919);
             let mut h = Harness::seeded(50_000 * USDC);
             h.c.trade_cap_usdc = 1_000 * USDC;
+            // 两个价格源，才有脱锚
+            h.c.signal_feed = SignalFeed::CbBtc;
             // 申购上限设得小一些（用户每笔最多 3,000），有时会被拒绝
             h.c.subscription_cap_usdc = 6_000 * USDC;
             let mut users = Users::new(6);

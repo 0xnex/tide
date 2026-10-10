@@ -4,7 +4,7 @@
 
 > **Devnet prototype. Do not use with real money.** The oracle and exchange are mocks. Mainnet needs a security audit and legal advice: pooling other people's money and charging a fee for managing it is regulated in many jurisdictions.
 
-> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code runs settlement as a fixing step plus capped trades. Redeemers are paid their slice's actual proceeds, and subscriptions become shares by the cbBTC they add. The config timelock, subscription pause, moving-average backfill, 1% withdrawal fee, subscription cap and pending cancels are built. The signal uses cbBTC/USD, or BTC/USD when `signal_feed` says there is no cbBTC/USD feed. Sections marked *(current code)* describe what runs today.
+> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code runs settlement as a fixing step plus capped trades. Redeemers are paid their slice's actual proceeds, and subscriptions become shares by the cbBTC they add. The config timelock, subscription pause, moving-average backfill, 1% withdrawal fee, subscription cap and pending cancels are built. The signal uses the feed named by `signal_feed`: BTC/USD by default, or cbBTC/USD. Sections marked *(current code)* describe what runs today.
 
 ---
 
@@ -264,7 +264,7 @@ flowchart LR
 | `min_subscription` | 1 USDC | Minimum subscription | current |
 | `max_staleness_secs` | 600 | Max oracle price age | current |
 | `depeg_threshold_bps` | 200 | cbBTC vs BTC gap that stops buys (with `CbBtc`; a missing BTC/USD reference also stops buys) | current |
-| `signal_feed` | `CbBtc` | `CbBtc`: signal, moving average, netting and `min_out` use cbBTC/USD, and BTC/USD (if present) is the depeg reference. `Btc`: no cbBTC/USD feed, everything uses BTC/USD and there is no depeg check. Change via 48 h timelock; switching mixes the two feeds in the moving average for up to 50 days | current |
+| `signal_feed` | `Btc` | `CbBtc`: signal, moving average, netting and `min_out` use cbBTC/USD, and BTC/USD is the depeg reference (a missing or stale reference blocks buys). `Btc`: no cbBTC/USD feed, everything uses BTC/USD and there is no depeg check. Change via 48 h timelock; switching mixes the two feeds in the moving average for up to 50 days | current |
 | `trade_cap_usdc` | 200,000 USDC | Max notional per trade | current |
 | `min_trade_interval_secs` | 60 | Seconds between trades | current |
 | `public_slippage_bps` | 10 | Non-keeper callers after the window (≤ `max_slippage_bps`) | current |
