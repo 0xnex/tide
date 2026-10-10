@@ -70,7 +70,7 @@ pub mod tide {
     // 申购、赎回、领取
     // ------------------------------------------------------------------
 
-    pub fn request_deposit(ctx: Context<RequestDeposit>, amount: u64) -> Result<()> {
+    pub fn request_subscription(ctx: Context<RequestSubscription>, amount: u64) -> Result<()> {
         let fund = &mut ctx.accounts.fund;
         let ticket = &mut ctx.accounts.ticket;
         if ticket.owner == Pubkey::default() {
@@ -86,14 +86,14 @@ pub mod tide {
             FundErrorCode::ClaimFirst
         );
         let now = Clock::get()?.unix_timestamp;
-        logic::request_deposit(&mut st, &mut t, amount, now, &cfg).map_err(map_err)?;
+        logic::request_subscription(&mut st, &mut t, amount, now, &cfg).map_err(map_err)?;
 
         token::transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
                 Transfer {
                     from: ctx.accounts.user_usdc.to_account_info(),
-                    to: ctx.accounts.deposit_escrow.to_account_info(),
+                    to: ctx.accounts.subscription_escrow.to_account_info(),
                     authority: ctx.accounts.user.to_account_info(),
                 },
             ),
@@ -104,7 +104,7 @@ pub mod tide {
         Ok(())
     }
 
-    pub fn request_withdraw(ctx: Context<RequestWithdraw>, shares: u64) -> Result<()> {
+    pub fn request_redemption(ctx: Context<RequestRedemption>, shares: u64) -> Result<()> {
         let fund = &mut ctx.accounts.fund;
         let ticket = &mut ctx.accounts.ticket;
         if ticket.owner == Pubkey::default() {
@@ -120,7 +120,7 @@ pub mod tide {
             FundErrorCode::ClaimFirst
         );
         let now = Clock::get()?.unix_timestamp;
-        logic::request_withdraw(&mut st, &mut t, shares, now, &cfg).map_err(map_err)?;
+        logic::request_redemption(&mut st, &mut t, shares, now, &cfg).map_err(map_err)?;
 
         token::transfer(
             CpiContext::new(
@@ -217,22 +217,22 @@ pub mod tide {
         let fund_ai = ctx.accounts.fund.to_account_info();
 
         // 1) 申购款从托管账户转入主账户
-        if out.record.deposit_usdc > 0 {
+        if out.record.subscription_usdc > 0 {
             token::transfer(
                 CpiContext::new_with_signer(
                     tp.clone(),
                     Transfer {
-                        from: ctx.accounts.deposit_escrow.to_account_info(),
+                        from: ctx.accounts.subscription_escrow.to_account_info(),
                         to: ctx.accounts.usdc_vault.to_account_info(),
                         authority: fund_ai.clone(),
                     },
                     fund_signer,
                 ),
-                out.record.deposit_usdc,
+                out.record.subscription_usdc,
             )?;
         }
         // 2) 销毁本期赎回的份额（用户申请赎回时已转入份额托管账户）
-        if out.record.withdraw_shares > 0 {
+        if out.record.redemption_shares > 0 {
             token::burn(
                 CpiContext::new_with_signer(
                     tp.clone(),
@@ -243,7 +243,7 @@ pub mod tide {
                     },
                     fund_signer,
                 ),
-                out.record.withdraw_shares,
+                out.record.redemption_shares,
             )?;
         }
         // 3) 为本期申购发行新份额，放在份额托管账户，等用户领取
@@ -391,9 +391,9 @@ pub struct ConfigData {
     pub window: u8,
     pub settle_offset_secs: i64,
     pub max_slippage_bps: u16,
-    pub deposit_fee_bps: u16,
-    pub withdraw_fee_bps: u16,
-    pub min_deposit: u64,
+    pub subscription_fee_bps: u16,
+    pub redemption_fee_bps: u16,
+    pub min_subscription: u64,
     pub max_staleness_secs: i64, // 预言机价格最多允许多旧
 }
 
@@ -403,9 +403,9 @@ impl ConfigData {
             window: self.window,
             settle_offset_secs: self.settle_offset_secs,
             max_slippage_bps: self.max_slippage_bps,
-            deposit_fee_bps: self.deposit_fee_bps,
-            withdraw_fee_bps: self.withdraw_fee_bps,
-            min_deposit: self.min_deposit,
+            subscription_fee_bps: self.subscription_fee_bps,
+            redemption_fee_bps: self.redemption_fee_bps,
+            min_subscription: self.min_subscription,
         }
     }
 }
@@ -415,8 +415,8 @@ pub struct StateData {
     pub usdc: u64,
     pub btc: u64,
     pub share_supply: u64,
-    pub pending_deposit_usdc: u64,
-    pub pending_withdraw_shares: u64,
+    pub queued_subscription_usdc: u64,
+    pub queued_redemption_shares: u64,
     pub prices: [u64; 64], // 必须等于 fund_logic::MAX_WINDOW（IDL 需要字面量长度）
     pub price_count: u8,
     pub price_head: u8,
@@ -431,8 +431,8 @@ impl StateData {
             usdc: s.usdc,
             btc: s.btc,
             share_supply: s.share_supply,
-            pending_deposit_usdc: s.pending_deposit_usdc,
-            pending_withdraw_shares: s.pending_withdraw_shares,
+            queued_subscription_usdc: s.queued_subscription_usdc,
+            queued_redemption_shares: s.queued_redemption_shares,
             prices: s.prices,
             price_count: s.price_count,
             price_head: s.price_head,
@@ -446,8 +446,8 @@ impl StateData {
             usdc: self.usdc,
             btc: self.btc,
             share_supply: self.share_supply,
-            pending_deposit_usdc: self.pending_deposit_usdc,
-            pending_withdraw_shares: self.pending_withdraw_shares,
+            queued_subscription_usdc: self.queued_subscription_usdc,
+            queued_redemption_shares: self.queued_redemption_shares,
             prices: self.prices,
             price_count: self.price_count,
             price_head: self.price_head,
@@ -478,8 +478,8 @@ pub struct Ticket {
     pub fund: Pubkey,
     pub owner: Pubkey,
     pub epoch: u64,
-    pub deposit_usdc: u64,
-    pub withdraw_shares: u64,
+    pub subscription_usdc: u64,
+    pub redemption_shares: u64,
     pub bump: u8,
 }
 
@@ -487,14 +487,14 @@ impl Ticket {
     fn to_logic(&self) -> logic::Ticket {
         logic::Ticket {
             epoch: self.epoch,
-            deposit_usdc: self.deposit_usdc,
-            withdraw_shares: self.withdraw_shares,
+            subscription_usdc: self.subscription_usdc,
+            redemption_shares: self.redemption_shares,
         }
     }
     fn set_from_logic(&mut self, t: &logic::Ticket) {
         self.epoch = t.epoch;
-        self.deposit_usdc = t.deposit_usdc;
-        self.withdraw_shares = t.withdraw_shares;
+        self.subscription_usdc = t.subscription_usdc;
+        self.redemption_shares = t.redemption_shares;
     }
 }
 
@@ -507,14 +507,14 @@ pub struct EpochRecord {
     pub price: u64,
     pub moving_average: u64,
     pub nav: u128,
-    pub deposit_usdc: u64,
+    pub subscription_usdc: u64,
     pub minted_shares: u64,
-    pub withdraw_shares: u64,
+    pub redemption_shares: u64,
     pub payout_usdc: u64,
     pub in_btc_after: bool,
-    pub unclaimed_deposit_usdc: u64,
+    pub unclaimed_subscription_usdc: u64,
     pub unclaimed_shares: u64,
-    pub unclaimed_withdraw_shares: u64,
+    pub unclaimed_redemption_shares: u64,
     pub unclaimed_payout_usdc: u64,
     pub bump: u8,
 }
@@ -526,17 +526,17 @@ impl EpochRecord {
         self.price = r.price;
         self.moving_average = r.moving_average;
         self.nav = r.nav;
-        self.deposit_usdc = r.deposit_usdc;
+        self.subscription_usdc = r.subscription_usdc;
         self.minted_shares = r.minted_shares;
-        self.withdraw_shares = r.withdraw_shares;
+        self.redemption_shares = r.redemption_shares;
         self.payout_usdc = r.payout_usdc;
         self.in_btc_after = r.in_btc_after;
         self.set_unclaimed(r);
     }
     fn set_unclaimed(&mut self, r: &logic::EpochRecord) {
-        self.unclaimed_deposit_usdc = r.unclaimed_deposit_usdc;
+        self.unclaimed_subscription_usdc = r.unclaimed_subscription_usdc;
         self.unclaimed_shares = r.unclaimed_shares;
-        self.unclaimed_withdraw_shares = r.unclaimed_withdraw_shares;
+        self.unclaimed_redemption_shares = r.unclaimed_redemption_shares;
         self.unclaimed_payout_usdc = r.unclaimed_payout_usdc;
     }
     fn to_logic(&self) -> logic::EpochRecord {
@@ -546,14 +546,14 @@ impl EpochRecord {
             price: self.price,
             moving_average: self.moving_average,
             nav: self.nav,
-            deposit_usdc: self.deposit_usdc,
+            subscription_usdc: self.subscription_usdc,
             minted_shares: self.minted_shares,
-            withdraw_shares: self.withdraw_shares,
+            redemption_shares: self.redemption_shares,
             payout_usdc: self.payout_usdc,
             in_btc_after: self.in_btc_after,
-            unclaimed_deposit_usdc: self.unclaimed_deposit_usdc,
+            unclaimed_subscription_usdc: self.unclaimed_subscription_usdc,
             unclaimed_shares: self.unclaimed_shares,
-            unclaimed_withdraw_shares: self.unclaimed_withdraw_shares,
+            unclaimed_redemption_shares: self.unclaimed_redemption_shares,
             unclaimed_payout_usdc: self.unclaimed_payout_usdc,
         }
     }
@@ -638,9 +638,9 @@ pub struct InitVaults<'info> {
     #[account(init, payer = admin, seeds = [b"btc_vault", fund.key().as_ref()], bump,
               token::mint = btc_mint, token::authority = fund)]
     pub btc_vault: Box<Account<'info, TokenAccount>>,
-    #[account(init, payer = admin, seeds = [b"deposit_escrow", fund.key().as_ref()], bump,
+    #[account(init, payer = admin, seeds = [b"subscription_escrow", fund.key().as_ref()], bump,
               token::mint = usdc_mint, token::authority = fund)]
-    pub deposit_escrow: Box<Account<'info, TokenAccount>>,
+    pub subscription_escrow: Box<Account<'info, TokenAccount>>,
     #[account(init, payer = admin, seeds = [b"payout_vault", fund.key().as_ref()], bump,
               token::mint = usdc_mint, token::authority = fund)]
     pub payout_vault: Box<Account<'info, TokenAccount>>,
@@ -659,7 +659,7 @@ pub struct AdminOnly<'info> {
 }
 
 #[derive(Accounts)]
-pub struct RequestDeposit<'info> {
+pub struct RequestSubscription<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
     #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump)]
@@ -671,14 +671,14 @@ pub struct RequestDeposit<'info> {
     pub ticket: Box<Account<'info, Ticket>>,
     #[account(mut, token::mint = fund.usdc_mint, token::authority = user)]
     pub user_usdc: Box<Account<'info, TokenAccount>>,
-    #[account(mut, seeds = [b"deposit_escrow", fund.key().as_ref()], bump)]
-    pub deposit_escrow: Box<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [b"subscription_escrow", fund.key().as_ref()], bump)]
+    pub subscription_escrow: Box<Account<'info, TokenAccount>>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-pub struct RequestWithdraw<'info> {
+pub struct RequestRedemption<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
     #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump)]
@@ -757,8 +757,8 @@ pub struct Settle<'info> {
     pub usdc_vault: Box<Account<'info, TokenAccount>>,
     #[account(mut, seeds = [b"btc_vault", fund.key().as_ref()], bump)]
     pub btc_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut, seeds = [b"deposit_escrow", fund.key().as_ref()], bump)]
-    pub deposit_escrow: Box<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [b"subscription_escrow", fund.key().as_ref()], bump)]
+    pub subscription_escrow: Box<Account<'info, TokenAccount>>,
     #[account(mut, seeds = [b"share_escrow", fund.key().as_ref()], bump)]
     pub share_escrow: Box<Account<'info, TokenAccount>>,
     #[account(mut, seeds = [b"payout_vault", fund.key().as_ref()], bump)]
@@ -832,7 +832,7 @@ pub enum FundErrorCode {
     #[msg("这一期还没结算")]
     EpochNotSettled,
     #[msg("低于最低申购金额")]
-    BelowMinDeposit,
+    BelowMinSubscription,
     #[msg("数量不能为零")]
     ZeroAmount,
     #[msg("历史价格数量超过均线窗口")]
@@ -868,7 +868,7 @@ fn map_err(e: logic::FundError) -> Error {
         E::Overflow => FundErrorCode::Overflow,
         E::NothingToClaim => FundErrorCode::NothingToClaim,
         E::EpochNotSettled => FundErrorCode::EpochNotSettled,
-        E::BelowMinDeposit => FundErrorCode::BelowMinDeposit,
+        E::BelowMinSubscription => FundErrorCode::BelowMinSubscription,
         E::ZeroAmount => FundErrorCode::ZeroAmount,
         E::TooManyPrices => FundErrorCode::TooManyPrices,
         E::QueueClosed => FundErrorCode::QueueClosed,

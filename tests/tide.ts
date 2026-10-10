@@ -113,7 +113,7 @@ describe("tide", () => {
         shareMint,
         usdcVault: pda([Buffer.from("usdc_vault"), fund.toBuffer()]),
         btcVault: pda([Buffer.from("btc_vault"), fund.toBuffer()]),
-        depositEscrow: pda([Buffer.from("deposit_escrow"), fund.toBuffer()]),
+        subscriptionEscrow: pda([Buffer.from("subscription_escrow"), fund.toBuffer()]),
         shareEscrow: pda([Buffer.from("share_escrow"), fund.toBuffer()]),
         payoutVault: pda([Buffer.from("payout_vault"), fund.toBuffer()]),
       })
@@ -141,23 +141,23 @@ describe("tide", () => {
       .rpc();
   }
 
-  async function deposit(user: Keypair, userUsdc: PublicKey, amount: number) {
+  async function subscribe(user: Keypair, userUsdc: PublicKey, amount: number) {
     await program.methods
-      .requestDeposit(new BN(amount))
+      .requestSubscription(new BN(amount))
       .accountsPartial({
         user: user.publicKey,
         fund,
         ticket: pda([Buffer.from("ticket"), fund.toBuffer(), user.publicKey.toBuffer()]),
         userUsdc,
-        depositEscrow: pda([Buffer.from("deposit_escrow"), fund.toBuffer()]),
+        subscriptionEscrow: pda([Buffer.from("subscription_escrow"), fund.toBuffer()]),
       })
       .signers([user])
       .rpc();
   }
 
-  async function withdraw(user: Keypair, shares: bigint) {
+  async function redeem(user: Keypair, shares: bigint) {
     await program.methods
-      .requestWithdraw(new BN(shares.toString()))
+      .requestRedemption(new BN(shares.toString()))
       .accountsPartial({
         user: user.publicKey,
         fund,
@@ -210,9 +210,9 @@ describe("tide", () => {
         window: 50,
         settleOffsetSecs: new BN(3_600),
         maxSlippageBps: 30,
-        depositFeeBps: 0,
-        withdrawFeeBps: 0,
-        minDeposit: new BN(USDC),
+        subscriptionFeeBps: 0,
+        redemptionFeeBps: 0,
+        minSubscription: new BN(USDC),
         maxStalenessSecs: new BN(600),
       })
       .accountsPartial({ admin: admin.publicKey, fund, usdcMint: usdcMint.publicKey, btcMint: btcMint.publicKey, shareMint, oracle, market })
@@ -228,8 +228,8 @@ describe("tide", () => {
   });
 
   it("第1天：申购后价格高于均线，买入 BTC", async () => {
-    await deposit(alice, aliceUsdc, 1_000 * USDC);
-    await deposit(bob, bobUsdc, 3_000 * USDC);
+    await subscribe(alice, aliceUsdc, 1_000 * USDC);
+    await subscribe(bob, bobUsdc, 3_000 * USDC);
     await settleDay(55_000);
 
     const f = await program.account.fund.fetch(fund);
@@ -262,7 +262,7 @@ describe("tide", () => {
           shareMint,
           usdcVault: pda([Buffer.from("usdc_vault"), fund.toBuffer()]),
           btcVault: pda([Buffer.from("btc_vault"), fund.toBuffer()]),
-          depositEscrow: pda([Buffer.from("deposit_escrow"), fund.toBuffer()]),
+          subscriptionEscrow: pda([Buffer.from("subscription_escrow"), fund.toBuffer()]),
           shareEscrow: pda([Buffer.from("share_escrow"), fund.toBuffer()]),
           payoutVault: pda([Buffer.from("payout_vault"), fund.toBuffer()]),
         })
@@ -276,7 +276,7 @@ describe("tide", () => {
   it("第2天：Alice 赎回，价格涨 10%，按新净值付款", async () => {
     const aShares = await tokenBalance(getAssociatedTokenAddressSync(shareMint, alice.publicKey));
     const before = await tokenBalance(aliceUsdc);
-    await withdraw(alice, aShares);
+    await redeem(alice, aShares);
     await settleDay(60_500);
     await claim(alice, aliceUsdc);
     const got = Number((await tokenBalance(aliceUsdc)) - before) / USDC;
@@ -297,7 +297,7 @@ describe("tide", () => {
   it("第4天：Bob 全部赎回，份额清零", async () => {
     const bShares = await tokenBalance(getAssociatedTokenAddressSync(shareMint, bob.publicKey));
     const before = await tokenBalance(bobUsdc);
-    await withdraw(bob, bShares);
+    await redeem(bob, bShares);
     await settleDay(41_000);
     await claim(bob, bobUsdc);
     const got = Number((await tokenBalance(bobUsdc)) - before) / USDC;

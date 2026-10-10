@@ -6,7 +6,7 @@ Guidance for AI coding agents (and human contributors) working on this repositor
 
 `tide` is a Solana (Anchor) program for a pooled BTC fund. Users queue USDC subscriptions and share redemptions; at 01:00 UTC each day the fixing price is recorded, compared with the 50-day moving average, and used to fix that epoch's NAV. Settlement then nets subscriptions against redemptions and rebalances the fund toward all-cbBTC (above the average) or all-USDC (below) through capped trades. Users then `claim` their shares or USDC. It is a **devnet prototype**: oracle and exchange are mocks.
 
-**Design in transition.** The target design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/0001`–`0004` (decisions). The invariants below describe that target design. Until the migration lands, the code still runs the original single-instruction `settle` with `deposit` / `withdraw` naming. Treat any difference between that code and these invariants as migration work to do, not as a rule to restore.
+**Design in transition.** The target design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/0001`–`0004` (decisions). The invariants below describe that target design. Until the migration lands, the code still runs the original single-instruction `settle`. Treat any difference between that code and these invariants as migration work to do, not as a rule to restore.
 
 ## Architecture
 
@@ -97,7 +97,7 @@ These are easy to break when editing:
 |---|---|
 | Fund | `"fund", admin` |
 | Share mint | `"share_mint", fund` |
-| Vaults | `"usdc_vault" / "btc_vault" / "deposit_escrow" / "share_escrow" / "payout_vault", fund` |
+| Vaults | `"usdc_vault" / "btc_vault" / "subscription_escrow" / "share_escrow" / "payout_vault", fund` |
 | Ticket | `"ticket", fund, user` |
 | Epoch record | `"epoch", fund, epoch.to_le_bytes()` |
 | Mock oracle / market | `"oracle", authority` / `"market", authority` |

@@ -57,7 +57,7 @@ async function main() {
       shareMint,
       usdcVault: pda([Buffer.from("usdc_vault"), fund.toBuffer()]),
       btcVault: pda([Buffer.from("btc_vault"), fund.toBuffer()]),
-      depositEscrow: pda([Buffer.from("deposit_escrow"), fund.toBuffer()]),
+      subscriptionEscrow: pda([Buffer.from("subscription_escrow"), fund.toBuffer()]),
       shareEscrow: pda([Buffer.from("share_escrow"), fund.toBuffer()]),
       payoutVault: pda([Buffer.from("payout_vault"), fund.toBuffer()]),
     })

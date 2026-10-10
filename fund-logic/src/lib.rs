@@ -45,7 +45,7 @@ pub enum FundError {
     Overflow,
     NothingToClaim,
     EpochNotSettled,
-    BelowMinDeposit,
+    BelowMinSubscription,
     ZeroAmount,
     TooManyPrices,
     QueueClosed,       // 已过定价时刻、当天还没结算，暂停申购赎回
@@ -55,12 +55,12 @@ pub enum FundError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
-    pub window: u8,              // 均线窗口（天），默认 50
-    pub settle_offset_secs: i64, // 每天 UTC 0 点之后多少秒可以结算，默认 3600（1 点）
-    pub max_slippage_bps: u16,   // 兑换相对预言机价格的最大滑点
-    pub deposit_fee_bps: u16,    // 申购费，留在基金里，补偿其他持有人承担的买入成本
-    pub withdraw_fee_bps: u16,   // 赎回费，同上
-    pub min_deposit: u64,        // 最低申购金额（USDC 原始单位）
+    pub window: u8,                // 均线窗口（天），默认 50
+    pub settle_offset_secs: i64,   // 每天 UTC 0 点之后多少秒可以结算，默认 3600（1 点）
+    pub max_slippage_bps: u16,     // 兑换相对预言机价格的最大滑点
+    pub subscription_fee_bps: u16, // 申购费，留在基金里，补偿其他持有人承担的买入成本
+    pub redemption_fee_bps: u16,   // 赎回费，同上
+    pub min_subscription: u64,     // 最低申购金额（USDC 原始单位）
 }
 
 impl Config {
@@ -70,9 +70,9 @@ impl Config {
             settle_offset_secs: 3_600,
             // 在 Binance 成交：0.075% 手续费 + 约 0.1% 滑点，再留出预言机与 Binance 的价差
             max_slippage_bps: 30,
-            deposit_fee_bps: 0,
-            withdraw_fee_bps: 0,
-            min_deposit: 1_000_000, // 1 USDC
+            subscription_fee_bps: 0,
+            redemption_fee_bps: 0,
+            min_subscription: 1_000_000, // 1 USDC
         }
     }
 
@@ -84,8 +84,8 @@ impl Config {
             return Err(FundError::InvalidConfig);
         }
         if self.max_slippage_bps as u128 >= BPS
-            || self.deposit_fee_bps as u128 >= BPS
-            || self.withdraw_fee_bps as u128 >= BPS
+            || self.subscription_fee_bps as u128 >= BPS
+            || self.redemption_fee_bps as u128 >= BPS
         {
             return Err(FundError::InvalidConfig);
         }
@@ -95,14 +95,14 @@ impl Config {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FundState {
-    pub usdc: u64,                 // 基金主账户 USDC（不含排队中的申购款、待领取的赎回款）
-    pub btc: u64,                  // 基金持有的 BTC
-    pub share_supply: u64,         // 已发行份额（含排队赎回、尚未销毁的份额）
-    pub pending_deposit_usdc: u64, // 本期排队的申购款
-    pub pending_withdraw_shares: u64, // 本期排队赎回的份额
+    pub usdc: u64,         // 基金主账户 USDC（不含排队中的申购款、待领取的赎回款）
+    pub btc: u64,          // 基金持有的 BTC
+    pub share_supply: u64, // 已发行份额（含排队赎回、尚未销毁的份额）
+    pub queued_subscription_usdc: u64, // 本期排队的申购款
+    pub queued_redemption_shares: u64, // 本期排队赎回的份额
     pub prices: [u64; MAX_WINDOW], // 每日价格环形缓冲
-    pub price_count: u8,           // 已记录的价格数量（最多 window）
-    pub price_head: u8,            // 下一个写入位置
+    pub price_count: u8,   // 已记录的价格数量（最多 window）
+    pub price_head: u8,    // 下一个写入位置
     pub in_btc: bool,
     pub last_settled_day: i64, // 最近一次结算的日期序号（unix 秒 / 86400），-1 表示从未结算
     pub epoch: u64,            // 当前开放申购/赎回的期号
@@ -114,8 +114,8 @@ impl FundState {
             usdc: 0,
             btc: 0,
             share_supply: 0,
-            pending_deposit_usdc: 0,
-            pending_withdraw_shares: 0,
+            queued_subscription_usdc: 0,
+            queued_redemption_shares: 0,
             prices: [0; MAX_WINDOW],
             price_count: 0,
             price_head: 0,
@@ -138,18 +138,18 @@ pub struct EpochRecord {
     pub epoch: u64,
     pub day: i64,
     pub price: u64,
-    pub moving_average: u64,  // 价格不足 window 个时为 0
-    pub nav: u128,            // 结算净值（兑换前）
-    pub deposit_usdc: u64,    // 本期申购总额
-    pub minted_shares: u64,   // 本期新发行份额（按申购额比例分给申购人）
-    pub withdraw_shares: u64, // 本期赎回份额
-    pub payout_usdc: u64,     // 本期赎回应付 USDC（按份额比例分给赎回人）
+    pub moving_average: u64,    // 价格不足 window 个时为 0
+    pub nav: u128,              // 结算净值（兑换前）
+    pub subscription_usdc: u64, // 本期申购总额
+    pub minted_shares: u64,     // 本期新发行份额（按申购额比例分给申购人）
+    pub redemption_shares: u64, // 本期赎回份额
+    pub payout_usdc: u64,       // 本期赎回应付 USDC（按份额比例分给赎回人）
     pub in_btc_after: bool,
     // 尚未领取的部分。每次领取后递减，最后一位领取人拿到精确的余数，
     // 不会留下取整“尘埃”。
-    pub unclaimed_deposit_usdc: u64,
+    pub unclaimed_subscription_usdc: u64,
     pub unclaimed_shares: u64,
-    pub unclaimed_withdraw_shares: u64,
+    pub unclaimed_redemption_shares: u64,
     pub unclaimed_payout_usdc: u64,
 }
 
@@ -287,18 +287,18 @@ pub fn check_queue_open(s: &FundState, now_unix: i64, cfg: &Config) -> Result<()
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Ticket {
     pub epoch: u64,
-    pub deposit_usdc: u64,
-    pub withdraw_shares: u64,
+    pub subscription_usdc: u64,
+    pub redemption_shares: u64,
 }
 
 impl Ticket {
     pub fn is_empty(&self) -> bool {
-        self.deposit_usdc == 0 && self.withdraw_shares == 0
+        self.subscription_usdc == 0 && self.redemption_shares == 0
     }
 }
 
 /// 外层必须先确认：ticket 为空，或 ticket.epoch == s.epoch（同一期可以追加）。
-pub fn request_deposit(
+pub fn request_subscription(
     s: &mut FundState,
     t: &mut Ticket,
     amount: u64,
@@ -309,25 +309,25 @@ pub fn request_deposit(
     if amount == 0 {
         return Err(FundError::ZeroAmount);
     }
-    if amount < cfg.min_deposit {
-        return Err(FundError::BelowMinDeposit);
+    if amount < cfg.min_subscription {
+        return Err(FundError::BelowMinSubscription);
     }
     if !t.is_empty() && t.epoch != s.epoch {
         return Err(FundError::NothingToClaim); // 上一期还没领取，外层应先 claim
     }
     t.epoch = s.epoch;
-    t.deposit_usdc = t
-        .deposit_usdc
+    t.subscription_usdc = t
+        .subscription_usdc
         .checked_add(amount)
         .ok_or(FundError::Overflow)?;
-    s.pending_deposit_usdc = s
-        .pending_deposit_usdc
+    s.queued_subscription_usdc = s
+        .queued_subscription_usdc
         .checked_add(amount)
         .ok_or(FundError::Overflow)?;
     Ok(())
 }
 
-pub fn request_withdraw(
+pub fn request_redemption(
     s: &mut FundState,
     t: &mut Ticket,
     shares: u64,
@@ -342,12 +342,12 @@ pub fn request_withdraw(
         return Err(FundError::NothingToClaim);
     }
     t.epoch = s.epoch;
-    t.withdraw_shares = t
-        .withdraw_shares
+    t.redemption_shares = t
+        .redemption_shares
         .checked_add(shares)
         .ok_or(FundError::Overflow)?;
-    s.pending_withdraw_shares = s
-        .pending_withdraw_shares
+    s.queued_redemption_shares = s
+        .queued_redemption_shares
         .checked_add(shares)
         .ok_or(FundError::Overflow)?;
     Ok(())
@@ -382,13 +382,13 @@ pub fn claim(t: &mut Ticket, r: &mut EpochRecord) -> Result<(u64, u64), FundErro
         return Err(FundError::EpochNotSettled);
     }
     let shares = take_pro_rata(
-        t.deposit_usdc,
-        &mut r.unclaimed_deposit_usdc,
+        t.subscription_usdc,
+        &mut r.unclaimed_subscription_usdc,
         &mut r.unclaimed_shares,
     )?;
     let usdc = take_pro_rata(
-        t.withdraw_shares,
-        &mut r.unclaimed_withdraw_shares,
+        t.redemption_shares,
+        &mut r.unclaimed_redemption_shares,
         &mut r.unclaimed_payout_usdc,
     )?;
     *t = Ticket::default();
@@ -450,24 +450,27 @@ pub fn begin_settle(
     // 3. 净值（兑换前），先赎回后申购，二者都按同一净值
     let nav_now = nav(s, price)?;
 
-    let withdraw_shares = s.pending_withdraw_shares;
-    let gross_payout = (withdraw_shares as u128) * nav_now / NAV_SCALE;
-    let payout = apply_bps_down(to_u64(gross_payout)?, cfg.withdraw_fee_bps)?;
+    let redemption_shares = s.queued_redemption_shares;
+    let gross_payout = (redemption_shares as u128) * nav_now / NAV_SCALE;
+    let payout = apply_bps_down(to_u64(gross_payout)?, cfg.redemption_fee_bps)?;
     s.share_supply = s
         .share_supply
-        .checked_sub(withdraw_shares)
+        .checked_sub(redemption_shares)
         .ok_or(FundError::Overflow)?;
-    s.pending_withdraw_shares = 0;
+    s.queued_redemption_shares = 0;
 
-    let deposit = s.pending_deposit_usdc;
-    let net_deposit = apply_bps_down(deposit, cfg.deposit_fee_bps)?;
-    let minted = to_u64((net_deposit as u128) * NAV_SCALE / nav_now)?;
+    let subscription_usdc = s.queued_subscription_usdc;
+    let net_subscription = apply_bps_down(subscription_usdc, cfg.subscription_fee_bps)?;
+    let minted = to_u64((net_subscription as u128) * NAV_SCALE / nav_now)?;
     s.share_supply = s
         .share_supply
         .checked_add(minted)
         .ok_or(FundError::Overflow)?;
-    s.usdc = s.usdc.checked_add(deposit).ok_or(FundError::Overflow)?; // 申购费留在基金里
-    s.pending_deposit_usdc = 0;
+    s.usdc = s
+        .usdc
+        .checked_add(subscription_usdc)
+        .ok_or(FundError::Overflow)?; // 申购费留在基金里
+    s.queued_subscription_usdc = 0;
 
     // 4. 兑换计划：按真正成交时的最新价格计算数量和 min_out
     let price = prices.exec;
@@ -518,14 +521,14 @@ pub fn begin_settle(
         price: prices.fix,
         moving_average: ma.unwrap_or(0),
         nav: nav_now,
-        deposit_usdc: deposit,
+        subscription_usdc,
         minted_shares: minted,
-        withdraw_shares,
+        redemption_shares,
         payout_usdc: payout,
         in_btc_after: signal_btc,
-        unclaimed_deposit_usdc: deposit,
+        unclaimed_subscription_usdc: subscription_usdc,
         unclaimed_shares: minted,
-        unclaimed_withdraw_shares: withdraw_shares,
+        unclaimed_redemption_shares: redemption_shares,
         unclaimed_payout_usdc: payout,
     };
     s.last_settled_day = day;
@@ -657,10 +660,10 @@ mod tests {
     }
 
     #[test]
-    fn first_deposit_is_one_to_one() {
+    fn first_subscription_is_one_to_one() {
         let mut s = FundState::new();
         let mut t = Ticket::default();
-        request_deposit(&mut s, &mut t, 100 * USDC, 100 * DAY, &cfg()).unwrap();
+        request_subscription(&mut s, &mut t, 100 * USDC, 100 * DAY, &cfg()).unwrap();
         let (mut r, _) = settle_day(&mut s, 100, 60_000 * USDC, 0);
         assert_eq!(r.minted_shares, 100 * USDC);
         let (sh, u) = claim(&mut t, &mut r).unwrap();
@@ -690,7 +693,7 @@ mod tests {
         let p0 = 50_000 * USDC;
         let mut s = seeded(p0);
         let mut t = Ticket::default();
-        request_deposit(&mut s, &mut t, 1_000 * USDC, 10 * DAY, &cfg()).unwrap();
+        request_subscription(&mut s, &mut t, 1_000 * USDC, 10 * DAY, &cfg()).unwrap();
         // 第 50 个价格高于前 49 个 -> 高于均线 -> 买入
         let (mut r, _) = settle_day(&mut s, 10, 55_000 * USDC, 0);
         assert!(r.in_btc_after && s.in_btc);
@@ -709,18 +712,18 @@ mod tests {
     }
 
     #[test]
-    fn late_depositor_cannot_use_stale_nav() {
+    fn late_subscriber_cannot_use_stale_nav() {
         // 老持有人 A 在 BTC 里；B 在价格大涨之后才申购，必须按大涨后的净值成交
         let p0 = 50_000 * USDC;
         let mut s = seeded(p0);
         let mut ta = Ticket::default();
-        request_deposit(&mut s, &mut ta, 1_000 * USDC, 10 * DAY, &cfg()).unwrap();
+        request_subscription(&mut s, &mut ta, 1_000 * USDC, 10 * DAY, &cfg()).unwrap();
         let (mut r, _) = settle_day(&mut s, 10, 51_000 * USDC, 0); // 买入 BTC
         claim(&mut ta, &mut r).unwrap();
         let a_shares = s.share_supply;
 
         let mut tb = Ticket::default();
-        request_deposit(&mut s, &mut tb, 1_000 * USDC, 11 * DAY, &cfg()).unwrap();
+        request_subscription(&mut s, &mut tb, 1_000 * USDC, 11 * DAY, &cfg()).unwrap();
         // 第二天 BTC 涨 20%
         let (mut r2, _) = settle_day(&mut s, 11, 61_200 * USDC, 0);
         let (b_shares, _) = claim(&mut tb, &mut r2).unwrap();
@@ -734,20 +737,20 @@ mod tests {
     }
 
     #[test]
-    fn withdraw_paid_at_settlement_nav_and_btc_sold_if_needed() {
+    fn redemption_paid_at_settlement_nav_and_btc_sold_if_needed() {
         let p0 = 50_000 * USDC;
         let mut s = seeded(p0);
         let mut ta = Ticket::default();
         let mut tb = Ticket::default();
-        request_deposit(&mut s, &mut ta, 1_000 * USDC, 10 * DAY, &cfg()).unwrap();
-        request_deposit(&mut s, &mut tb, 3_000 * USDC, 10 * DAY, &cfg()).unwrap();
+        request_subscription(&mut s, &mut ta, 1_000 * USDC, 10 * DAY, &cfg()).unwrap();
+        request_subscription(&mut s, &mut tb, 3_000 * USDC, 10 * DAY, &cfg()).unwrap();
         let (mut r, _) = settle_day(&mut s, 10, 51_000 * USDC, 0);
         let (a_sh, _) = claim(&mut ta, &mut r).unwrap();
         claim(&mut tb, &mut r).unwrap();
         assert_eq!(s.usdc, 0, "全部在 BTC 里");
 
         // A 赎回全部份额；第二天价格继续上涨（仍高于均线），基金要卖出一部分 BTC 付款
-        request_withdraw(&mut s, &mut ta, a_sh, 11 * DAY, &cfg()).unwrap();
+        request_redemption(&mut s, &mut ta, a_sh, 11 * DAY, &cfg()).unwrap();
         let (mut r2, payout) = settle_day(&mut s, 11, 56_100 * USDC, 0);
         let (_, a_usdc) = claim(&mut ta, &mut r2).unwrap();
         assert_eq!(payout, r2.payout_usdc);
@@ -763,7 +766,7 @@ mod tests {
     fn slippage_guard_rejects_bad_fill() {
         let mut s = seeded(50_000 * USDC);
         let mut t = Ticket::default();
-        request_deposit(&mut s, &mut t, 1_000 * USDC, 10 * DAY, &cfg()).unwrap();
+        request_subscription(&mut s, &mut t, 1_000 * USDC, 10 * DAY, &cfg()).unwrap();
         let price = 51_000 * USDC;
         let mut out = begin_settle(&mut s, 10 * DAY + ONE_AM, &at_fix(10, price), &cfg()).unwrap();
         let plan = out.swap.unwrap();
@@ -779,12 +782,12 @@ mod tests {
     #[test]
     fn fees_stay_in_fund() {
         let c = Config {
-            deposit_fee_bps: 100,
+            subscription_fee_bps: 100,
             ..cfg()
         };
         let mut s = FundState::new();
         let mut ta = Ticket::default();
-        request_deposit(&mut s, &mut ta, 1_000 * USDC, 10 * DAY, &c).unwrap();
+        request_subscription(&mut s, &mut ta, 1_000 * USDC, 10 * DAY, &c).unwrap();
         let mut out =
             begin_settle(&mut s, 10 * DAY + ONE_AM, &at_fix(10, 50_000 * USDC), &c).unwrap();
         finish_settle(&mut s, &mut out, None).unwrap();
@@ -799,7 +802,7 @@ mod tests {
     fn claim_requires_settled_epoch_and_only_once() {
         let mut s = FundState::new();
         let mut t = Ticket::default();
-        request_deposit(&mut s, &mut t, 5 * USDC, 1 * DAY, &cfg()).unwrap();
+        request_subscription(&mut s, &mut t, 5 * USDC, 1 * DAY, &cfg()).unwrap();
         let (mut r, _) = settle_day(&mut s, 1, 1 * USDC, 0);
         let mut wrong = r;
         wrong.epoch = 99;
@@ -812,12 +815,12 @@ mod tests {
     }
 
     #[test]
-    fn min_deposit_enforced() {
+    fn min_subscription_enforced() {
         let mut s = FundState::new();
         let mut t = Ticket::default();
         assert_eq!(
-            request_deposit(&mut s, &mut t, USDC - 1, 1 * DAY, &cfg()),
-            Err(FundError::BelowMinDeposit)
+            request_subscription(&mut s, &mut t, USDC - 1, 1 * DAY, &cfg()),
+            Err(FundError::BelowMinSubscription)
         );
     }
 
@@ -870,14 +873,14 @@ mod tests {
                     match rng.below(10) {
                         0 | 1 => {
                             let amt = (1 + rng.below(5_000)) * USDC;
-                            request_deposit(&mut s, &mut tickets[u], amt, day * DAY, &cfg())
+                            request_subscription(&mut s, &mut tickets[u], amt, day * DAY, &cfg())
                                 .unwrap();
                             cash_in[u] += amt;
                         }
                         2 if held[u] > 0 => {
                             let sh = 1 + rng.below(held[u]);
                             held[u] -= sh;
-                            request_withdraw(&mut s, &mut tickets[u], sh, day * DAY, &cfg())
+                            request_redemption(&mut s, &mut tickets[u], sh, day * DAY, &cfg())
                                 .unwrap();
                         }
                         _ => {}
@@ -906,7 +909,7 @@ mod tests {
                 assert_eq!(r.unclaimed_payout_usdc, 0);
                 let held_total: u64 = held.iter().sum();
                 // 已发行份额 = 用户持有 + 本期排队赎回中的份额
-                let queued: u64 = tickets.iter().map(|t| t.withdraw_shares).sum();
+                let queued: u64 = tickets.iter().map(|t| t.redemption_shares).sum();
                 assert_eq!(s.share_supply, held_total + queued);
             }
             // 价值守恒：基金总资产 ≈ 用户份额价值之和（误差为取整尘埃）
@@ -927,14 +930,14 @@ mod tests {
         let mut s = seeded(50_000 * USDC);
         let mut ta = Ticket::default();
         let mut tb = Ticket::default();
-        request_deposit(&mut s, &mut ta, 1_000 * USDC, 10 * DAY, &cfg()).unwrap();
-        request_deposit(&mut s, &mut tb, 2_000 * USDC, 10 * DAY, &cfg()).unwrap();
+        request_subscription(&mut s, &mut ta, 1_000 * USDC, 10 * DAY, &cfg()).unwrap();
+        request_subscription(&mut s, &mut tb, 2_000 * USDC, 10 * DAY, &cfg()).unwrap();
         let (mut r, _) = settle_day(&mut s, 10, 51_000 * USDC, 18);
         let (a, _) = claim(&mut ta, &mut r).unwrap();
         let (b, _) = claim(&mut tb, &mut r).unwrap();
         // 两人同时赎回全部份额，信号仍为持有 BTC，交易所收 0.18%
-        request_withdraw(&mut s, &mut ta, a, 11 * DAY, &cfg()).unwrap();
-        request_withdraw(&mut s, &mut tb, b, 11 * DAY, &cfg()).unwrap();
+        request_redemption(&mut s, &mut ta, a, 11 * DAY, &cfg()).unwrap();
+        request_redemption(&mut s, &mut tb, b, 11 * DAY, &cfg()).unwrap();
         let (mut r2, payout, swap) = settle_day_swap(&mut s, 11, 52_000 * USDC, 18);
         assert!(matches!(
             swap,
@@ -952,7 +955,7 @@ mod tests {
         assert!((ratio - 2.0).abs() < 1e-3, "ratio {ratio}");
         // 基金还能继续运作
         let mut tc = Ticket::default();
-        request_deposit(&mut s, &mut tc, 10 * USDC, 12 * DAY, &cfg()).unwrap();
+        request_subscription(&mut s, &mut tc, 10 * USDC, 12 * DAY, &cfg()).unwrap();
         settle_day(&mut s, 12, 53_000 * USDC, 18);
     }
 
@@ -960,12 +963,12 @@ mod tests {
     fn late_settle_fills_at_fix_price_whatever_the_call_time() {
         let mut s = seeded(50_000 * USDC);
         let mut ta = Ticket::default();
-        request_deposit(&mut s, &mut ta, 1_000 * USDC, 10 * DAY, &cfg()).unwrap();
+        request_subscription(&mut s, &mut ta, 1_000 * USDC, 10 * DAY, &cfg()).unwrap();
         let (mut r, _) = settle_day(&mut s, 10, 51_000 * USDC, 0); // 买入 BTC
         let (a_sh, _) = claim(&mut ta, &mut r).unwrap();
         let mut tb = Ticket::default();
-        request_withdraw(&mut s, &mut ta, a_sh / 10, 11 * DAY, &cfg()).unwrap();
-        request_deposit(&mut s, &mut tb, 500 * USDC, 11 * DAY, &cfg()).unwrap();
+        request_redemption(&mut s, &mut ta, a_sh / 10, 11 * DAY, &cfg()).unwrap();
+        request_subscription(&mut s, &mut tb, 500 * USDC, 11 * DAY, &cfg()).unwrap();
 
         let fix = 52_000 * USDC;
         let fix_at = 11 * DAY + ONE_AM;
@@ -1044,17 +1047,17 @@ mod tests {
         let mut s = seeded(50_000 * USDC);
         let fix_at = 10 * DAY + ONE_AM;
         let mut ta = Ticket::default();
-        request_deposit(&mut s, &mut ta, 100 * USDC, fix_at - 1, &cfg()).unwrap(); // 00:59:59 还开放
+        request_subscription(&mut s, &mut ta, 100 * USDC, fix_at - 1, &cfg()).unwrap(); // 00:59:59 还开放
 
         // 定价价格公开之后，到当天结算之前，申购赎回都关闭
         let mut tb = Ticket::default();
         let closed = Err(FundError::QueueClosed);
         assert_eq!(
-            request_deposit(&mut s, &mut tb, 100 * USDC, fix_at, &cfg()),
+            request_subscription(&mut s, &mut tb, 100 * USDC, fix_at, &cfg()),
             closed
         );
         assert_eq!(
-            request_withdraw(&mut s, &mut tb, 1, fix_at + 12 * 3600, &cfg()),
+            request_redemption(&mut s, &mut tb, 1, fix_at + 12 * 3600, &cfg()),
             closed
         );
         assert_eq!(tb, Ticket::default());
@@ -1062,20 +1065,20 @@ mod tests {
         // 结算之后重新开放，进入下一期
         let (mut r, _) = settle_day(&mut s, 10, 51_000 * USDC, 0);
         claim(&mut ta, &mut r).unwrap();
-        request_deposit(&mut s, &mut tb, 100 * USDC, fix_at + 60, &cfg()).unwrap();
+        request_subscription(&mut s, &mut tb, 100 * USDC, fix_at + 60, &cfg()).unwrap();
         assert_eq!(tb.epoch, r.epoch + 1);
 
         // 某天没人结算：定价时刻之后一直关闭，第二天 0 点重新开放
         let mut tc = Ticket::default();
         assert_eq!(
-            request_deposit(&mut s, &mut tc, 100 * USDC, 11 * DAY + ONE_AM, &cfg()),
+            request_subscription(&mut s, &mut tc, 100 * USDC, 11 * DAY + ONE_AM, &cfg()),
             closed
         );
         assert_eq!(
-            request_deposit(&mut s, &mut tc, 100 * USDC, 12 * DAY - 1, &cfg()),
+            request_subscription(&mut s, &mut tc, 100 * USDC, 12 * DAY - 1, &cfg()),
             closed
         );
-        request_deposit(&mut s, &mut tc, 100 * USDC, 12 * DAY, &cfg()).unwrap();
+        request_subscription(&mut s, &mut tc, 100 * USDC, 12 * DAY, &cfg()).unwrap();
     }
 
     #[test]
@@ -1104,7 +1107,7 @@ mod tests {
                     }
                     let r = rng.next() % 10;
                     if r < 2 {
-                        request_deposit(
+                        request_subscription(
                             &mut s,
                             &mut tickets[u],
                             (1 + rng.next() % 3_000) * USDC,
@@ -1119,7 +1122,7 @@ mod tests {
                             1 + rng.next() % held[u]
                         };
                         held[u] -= sh;
-                        request_withdraw(&mut s, &mut tickets[u], sh, day * DAY, &cfg()).unwrap();
+                        request_redemption(&mut s, &mut tickets[u], sh, day * DAY, &cfg()).unwrap();
                     }
                 }
                 let step = (rng.next() % 1601) as i64 - 800;
@@ -1140,7 +1143,7 @@ mod tests {
                     late += 1;
                     let t = fix_at + (rng.next() % (now - fix_at) as u64) as i64;
                     assert_eq!(
-                        request_deposit(&mut s, &mut Ticket::default(), USDC, t, &cfg()),
+                        request_subscription(&mut s, &mut Ticket::default(), USDC, t, &cfg()),
                         Err(FundError::QueueClosed)
                     );
                 }
@@ -1169,7 +1172,7 @@ mod tests {
                         held[u] += sh;
                     }
                 }
-                let queued: u64 = tickets.iter().map(|t| t.withdraw_shares).sum();
+                let queued: u64 = tickets.iter().map(|t| t.redemption_shares).sum();
                 assert_eq!(s.share_supply, held.iter().sum::<u64>() + queued);
             }
         }

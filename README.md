@@ -4,7 +4,7 @@
 
 > **Devnet prototype. Do not use with real money.** The oracle and exchange are mocks. Mainnet needs a security audit and legal advice: pooling other people's money and charging a performance fee is regulated in many jurisdictions.
 
-> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code still runs the original design: one atomic `settle`, with `deposit` / `withdraw` naming. Sections marked *(current code)* describe what runs today.
+> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code still runs the original design: one atomic `settle` that swaps the whole fund. Sections marked *(current code)* describe what runs today.
 
 ---
 
@@ -245,8 +245,8 @@ flowchart LR
 | `initialize(config)` | admin | Create fund account and share mint |
 | `init_vaults` | admin | Create the five fund-owned token accounts |
 | `seed_prices(prices)` | admin | Pre-load historical prices, before the first settlement only |
-| `request_deposit(amount)` | anyone | Queue a subscription |
-| `request_withdraw(shares)` | holder | Queue a redemption |
+| `request_subscription(amount)` | anyone | Queue a subscription |
+| `request_redemption(shares)` | holder | Queue a redemption |
 | `settle` | anyone | Daily settlement after `settle_offset_secs` |
 | `claim` | subscriber / redeemer | Collect shares or USDC |
 | `init_mock_oracle`, `set_mock_price`, `init_mock_market` | admin | Devnet only |
@@ -258,8 +258,8 @@ flowchart LR
 | `window` | 50 | Moving-average days (max 64) | current |
 | `settle_offset_secs` | 3600 | Fixing time after 00:00 UTC | current |
 | `max_slippage_bps` | 30 | Keeper slippage bound | current |
-| `deposit_fee_bps` / `withdraw_fee_bps` | 0 | Subscription / redemption fee, kept in fund | current |
-| `min_deposit` | 1 USDC | Minimum subscription | current |
+| `subscription_fee_bps` / `redemption_fee_bps` | 0 | Subscription / redemption fee, kept in fund | current |
+| `min_subscription` | 1 USDC | Minimum subscription | current |
 | `max_staleness_secs` | 600 | Max oracle price age | current |
 | Trade cap | 200,000 USDC | Max notional per trade | planned |
 | Min trade interval | 60 s | Time between trades | planned |
@@ -276,7 +276,7 @@ flowchart LR
 | Fund | `["fund", admin]` |
 | Share mint | `["share_mint", fund]` |
 | USDC vault / BTC vault | `["usdc_vault", fund]` / `["btc_vault", fund]` |
-| Deposit escrow / Share escrow / Payout vault | `["deposit_escrow", fund]` / `["share_escrow", fund]` / `["payout_vault", fund]` |
+| Subscription escrow / Share escrow / Payout vault | `["subscription_escrow", fund]` / `["share_escrow", fund]` / `["payout_vault", fund]` |
 | Ticket (per user) | `["ticket", fund, user]` |
 | Epoch record | `["epoch", fund, epoch as u64 LE]` |
 | Mock oracle / Mock market | `["oracle", authority]` / `["market", authority]` |
@@ -312,7 +312,7 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-  A["Rename deposit / withdraw<br/>→ subscription / redemption"] --> B["Migrate fund-logic<br/>ADRs 0001–0004"]
+  A["✓ Rename to<br/>subscription / redemption"] --> B["Migrate fund-logic<br/>ADRs 0001–0004"]
   B --> C["Pyth BTC/USD +<br/>cbBTC/USD"] & D["Jupiter<br/>route off-chain,<br/>min_out on-chain"]
   B --> E["Keeper · cancel ·<br/>MA backfill"]
   B --> F["Multisig · timelock ·<br/>subscription pause"]
