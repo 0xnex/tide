@@ -25,13 +25,14 @@
 //!   不用调用 fix 那一刻的价格：调用人不能挑一天里对自己最有利的时刻。
 //! - 定价时刻到当天定价步骤之间提交的请求属于下一期：定价价格已经公开，
 //!   这段时间的请求不能按它成交，也不能撤销已经排队的请求。
-//! - 两个价格（ADR 0003）：信号价格（BTC/USD）用于均线和信号，因为策略跟踪的是 BTC；
-//!   估值价格（cbBTC/USD）用于轧差和交易的 min_out，因为基金实际持有的是 cbBTC。
+//! - 价格源（ADR 0005）：基金持有的是 cbBTC，有 cbBTC/USD 价格源时，均线、信号、轧差和交易的
+//!   min_out 都用它，BTC/USD 只用来检查脱锚（ADR 0003）；没有 cbBTC/USD 时都用 BTC/USD，
+//!   不检查脱锚，交易只靠滑点上限。用哪个由配置 signal_feed 决定。
 //! - 定价时记录当天的信号价格，如果高于最近 window 个日历日信号价格的平均值，目标是持有 cbBTC；
 //!   否则全部持有 USDC。价格按日期存在 MAX_WINDOW 个格子里：没有定价的一天可以由任何人
 //!   用那天定价窗口内发布的价格回填；没回填的跳过，用更早的一天补足。
 //!   最近 MAX_WINDOW 天里价格不足 window 个时持有 USDC。
-//! - 每笔交易前检查两个最新价格：相差超过 depeg_threshold_bps（脱锚）时不买入 cbBTC；
+//! - 两个价格源都有时，每笔交易前比较两个最新价格：相差超过 depeg_threshold_bps（脱锚）时不买入 cbBTC；
 //!   卖出和定价照常进行，持续脱锚也不会让基金卡住。
 //! - 资产用内部记账，不读取代币账户余额，别人直接转账进来不会影响份额计算
 //!   （防止“捐款抬高份额价格”攻击）。赎回资产和待成交申购单独记账，不算基金资产。
@@ -88,6 +89,13 @@ pub enum FundError {
     BackfillOutOfRange,      // 只能回填过去、还在存储范围内（最近 MAX_WINDOW 天）的一天
 }
 
+/// 信号（以及均线、轧差、min_out）用哪个价格源
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalFeed {
+    CbBtc, // Pyth 有 cbBTC/USD：用它；BTC/USD 有的话只用来检查脱锚
+    Btc,   // 没有 cbBTC/USD：都用 BTC/USD，不检查脱锚
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
     pub window: u8,                   // 均线窗口（天），默认 50
@@ -102,6 +110,7 @@ pub struct Config {
     pub public_slippage_bps: u16,     // 窗口之后其他人交易的滑点上限，比 max_slippage_bps 更严
     pub withdrawal_fee_bps: u16,      // 取款费率（领取赎回款时欠管理人），最多 1%
     pub subscription_cap_usdc: u64,   // 申购上限：还没买完的申购（排队的加待成交的）最多这么多
+    pub signal_feed: SignalFeed,      // 信号价格源，创建时设定，只能通过时间锁修改
 }
 
 impl Config {
@@ -120,6 +129,7 @@ impl Config {
             public_slippage_bps: 10,
             withdrawal_fee_bps: 100,
             subscription_cap_usdc: 1_000_000_000_000, // 1,000,000 USDC
+            signal_feed: SignalFeed::CbBtc,
         }
     }
 
@@ -270,8 +280,8 @@ impl Default for FundState {
 pub struct EpochRecord {
     pub epoch: u64,
     pub first_epoch: u64,
-    pub signal_price: u64,         // 定价时刻的 BTC/USD，记入均线
-    pub valuation_price: u64,      // 定价时刻的 cbBTC/USD，用于轧差
+    pub signal_price: u64,         // 选定价格源的定价价格：记入均线，也用于轧差
+    pub reference_price: u64,      // 脱锚检查用的 BTC/USD 定价价格，没有参照时为 0
     pub moving_average: u64,       // 价格不足 window 个时为 0
     pub subscription_usdc: u64,    // 本期申购总额（扣申购费之前），申购人按它的比例领取份额
     pub minted_shares: u64,        // 本期已发行的份额：随成交增加
@@ -319,11 +329,53 @@ pub struct PricePoint {
     pub publish_time: i64,
 }
 
-/// 定价步骤用的价格：两个价格源在定价窗口内发布的价格。
+/// 定价步骤用的价格：各价格源在定价窗口内发布的价格，没有这个价格源时为 None。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FixPrices {
-    pub signal: PricePoint,    // BTC/USD：均线和信号
-    pub valuation: PricePoint, // cbBTC/USD：轧差
+    pub cbbtc: Option<PricePoint>, // cbBTC/USD
+    pub btc: Option<PricePoint>,   // BTC/USD
+}
+
+/// 按配置选出的价格：price 用于信号、均线、轧差和 min_out（即信号价格和估值价格）；
+/// reference 是脱锚检查的参照价格（BTC/USD）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FeedChoice<T> {
+    price: T,
+    reference: Option<T>,
+    checks_peg: bool, // 基金持有的 cbBTC 有自己的价格源：要和 BTC/USD 比较才能买入
+}
+
+/// signal_feed 为 CbBtc 时必须有 cbBTC/USD，BTC/USD 是脱锚检查的参照；为 Btc 时必须有
+/// BTC/USD，cbBTC/USD 即使提供也不用，不检查脱锚。缺少选定的价格源时返回 BadPrice。
+fn choose_feed<T: Copy>(
+    cbbtc: Option<T>,
+    btc: Option<T>,
+    cfg: &Config,
+) -> Result<FeedChoice<T>, FundError> {
+    match cfg.signal_feed {
+        SignalFeed::CbBtc => Ok(FeedChoice {
+            price: cbbtc.ok_or(FundError::BadPrice)?,
+            reference: btc,
+            checks_peg: true,
+        }),
+        SignalFeed::Btc => Ok(FeedChoice {
+            price: btc.ok_or(FundError::BadPrice)?,
+            reference: None,
+            checks_peg: false,
+        }),
+    }
+}
+
+impl FeedChoice<u64> {
+    /// 能不能买入 cbBTC（轧差也算买入）：要检查脱锚时，参照价格缺失（没提供、过旧、不在定价窗口内）
+    /// 等于无法确认没有脱锚，也不买入。这样少传参照价格绕不过脱锚检查；
+    /// 而卖出和定价不需要参照价格，参照出问题时照常进行（不变量 6）。
+    fn blocks_buys(&self, cfg: &Config) -> bool {
+        self.checks_peg
+            && self.reference.map_or(true, |btc| {
+                is_depegged(btc, self.price, cfg.depeg_threshold_bps)
+            })
+    }
 }
 
 /// 定价步骤的结果：本期记录，以及外层要做的转账里记录没有直接给出的一项
@@ -454,14 +506,16 @@ pub fn seed_prices(
 /// 只接受过去的一天、还在存储范围内（最近 MAX_WINDOW 天）、还没有价格，
 /// 而且价格发布在那一天的定价窗口内：回填的人只能在那几十秒里发布的价格中挑，
 /// 和那天按时定价拿到的价格一样（谁先回填用谁的；换成 Pyth 后这几十秒里的价差可以忽略）。
-/// 只影响之后定价时的均线，已经定价的结果不变。
+/// 只影响之后定价时的均线，已经定价的结果不变。价格源按配置选择，和定价一样。
+/// 返回记下的信号价格。
 pub fn backfill_price(
     s: &mut FundState,
     day: i64,
-    signal: &PricePoint,
+    prices: &FixPrices,
     now_unix: i64,
     cfg: &Config,
-) -> Result<(), FundError> {
+) -> Result<u64, FundError> {
+    let signal = &choose_feed(prices.cbbtc, prices.btc, cfg)?.price;
     let today = day_of(now_unix);
     if day >= today || day <= today.saturating_sub(MAX_WINDOW as i64) {
         return Err(FundError::BackfillOutOfRange);
@@ -474,13 +528,13 @@ pub fn backfill_price(
     }
     check_fix_window(signal.publish_time, fix_time(day, cfg))?;
     record_price(s, day, signal.price);
-    Ok(())
+    Ok(signal.price)
 }
 
-/// cbBTC 是否脱锚：估值价格与信号价格之差超过信号价格的 threshold_bps。
-pub fn is_depegged(signal: u64, valuation: u64, threshold_bps: u16) -> bool {
-    let gap = (valuation as u128).abs_diff(signal as u128);
-    gap * BPS > (signal as u128) * threshold_bps as u128
+/// cbBTC 是否脱锚：cbBTC/USD 与 BTC/USD 之差超过 BTC/USD 的 threshold_bps。
+pub fn is_depegged(btc: u64, cbbtc: u64, threshold_bps: u16) -> bool {
+    let gap = (cbbtc as u128).abs_diff(btc as u128);
+    gap * BPS > (btc as u128) * threshold_bps as u128
 }
 
 pub fn day_of(unix: i64) -> i64 {
@@ -1023,7 +1077,8 @@ pub fn fix(
 ) -> Result<FixOutcome, FundError> {
     cfg.validate()?;
     check_keeper_window(now_unix, caller, cfg)?;
-    if prices.signal.price == 0 || prices.valuation.price == 0 {
+    let chosen = choose_feed(prices.cbbtc, prices.btc, cfg)?;
+    if chosen.price.price == 0 {
         return Err(FundError::BadPrice);
     }
     let day = day_of(now_unix);
@@ -1034,21 +1089,30 @@ pub fn fix(
     if now_unix < fix_at {
         return Err(FundError::TooEarly);
     }
-    for t in [prices.signal.publish_time, prices.valuation.publish_time] {
-        check_fix_window(t, fix_at)?;
-        if t > now_unix {
-            return Err(FundError::PriceNotAtFixTime);
-        }
+    let at_fix_time = |p: &PricePoint| {
+        check_fix_window(p.publish_time, fix_at).is_ok() && p.publish_time <= now_unix
+    };
+    if !at_fix_time(&chosen.price) {
+        return Err(FundError::PriceNotAtFixTime);
     }
+    // 参照价格不是定价时刻发布的就不用：只是不轧差，定价照常
+    let feeds = FeedChoice {
+        price: chosen.price.price,
+        reference: chosen
+            .reference
+            .filter(|p| p.price > 0 && at_fix_time(p))
+            .map(|p| p.price),
+        checks_peg: chosen.checks_peg,
+    };
 
     // 在副本上计算，最后一次性写回：出错时状态不变
     let mut n = s.clone();
     roll_queue(&mut n, now_unix)?;
     let epoch = epoch_of_day(day)?;
-    let price = prices.valuation.price;
+    let price = feeds.price;
 
-    // 2. 信号价格进均线，决定目标
-    let signal = prices.signal.price;
+    // 2. 信号价格进均线，决定目标（信号价格就是选定价格源的定价价格）
+    let signal = price;
     record_price(&mut n, day, signal);
     let ma = moving_average(&n, day, cfg.window);
     n.target_btc = matches!(ma, Some(m) if signal > m);
@@ -1090,7 +1154,7 @@ pub fn fix(
     let can_net = n.target_btc
         && n.pending_count == 0
         && fund_rebalanced(&n, price)?
-        && !is_depegged(signal, price, cfg.depeg_threshold_bps);
+        && !feeds.blocks_buys(cfg);
     let (netted_usdc, netted_btc) = if can_net {
         let usdc = net_subscription.min(btc_value(slice_btc, price)?);
         // cbBTC 向下取整：usdc ≤ slice_btc 的价值，所以 netted_btc ≤ slice_btc
@@ -1145,7 +1209,7 @@ pub fn fix(
         epoch,
         first_epoch: epoch_of_day(s.last_fix_day.saturating_add(1))?,
         signal_price: signal,
-        valuation_price: price,
+        reference_price: feeds.reference.unwrap_or(0),
         moving_average: ma.unwrap_or(0),
         subscription_usdc,
         minted_shares: netted_shares,
@@ -1182,11 +1246,11 @@ pub fn fix(
 // 交易
 // ---------------------------------------------------------------------------
 
-/// 调用时两个价格源的最新价格
+/// 调用时各价格源的最新价格，没有这个价格源时为 None
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarketPrices {
-    pub signal: u64,    // BTC/USD：只用于脱锚检查
-    pub valuation: u64, // cbBTC/USD：交易数量、min_out 和脱锚检查
+    pub cbbtc: Option<u64>, // cbBTC/USD
+    pub btc: Option<u64>,   // BTC/USD
 }
 
 /// 一笔交易服务的对象
@@ -1216,6 +1280,7 @@ pub struct TradePlan {
     pub amount_in: u64,
     pub min_out: u64,
     pub bucket: TradeBucket,
+    pub price: u64, // 算 min_out 用的估值价格（选定价格源的最新价格）；模拟交易所按它成交
 }
 
 /// 规划下一步。清算窗口内其他调用人得到 KeeperOnly。没有可做的时返回原因：
@@ -1239,16 +1304,18 @@ pub fn plan_trade(
 ) -> Result<TradePlan, FundError> {
     cfg.validate()?;
     check_keeper_window(now_unix, caller, cfg)?;
-    if prices.signal == 0 || prices.valuation == 0 {
+    let mut chosen = choose_feed(prices.cbbtc, prices.btc, cfg)?;
+    if chosen.price == 0 {
         return Err(FundError::BadPrice);
     }
-    let price = prices.valuation;
+    chosen.reference = chosen.reference.filter(|&p| p > 0);
+    let price = chosen.price;
     // 窗口之后的其他调用人用更严的滑点上限：能从一笔交易里挤出的价值更少
     let slip = match caller {
         Caller::Keeper => cfg.max_slippage_bps,
         Caller::Public => cfg.public_slippage_bps,
     };
-    let depegged = is_depegged(prices.signal, price, cfg.depeg_threshold_bps);
+    let depegged = chosen.blocks_buys(cfg);
     // 上限折算成 cbBTC 向下取整；至少 1 sat，保证价格再高也能卖完
     let cap_btc = usdc_to_btc(cfg.trade_cap_usdc, price)?.max(1);
     let sell = |amount: u64, bucket| -> Result<TradePlan, FundError> {
@@ -1257,6 +1324,7 @@ pub fn plan_trade(
             amount_in: amount,
             min_out: apply_bps_down(btc_value(amount, price)?, slip)?,
             bucket,
+            price,
         })
     };
     let buy = |amount: u64, bucket| -> Result<TradePlan, FundError> {
@@ -1265,6 +1333,7 @@ pub fn plan_trade(
             amount_in: amount,
             min_out: apply_bps_down(usdc_to_btc(amount, price)?, slip)?,
             bucket,
+            price,
         })
     };
     let plan = if let Some(slice) = s.oldest_slice() {
@@ -1295,6 +1364,7 @@ pub fn plan_trade(
                 amount_in: p.usdc,
                 min_out: 0,
                 bucket,
+                price,
             });
         }
         if depegged {
@@ -1464,18 +1534,34 @@ mod tests {
         Config::default_config()
     }
 
-    /// 两个价格都在定价时刻发布
-    fn at_fix2(day: i64, signal: u64, valuation: u64) -> FixPrices {
+    /// 两个价格源都在定价时刻发布：BTC/USD 和 cbBTC/USD
+    fn at_fix2(day: i64, btc: u64, cbbtc: u64) -> FixPrices {
         let t = day * DAY + ONE_AM;
         FixPrices {
-            signal: PricePoint {
-                price: signal,
+            btc: Some(PricePoint {
+                price: btc,
                 publish_time: t,
-            },
-            valuation: PricePoint {
-                price: valuation,
+            }),
+            cbbtc: Some(PricePoint {
+                price: cbbtc,
                 publish_time: t,
-            },
+            }),
+        }
+    }
+
+    /// 两个价格源在同一时刻发布同一个价格
+    fn both(p: PricePoint) -> FixPrices {
+        FixPrices {
+            btc: Some(p),
+            cbbtc: Some(p),
+        }
+    }
+
+    /// 两个价格源的最新价格：BTC/USD 和 cbBTC/USD
+    fn mp(btc: u64, cbbtc: u64) -> MarketPrices {
+        MarketPrices {
+            btc: Some(btc),
+            cbbtc: Some(cbbtc),
         }
     }
 
@@ -1486,6 +1572,7 @@ mod tests {
     /// 基金状态加上每次定价的记录（按期号递增），模拟链上的账户。
     /// usdc_tokens / btc_tokens 按程序的转账记录基金名下的代币（托管、主账户、待领取账户），
     /// 用来核对内部记账：不能凭空多出或少掉资产。
+    #[derive(Clone)]
     struct Harness {
         s: FundState,
         records: Vec<EpochRecord>,
@@ -1704,7 +1791,8 @@ mod tests {
             fee_bps: u16,
         ) -> Result<TradePlan, FundError> {
             let plan = plan_trade(&self.s, now, &p, caller, &self.c)?;
-            self.fill(now, &plan, exec(&plan, p.valuation, fee_bps))?;
+            // 交易所按算 min_out 的那个价格成交
+            self.fill(now, &plan, exec(&plan, plan.price, fee_bps))?;
             Ok(plan)
         }
 
@@ -1737,10 +1825,7 @@ mod tests {
     }
 
     fn same(price: u64) -> MarketPrices {
-        MarketPrices {
-            signal: price,
-            valuation: price,
-        }
+        mp(price, price)
     }
 
     /// 基金资产按价格折算的总值（只在测试里用来检查，基金本身从不按美元估值）
@@ -1874,7 +1959,7 @@ mod tests {
         assert_eq!((out.shares, out.fee_usdc), (1_000 * USDC, 0));
 
         // 待成交申购满了之后的申购全额退款，也不收取款费
-        let depeg = |day: i64| at_fix2(day, 51_000 * USDC, 49_000 * USDC);
+        let depeg = |day: i64| at_fix2(day, 53_000 * USDC, 51_000 * USDC);
         for day in 11..11 + MAX_PENDING as i64 {
             h.subscribe(&mut Ticket::default(), 100 * USDC, day * DAY);
             h.fix_with(day * DAY + ONE_AM, &depeg(day)).unwrap();
@@ -1996,7 +2081,7 @@ mod tests {
             price: 60_000 * USDC,
             publish_time: 10 * DAY + ONE_AM + 5,
         };
-        backfill_price(&mut h.s, 10, &p10, 11 * DAY, &h.c).unwrap();
+        backfill_price(&mut h.s, 10, &both(p10), 11 * DAY, &h.c).unwrap();
         let r = h.fix_with(fix11, &p11).unwrap();
         assert_eq!(
             r.moving_average,
@@ -2014,7 +2099,8 @@ mod tests {
             publish_time: day * DAY + ONE_AM + t,
         };
         let s0 = h.s.clone();
-        let run = |day: i64, p: PricePoint| backfill_price(&mut s0.clone(), day, &p, now, &h.c);
+        let run =
+            |day: i64, p: PricePoint| backfill_price(&mut s0.clone(), day, &both(p), now, &h.c);
         // 已经有价格的一天（定价过的、种子价格）不能改
         assert_eq!(run(9, at(9, 0)), Err(FundError::PriceAlreadyRecorded));
         assert_eq!(run(8, at(8, 0)), Err(FundError::PriceAlreadyRecorded));
@@ -2043,12 +2129,12 @@ mod tests {
         );
         // 失败时状态不变；成功只写这一天，之后不能再改
         assert_eq!(h.s, s0);
-        backfill_price(&mut h.s, 10, &at(10, FIX_WINDOW_SECS - 1), now, &h.c).unwrap();
+        backfill_price(&mut h.s, 10, &both(at(10, FIX_WINDOW_SECS - 1)), now, &h.c).unwrap();
         assert_eq!(
-            backfill_price(&mut h.s, 10, &at(10, 0), now, &h.c),
+            backfill_price(&mut h.s, 10, &both(at(10, 0)), now, &h.c),
             Err(FundError::PriceAlreadyRecorded)
         );
-        backfill_price(&mut h.s, oldest, &at(oldest, 0), now, &h.c).unwrap();
+        backfill_price(&mut h.s, oldest, &both(at(oldest, 0)), now, &h.c).unwrap();
         assert_eq!(moving_average(&h.s, 10, 1), Some(60_000 * USDC));
     }
 
@@ -2059,14 +2145,14 @@ mod tests {
         let now = fix_at + 5 * 3600;
         // 两个价格的发布时间分别设置
         let at = |ts: i64, tv: i64| FixPrices {
-            signal: PricePoint {
+            btc: Some(PricePoint {
                 price: USDC,
                 publish_time: ts,
-            },
-            valuation: PricePoint {
+            }),
+            cbbtc: Some(PricePoint {
                 price: USDC,
                 publish_time: tv,
-            },
+            }),
         };
         let run_both = |now: i64, ts: i64, tv: i64| {
             fix(&mut s.clone(), now, &at(ts, tv), Caller::Keeper, &cfg()).map(|_| ())
@@ -2082,9 +2168,10 @@ mod tests {
         assert_eq!(run(now, fix_at - DAY), bad);
         // 发布时间不能晚于调用时间
         assert_eq!(run(fix_at + 10, fix_at + 20), bad);
-        // 两个价格都必须在窗口内：只有一个在窗口内也不行
+        // 选定的 cbBTC/USD 必须在窗口内；BTC/USD 参照不在窗口内时不用它（只是不轧差），定价照常
         assert_eq!(run_both(now, fix_at, now), bad);
-        assert_eq!(run_both(now, now, fix_at), bad);
+        let r = fix(&mut s.clone(), now, &at(now, fix_at), Caller::Keeper, &cfg()).unwrap();
+        assert_eq!(r.record.reference_price, 0);
     }
 
     #[test]
@@ -2314,7 +2401,7 @@ mod tests {
         h.redeem(&mut holder, 100 * USDC, 10 * DAY);
 
         // 脱锚，一笔都没买：这 100 万成为待成交申购，算进下一期的上限
-        let depeg = |day: i64| at_fix2(day, 51_000 * USDC, 49_000 * USDC);
+        let depeg = |day: i64| at_fix2(day, 53_000 * USDC, 51_000 * USDC);
         h.fix_with(10 * DAY + ONE_AM, &depeg(10)).unwrap();
         assert_eq!(
             request_subscription(&mut h.s, &mut tc, USDC, 10 * DAY + 2 * ONE_AM, &h.c),
@@ -2360,7 +2447,7 @@ mod tests {
         // 脱锚：一笔都买不了。申购费 10 USDC 在定价时进了基金，待成交 990
         h.fix_with(
             10 * DAY + ONE_AM,
-            &at_fix2(10, 51_000 * USDC, 49_000 * USDC),
+            &at_fix2(10, 53_000 * USDC, 51_000 * USDC),
         )
         .unwrap();
         assert_eq!(h.s.usdc, 10 * USDC);
@@ -2566,31 +2653,188 @@ mod tests {
     }
 
     #[test]
-    fn signal_price_drives_the_moving_average() {
+    fn the_moving_average_records_the_chosen_feeds_fixing_price() {
         let mut h = Harness::seeded(50_000 * USDC);
         let mut t = Ticket::default();
         h.subscribe(&mut t, 1_000 * USDC, 10 * DAY);
         h.settle_day(10, 51_000 * USDC, 0);
         h.claim(&mut t).unwrap();
-        // 基金一半 USDC、一半 cbBTC（直接设置，代币账户同步）
-        (h.s.usdc, h.usdc_tokens) = (500 * USDC, 500 * USDC);
-        (h.s.btc, h.btc_tokens) = (1_000_000, 1_000_000); // 0.01 cbBTC
-
         // BTC/USD 52,000，cbBTC/USD 51,500（约低 1%，未脱锚）
-        let r2 = h
-            .fix_with(
-                11 * DAY + ONE_AM,
-                &at_fix2(11, 52_000 * USDC, 51_500 * USDC),
-            )
-            .unwrap();
-        assert_eq!(r2.signal_price, 52_000 * USDC);
-        assert_eq!(r2.valuation_price, 51_500 * USDC);
-        // 均线只记录信号价格：48 × 50,000 + 51,000 + 52,000
+        let fix11 = 11 * DAY + ONE_AM;
+        let p = at_fix2(11, 52_000 * USDC, 51_500 * USDC);
+
+        // 默认用 cbBTC/USD：均线记录 cbBTC 的定价价格，BTC/USD 只作脱锚检查的参照
+        let mut cb = h.clone();
+        let r = cb.fix_with(fix11, &p).unwrap();
+        assert_eq!(cb.c.signal_feed, SignalFeed::CbBtc);
         assert_eq!(
-            r2.moving_average,
+            (r.signal_price, r.reference_price),
+            (51_500 * USDC, 52_000 * USDC)
+        );
+        assert_eq!(
+            r.moving_average,
+            (48 * 50_000 + 51_000 + 51_500) * USDC / 50
+        );
+
+        // 没有 cbBTC/USD 时用 BTC/USD：均线记录 BTC 的定价价格，没有参照
+        h.c.signal_feed = SignalFeed::Btc;
+        let r = h.fix_with(fix11, &p).unwrap();
+        assert_eq!((r.signal_price, r.reference_price), (52_000 * USDC, 0));
+        assert_eq!(
+            r.moving_average,
             (48 * 50_000 + 51_000 + 52_000) * USDC / 50
         );
-        assert!(r2.target_btc && h.s.target_btc);
+        assert!(r.target_btc && h.s.target_btc);
+    }
+
+    #[test]
+    fn the_depeg_check_runs_only_when_both_feeds_exist() {
+        let mut h = Harness::seeded(50_000 * USDC);
+        let mut t = Ticket::default();
+        h.subscribe(&mut t, 1_000 * USDC, 10 * DAY);
+        h.fix_day(10, 51_000 * USDC);
+        let now = 10 * DAY + 2 * ONE_AM;
+        let plan = |h: &Harness, m: MarketPrices| plan_trade(&h.s, now, &m, Caller::Keeper, &h.c);
+        let min_out_at =
+            |price: u64| apply_bps_down(usdc_to_btc(1_000 * USDC, price).unwrap(), 30).unwrap();
+        // 用 cbBTC/USD：两个价格源都有、相差 3% 时不买入；不脱锚时按 cbBTC 的价格买入
+        let gap = mp(53_000 * USDC, 51_400 * USDC);
+        assert_eq!(plan(&h, gap), Err(FundError::DepegBlocksBuy));
+        let p = plan(&h, mp(51_500 * USDC, 51_400 * USDC)).unwrap();
+        assert_eq!(p.min_out, min_out_at(51_400 * USDC));
+        // 缺少 BTC/USD 参照时没法确认没有脱锚：也不买入（少传参照绕不过检查）
+        let cb_only = MarketPrices {
+            cbbtc: Some(51_400 * USDC),
+            btc: None,
+        };
+        assert_eq!(plan(&h, cb_only), Err(FundError::DepegBlocksBuy));
+        // 缺少选定的 cbBTC/USD：价格无效
+        let no_cb = MarketPrices {
+            cbbtc: None,
+            btc: Some(51_000 * USDC),
+        };
+        assert_eq!(plan(&h, no_cb), Err(FundError::BadPrice));
+
+        // 用 BTC/USD（没有 cbBTC/USD 价格源）：cbBTC/USD 不用，不检查脱锚，min_out 按 BTC 的价格
+        h.c.signal_feed = SignalFeed::Btc;
+        let p = plan(&h, gap).unwrap();
+        assert_eq!(
+            (p.price, p.min_out),
+            (53_000 * USDC, min_out_at(53_000 * USDC))
+        );
+        let no_btc = MarketPrices {
+            cbbtc: Some(51_000 * USDC),
+            btc: None,
+        };
+        assert_eq!(plan(&h, no_btc), Err(FundError::BadPrice));
+    }
+
+    #[test]
+    fn a_missing_reference_blocks_buys_but_not_sells_or_fixing() {
+        // A 持有 cbBTC，赎回一半；B 申购。定价时 BTC/USD 参照缺失或不是定价时刻发布的：
+        // 照常定价，但不轧差；赎回资产照常卖出，买入等参照恢复
+        let mut h = Harness::seeded(50_000 * USDC);
+        let (mut ta, mut tb) = (Ticket::default(), Ticket::default());
+        h.subscribe(&mut ta, 1_000 * USDC, 10 * DAY);
+        h.settle_day(10, 51_000 * USDC, 0);
+        let (a, _) = h.claim(&mut ta).unwrap();
+        h.redeem(&mut ta, a / 2, 11 * DAY);
+        h.subscribe(&mut tb, 300 * USDC, 11 * DAY);
+        let fix11 = 11 * DAY + ONE_AM;
+        let cb = PricePoint {
+            price: 52_000 * USDC,
+            publish_time: fix11,
+        };
+        let late_btc = PricePoint {
+            price: 52_000 * USDC,
+            publish_time: fix11 + FIX_WINDOW_SECS,
+        };
+        for btc in [None, Some(late_btc)] {
+            let r = fix(
+                &mut h.s.clone(),
+                fix11 + 120,
+                &FixPrices {
+                    cbbtc: Some(cb),
+                    btc,
+                },
+                Caller::Keeper,
+                &h.c,
+            )
+            .unwrap()
+            .record;
+            assert!(r.target_btc && r.slice_btc > 0);
+            assert_eq!((r.netted_btc, r.reference_price), (0, 0), "不轧差");
+        }
+        // 选定的 cbBTC/USD 缺失或不是定价时刻发布的：不能定价
+        let no_cb = FixPrices {
+            cbbtc: None,
+            btc: Some(cb),
+        };
+        assert_eq!(
+            fix(&mut h.s.clone(), fix11 + 120, &no_cb, Caller::Keeper, &h.c),
+            Err(FundError::BadPrice)
+        );
+        let late_cb = FixPrices {
+            cbbtc: Some(late_btc),
+            btc: Some(cb),
+        };
+        assert_eq!(
+            fix(
+                &mut h.s.clone(),
+                fix11 + 120,
+                &late_cb,
+                Caller::Keeper,
+                &h.c
+            ),
+            Err(FundError::PriceNotAtFixTime)
+        );
+
+        h.fix_with(
+            fix11 + 120,
+            &FixPrices {
+                cbbtc: Some(cb),
+                btc: None,
+            },
+        )
+        .unwrap();
+        let cb_only = MarketPrices {
+            cbbtc: Some(52_000 * USDC),
+            btc: None,
+        };
+        let (plans, why, _) = h.trade_until_done(fix11 + 120, cb_only, 0);
+        assert_eq!(why, FundError::DepegBlocksBuy);
+        assert!(plans.iter().all(|p| p.side == Side::SellBtc));
+        assert!(h.claim(&mut ta).unwrap().1 > 0, "赎回照常完成");
+        // 参照恢复之后买入
+        h.trade_at(fix11 + 3_600, same(52_000 * USDC), 0).unwrap();
+        assert!(h.claim(&mut tb).unwrap().0 > 0);
+    }
+
+    #[test]
+    fn backfill_uses_the_chosen_feed() {
+        let mut h = Harness::seeded(50_000 * USDC);
+        h.c.signal_feed = SignalFeed::Btc;
+        h.fix_day(9, 50_000 * USDC);
+        let at = |price: u64| PricePoint {
+            price,
+            publish_time: 10 * DAY + ONE_AM,
+        };
+        let prices = FixPrices {
+            cbbtc: Some(at(59_000 * USDC)),
+            btc: Some(at(60_000 * USDC)),
+        };
+        assert_eq!(
+            backfill_price(&mut h.s, 10, &prices, 11 * DAY, &h.c),
+            Ok(60_000 * USDC)
+        );
+        let no_btc = FixPrices {
+            cbbtc: Some(at(59_000 * USDC)),
+            btc: None,
+        };
+        assert_eq!(
+            backfill_price(&mut h.s.clone(), 10, &no_btc, 11 * DAY, &h.c),
+            Err(FundError::BadPrice)
+        );
     }
 
     #[test]
@@ -2851,7 +3095,7 @@ mod tests {
         h.subscribe(&mut holder, 10_000 * USDC, 9 * DAY);
         h.settle_day(9, 51_000 * USDC, 0);
         h.claim(&mut holder).unwrap();
-        let depeg = |day: i64| at_fix2(day, 51_000 * USDC, 49_000 * USDC);
+        let depeg = |day: i64| at_fix2(day, 53_000 * USDC, 51_000 * USDC);
         let mut tickets = vec![];
         for day in 10..10 + MAX_PENDING as i64 {
             let mut t = Ticket::default();
@@ -2871,10 +3115,7 @@ mod tests {
         assert_eq!(h.claim(&mut late).unwrap(), (0, 100 * USDC));
         assert!(late.is_empty());
         // 赎回照常：赎回资产在卖出后可以领取
-        let m = MarketPrices {
-            signal: 51_000 * USDC,
-            valuation: 49_000 * USDC,
-        };
+        let m = mp(53_000 * USDC, 51_000 * USDC);
         let (plans, why, _) = h.trade_until_done(day * DAY + ONE_AM, m, 0);
         assert_eq!((plans.len(), why), (1, FundError::DepegBlocksBuy));
         assert!(h.claim(&mut holder).unwrap().1 > 0);
@@ -2997,10 +3238,7 @@ mod tests {
         h.fix_day(10, 51_000 * USDC);
         // 晚上 9 点才交易，这时 cbBTC 是 52,500（BTC/USD 52,600，未脱锚）
         let now = 10 * DAY + 21 * 3600;
-        let p = MarketPrices {
-            signal: 52_600 * USDC,
-            valuation: 52_500 * USDC,
-        };
+        let p = mp(52_600 * USDC, 52_500 * USDC);
         let plan = plan_trade(&h.s, now, &p, Caller::Keeper, &h.c).unwrap();
         // 1000 USDC @ 52,500 = 1,904,761 sat，减 0.3% = 1,899,046
         assert_eq!(plan.min_out, 1_899_046);
@@ -3040,15 +3278,12 @@ mod tests {
         let r = h
             .fix_with(
                 10 * DAY + ONE_AM,
-                &at_fix2(10, 51_000 * USDC, 49_470 * USDC),
+                &at_fix2(10, 53_000 * USDC, 51_400 * USDC),
             )
             .unwrap();
         assert!(r.target_btc, "目标仍是 cbBTC");
         let t0 = 10 * DAY + ONE_AM;
-        let depegged = MarketPrices {
-            signal: 51_000 * USDC,
-            valuation: 49_470 * USDC,
-        };
+        let depegged = mp(53_000 * USDC, 51_400 * USDC);
         assert_eq!(h.trade_at(t0, depegged, 0), Err(FundError::DepegBlocksBuy));
         assert_eq!(
             h.claim(&mut t),
@@ -3071,10 +3306,7 @@ mod tests {
             &at_fix2(11, 40_000 * USDC, 38_000 * USDC),
         )
         .unwrap();
-        let depegged = MarketPrices {
-            signal: 40_000 * USDC,
-            valuation: 38_000 * USDC,
-        };
+        let depegged = mp(40_000 * USDC, 38_000 * USDC);
         let (plans, why, _) = h.trade_until_done(11 * DAY + ONE_AM, depegged, 0);
         assert_eq!(why, FundError::NothingToTrade);
         let buckets: Vec<_> = plans.iter().map(|p| (p.side, p.bucket)).collect();
@@ -3362,14 +3594,14 @@ mod tests {
         let fix_at = 11 * DAY + ONE_AM;
         let on_time = at_fix(11, 52_000 * USDC);
         let late = FixPrices {
-            signal: PricePoint {
+            btc: Some(PricePoint {
                 price: 52_000 * USDC,
                 publish_time: fix_at + 30,
-            },
-            valuation: PricePoint {
+            }),
+            cbbtc: Some(PricePoint {
                 price: 52_000 * USDC,
                 publish_time: fix_at + 30,
-            },
+            }),
         };
         // 晚上 9 点才定价：信号、轧差、赎回资产都只取决于定价价格
         let a = fix(&mut h.s.clone(), fix_at, &on_time, Caller::Keeper, &h.c).unwrap();
@@ -3480,11 +3712,13 @@ mod tests {
             if now >= until {
                 return;
             }
-            let m = MarketPrices {
-                signal: rng.wiggle(p.signal, 30),
-                valuation: rng.wiggle(p.valuation, 30),
-            };
-            let depegged = is_depegged(m.signal, m.valuation, h.c.depeg_threshold_bps);
+            let m = mp(
+                rng.wiggle(p.btc.unwrap(), 30),
+                rng.wiggle(p.cbbtc.unwrap(), 30),
+            );
+            // 按配置选出的价格：成交价，以及有参照时的脱锚检查
+            let chosen = choose_feed(m.cbbtc, m.btc, &h.c).unwrap();
+            let depegged = chosen.blocks_buys(&h.c);
             let caller = if rng.below(4) == 0 {
                 Caller::Public
             } else {
@@ -3520,12 +3754,12 @@ mod tests {
             if caller == Caller::Public {
                 tally.public_plans += 1;
             }
-            assert!(btc_value_of(&plan, m.valuation) <= h.c.trade_cap_usdc);
+            assert!(btc_value_of(&plan, chosen.price) <= h.c.trade_cap_usdc);
             // 随机失败，或者交易所的手续费超过这个调用人的滑点上限
             let got = if plan.min_out > 0 && rng.below(100) < fail_pct {
                 plan.min_out - 1
             } else {
-                exec(&plan, m.valuation, fee_bps)
+                exec(&plan, chosen.price, fee_bps)
             };
             if got < plan.min_out {
                 let before = h.s.clone();
@@ -3785,6 +4019,10 @@ mod tests {
             let mut rng = Rng(seed);
             let mut h = Harness::seeded(50_000 * USDC);
             h.c.trade_cap_usdc = 2_000 * USDC; // 用户的金额相对上限较大，每天多笔交易
+                                               // 一半的种子没有 cbBTC/USD 价格源：信号和成交都用 BTC/USD
+            if seed % 2 == 0 {
+                h.c.signal_feed = SignalFeed::Btc;
+            }
             let mut users = Users::new(8);
             let mut tally = Tally::default();
             let mut price = 50_000 * USDC;
@@ -3819,10 +4057,7 @@ mod tests {
                 }
                 // 定价之后、成交之前，有人撤销刚成为待成交的申购
                 users.random_pending_cancels(&mut h, &mut rng);
-                let p = MarketPrices {
-                    signal: price,
-                    valuation,
-                };
+                let p = mp(price, valuation);
                 random_trades(
                     &mut h,
                     &mut rng,
@@ -3893,14 +4128,14 @@ mod tests {
             let mut price = 50_000 * USDC;
             let mut valuation = price;
             let mut fail_pct = 30;
-            let mut skipped: Option<(i64, PricePoint)> = None;
+            let mut skipped: Option<(i64, FixPrices)> = None;
             for day in 10..300i64 {
                 // 昨天没人定价：一半的时候有人用昨天定价窗口内的价格回填，只能回填一次
-                if let Some((d, signal)) = skipped.take() {
+                if let Some((d, prices)) = skipped.take() {
                     if rng.below(2) == 0 {
-                        backfill_price(&mut h.s, d, &signal, day * DAY, &h.c).unwrap();
+                        backfill_price(&mut h.s, d, &prices, day * DAY, &h.c).unwrap();
                         assert_eq!(
-                            backfill_price(&mut h.s, d, &signal, day * DAY, &h.c),
+                            backfill_price(&mut h.s, d, &prices, day * DAY, &h.c),
                             Err(FundError::PriceAlreadyRecorded)
                         );
                         backfills += 1;
@@ -3934,10 +4169,7 @@ mod tests {
                 }
                 users.random_cancels(&mut h, &mut rng, day * DAY);
                 // 昨天的价格附近：定价之前，前几天没做完的交易继续
-                let yesterday = MarketPrices {
-                    signal: price,
-                    valuation,
-                };
+                let yesterday = mp(price, valuation);
                 // 价格随机游走（±8%）；cbBTC 相对 BTC 偏离 -300..=300 bps，约三分之一超过脱锚阈值
                 price = rng.wiggle(price, 800).max(1_000 * USDC);
                 valuation = rng.wiggle(price, 300);
@@ -3988,18 +4220,18 @@ mod tests {
                 let publish =
                     |rng: &mut Rng| (fix_at + rng.below(FIX_WINDOW_SECS as u64) as i64).min(now);
                 let p = FixPrices {
-                    signal: PricePoint {
+                    btc: Some(PricePoint {
                         price,
                         publish_time: publish(&mut rng),
-                    },
-                    valuation: PricePoint {
+                    }),
+                    cbbtc: Some(PricePoint {
                         price: valuation,
                         publish_time: publish(&mut rng),
-                    },
+                    }),
                 };
                 // 有时整天没人定价：这一期顺延，第二天可能有人回填这天的信号价格
                 if rng.below(25) == 0 {
-                    skipped = Some((day, p.signal));
+                    skipped = Some((day, p));
                     skipped_fixes += 1;
                 } else {
                     // 随机调用人：清算窗口内其他人被拒绝，由清算地址定价
@@ -4022,10 +4254,7 @@ mod tests {
                         Err(e) => panic!("fix: {e:?}"),
                     }
                 }
-                let m = MarketPrices {
-                    signal: price,
-                    valuation,
-                };
+                let m = mp(price, valuation);
                 random_trades(
                     &mut h,
                     &mut rng,

@@ -1,9 +1,9 @@
 // 每日结算脚本（devnet 原型用）
 //
 // 做三件事：
-//   1. 从 Binance 公开行情读取 BTC 价格，写入模拟预言机的两个价格源（主网版本应改用 Pyth，删除这一步）。
+//   1. 从 Binance 公开行情读取 BTC 价格，写入模拟预言机（主网版本应改用 Pyth，删除这一步）。
 //      Binance 没有 cbBTC 行情，devnet 上把 cbBTC/USD 当作与 BTC/USD 同价；
-//      Pyth 上线后分别读取 BTC/USD 和 cbBTC/USD。
+//      配置 signal_feed 为 btc 时只写 BTC/USD。Pyth 上线后分别读取 BTC/USD 和 cbBTC/USD。
 //   2. 调用 fix 完成当天的定价步骤
 //   3. 每隔最小交易间隔调用一次 trade（每次之前刷新价格），直到程序回答没有可交易的：
 //      NothingToTrade（都做完了）、DepegBlocksBuy（脱锚，等下一次）或 FixPending（定价没成功，
@@ -63,10 +63,12 @@ async function main() {
   const fundPda = (name: string) => pda([Buffer.from(name), fund.toBuffer()]);
   const epochPda = (epoch: BN) => pda([Buffer.from("epoch"), fund.toBuffer(), epoch.toArrayLike(Buffer, "le", 8)]);
 
-  // 信号价格（BTC/USD）和估值价格（cbBTC/USD）
+  // 写入 BTC/USD 和 cbBTC/USD。signal_feed 为 cbBtc 时两个都写（devnet 上 cbBTC 当作与 BTC 同价，
+  // fund 用 cbBTC/USD、拿 BTC/USD 检查脱锚）；为 btc 时只写 BTC/USD，cbBTC/USD 写 0 表示没有这个价格源
   async function postPrice() {
     const price = await btcPriceMicroUsd();
-    await program.methods.setMockPrice(price, price).accountsPartial({ authority: admin, oracle }).rpc();
+    const cbbtc = "btc" in f.config.signalFeed ? new BN(0) : price;
+    await program.methods.setMockPrice(price, cbbtc).accountsPartial({ authority: admin, oracle }).rpc();
     return price.toNumber() / 1e6;
   }
 

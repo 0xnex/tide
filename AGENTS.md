@@ -6,7 +6,7 @@ Guidance for AI coding agents (and human contributors) working on this repositor
 
 `tide` is a Solana (Anchor) program for a pooled BTC fund. Users queue USDC subscriptions and share redemptions; at 01:00 UTC each day the fixing price is recorded and compared with the 50-day moving average. Settlement then sets aside the redemption slice, nets subscriptions against it, and rebalances the fund toward all-cbBTC (above the average) or all-USDC (below) through capped trades. Shares follow actual execution, never a USD valuation. Users then `claim` their shares or USDC. It is a **devnet prototype**: oracle and exchange are mocks.
 
-**Design in transition.** The target design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/` (decisions; 0005–0007 replace parts of 0002–0004). The invariants below describe that target design. Settlement already runs as a `fix` step plus capped `trade` steps, redeemers are paid what their redemption slice sells for, and subscriptions become shares by the asset they add. The 48-hour config timelock, the subscription pause, the moving-average backfill, the withdrawal fee, the subscription cap and pending cancels are built. Until the rest of the migration lands, the signal still uses BTC/USD. Treat any difference between that code and these invariants as migration work to do, not as a rule to restore.
+**Design in transition.** The target design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/` (decisions; 0005–0007 replace parts of 0002–0004). The invariants below describe that target design. Settlement already runs as a `fix` step plus capped `trade` steps, redeemers are paid what their redemption slice sells for, and subscriptions become shares by the asset they add. The 48-hour config timelock, the subscription pause, the moving-average backfill, the withdrawal fee, the subscription cap and pending cancels are built. The signal follows the `signal_feed` config: cbBTC/USD by default, BTC/USD when there is no cbBTC/USD feed. Treat any difference between that code and these invariants as migration work to do, not as a rule to restore.
 
 ## Replies
 
@@ -70,7 +70,7 @@ flowchart LR
 8. **Integer math only.** No floats in `fund-logic` or the program. Use `u128` intermediates and checked arithmetic; round in favor of the fund (down for amounts paid out, up for amounts the fund must sell to cover a payout).
 9. **One settlement per epoch,** opened at its fixing time. Only the keeper may drive it during the keeper window; after that, anyone may.
 10. **Step atomicity.** Settlement is several instructions (ADR 0001). Within each instruction, all token movements and checks happen together, so a failure rolls that step back. The state between steps must always let the next step resume.
-11. **Price feeds.** The signal and moving average use Pyth cbBTC/USD when that feed exists, otherwise BTC/USD (ADR 0005). Netting and `min_out` use cbBTC/USD. When both feeds exist, a gap above the depeg threshold blocks buys (ADR 0003). A missed day's fixing price may be backfilled only with a Pyth update published in that day's fixing window.
+11. **Price feeds.** The signal and moving average use Pyth cbBTC/USD when that feed exists, otherwise BTC/USD (ADR 0005). Netting and `min_out` use cbBTC/USD (BTC/USD when there is no cbBTC/USD feed). When the signal uses cbBTC/USD, a gap above the depeg threshold against BTC/USD blocks buys (ADR 0003), and so does a missing or stale BTC/USD reference, which never blocks sells or fixing. With only BTC/USD there is no depeg check and trades rely on the slippage bound. A missed day's fixing price may be backfilled only with a Pyth update published in that day's fixing window.
 12. **Withdrawal fee.** 1% of the USDC a redeemer claims goes to the fee address, set at `initialize` and changeable only through the 48-hour timelock. `claim` only records it in `FundState.fees_owed` (the USDC stays in the payout vault) and `collect_fees` pays it out, so a problem with the fee address's token account can never block a claim. The rate is capped at 1% in code. There is no performance fee and no redemption fee (ADR 0007).
 
 ## Keeping the two layers in sync
@@ -83,6 +83,7 @@ These are easy to break when editing:
 - `Ticket` (program) mirrors `fund_logic::Ticket`, including `shares_claimed`.
 - `EpochRecord` (program) mirrors `fund_logic::EpochRecord`, including the five `unclaimed_*` fields and the two `cancelled_*` fields. Update `set_from_logic`, `set_unclaimed`, and `to_logic`.
 - Every `fund_logic::FundError` variant needs a matching `FundErrorCode` and an arm in `map_err`. The match is exhaustive, so the compiler will remind you.
+- `ConfigData.signal_feed` (`SignalFeedData`) mirrors `fund_logic::SignalFeed`; map it in `to_logic`.
 - `ConfigData` has three extra fields checked in the program, not in `fund-logic`: `max_staleness_secs`, `keeper` (mapped to `fund_logic::Caller`) and `fee_address` (where `collect_fees` sends the withdrawal fee).
 
 ## Units

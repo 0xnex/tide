@@ -23,9 +23,12 @@
 //! - 治理：管理员（应为外部多签，比如 Squads）提议一份完整的新配置，48 小时之后才能生效；
 //!   唯一立即生效的操作是暂停、恢复申购。赎回永远不能暂停，管理员也不能动基金资产
 //!
+//! - 价格源（ADR 0005）：config.signal_feed 为 CbBtc 时信号、均线、轧差和 min_out 都用 cbBTC/USD，
+//!   有 BTC/USD 时用它检查脱锚；为 Btc 时都用 BTC/USD，不检查脱锚
+//!
 //! 原型限制（上主网前必须替换）：
-//! - 价格来自 MockOracle（管理员手动设置两个价格：BTC/USD 信号价格、cbBTC/USD 估值价格），
-//!   主网应改为 Pyth 的两个价格源
+//! - 价格来自 MockOracle（管理员手动设置 BTC/USD 和 cbBTC/USD 两个价格，0 表示没有这个价格源），
+//!   主网应改为 Pyth 的价格源
 //! - 兑换走 MockMarket（按预言机价格成交、收固定手续费），主网应改为 Jupiter
 //!
 //! 所有记账逻辑在 fund-logic crate 中（纯 Rust，有完整单元测试），本文件只负责
@@ -369,10 +372,11 @@ pub mod tide {
         // 模拟预言机每个价格源只有一个价格：它必须在定价窗口内发布，并且不超过
         // max_staleness_secs，所以目前只能在 1 点后几十秒内定价。
         // 换成 Pyth 后，定价价格用 1 点的历史价格更新。
-        let prices = fresh_prices(&ctx.accounts.oracle, now, fund_cfg.max_staleness_secs)?;
+        let prices = fresh_prices(&ctx.accounts.oracle, &fund_cfg, now)?;
 
         let cfg = fund_cfg.to_logic();
-        let mut st = ctx.accounts.fund.state.to_logic();
+        // 基金状态有 1.5KB，放在堆上：SBF 每个栈帧只有 4KB
+        let mut st = Box::new(ctx.accounts.fund.state.to_logic());
         let caller = fund_cfg.caller(&ctx.accounts.cranker.key());
         let logic::FixOutcome { record, fee_usdc } =
             logic::fix(&mut st, now, &prices, caller, &cfg).map_err(map_err)?;
@@ -448,7 +452,7 @@ pub mod tide {
             epoch: record.epoch,
             first_epoch: record.first_epoch,
             signal_price: record.signal_price,
-            valuation_price: record.valuation_price,
+            reference_price: record.reference_price,
             moving_average: record.moving_average,
             target_btc: record.target_btc,
         });
@@ -461,13 +465,14 @@ pub mod tide {
     pub fn trade(ctx: Context<Trade>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let fund_cfg = ctx.accounts.fund.config;
-        let latest = fresh_prices(&ctx.accounts.oracle, now, fund_cfg.max_staleness_secs)?;
+        let latest = fresh_prices(&ctx.accounts.oracle, &fund_cfg, now)?;
         let prices = logic::MarketPrices {
-            signal: latest.signal.price,
-            valuation: latest.valuation.price,
+            cbbtc: latest.cbbtc.map(|p| p.price),
+            btc: latest.btc.map(|p| p.price),
         };
         let cfg = fund_cfg.to_logic();
-        let mut st = ctx.accounts.fund.state.to_logic();
+        // 基金状态有 1.5KB，放在堆上：SBF 每个栈帧只有 4KB
+        let mut st = Box::new(ctx.accounts.fund.state.to_logic());
         let caller = fund_cfg.caller(&ctx.accounts.cranker.key());
         let plan = logic::plan_trade(&st, now, &prices, caller, &cfg).map_err(map_err)?;
 
@@ -522,8 +527,7 @@ pub mod tide {
                         usdc_dest,
                     )
                 };
-                let got =
-                    logic::market_fill(&plan, prices.valuation, market.fee_bps).map_err(map_err)?;
+                let got = logic::market_fill(&plan, plan.price, market.fee_bps).map_err(map_err)?;
                 fund_transfer(
                     &tp,
                     &fund_ai,
@@ -612,20 +616,14 @@ pub mod tide {
     /// （换成 Pyth 后传那一天的历史价格更新）。
     pub fn backfill_price(ctx: Context<BackfillPrice>, day: i64) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
-        let oracle = &ctx.accounts.oracle;
-        let signal = logic::PricePoint {
-            price: oracle.signal_price,
-            publish_time: oracle.signal_publish_time,
-        };
+        let prices = oracle_feeds(&ctx.accounts.oracle);
         let fund = &mut ctx.accounts.fund;
         let cfg = fund.config.to_logic();
         let mut st = fund.state.to_logic();
-        logic::backfill_price(&mut st, day, &signal, now, &cfg).map_err(map_err)?;
+        let signal_price =
+            logic::backfill_price(&mut st, day, &prices, now, &cfg).map_err(map_err)?;
         fund.state = StateData::from_logic(&st);
-        emit!(PriceBackfilled {
-            day,
-            signal_price: signal.price,
-        });
+        emit!(PriceBackfilled { day, signal_price });
         Ok(())
     }
 
@@ -633,24 +631,25 @@ pub mod tide {
     // 原型专用：模拟预言机和模拟交易所（主网版本删除）
     // ------------------------------------------------------------------
 
+    /// 价格为 0 表示没有这个价格源
     pub fn init_mock_oracle(
         ctx: Context<InitMockOracle>,
-        signal_price: u64,
-        valuation_price: u64,
+        btc_price: u64,
+        cbbtc_price: u64,
     ) -> Result<()> {
         let o = &mut ctx.accounts.oracle;
         o.authority = ctx.accounts.authority.key();
-        o.set(signal_price, valuation_price, Clock::get()?.unix_timestamp);
+        o.set(btc_price, cbbtc_price, Clock::get()?.unix_timestamp);
         Ok(())
     }
 
     pub fn set_mock_price(
         ctx: Context<SetMockPrice>,
-        signal_price: u64,
-        valuation_price: u64,
+        btc_price: u64,
+        cbbtc_price: u64,
     ) -> Result<()> {
         let o = &mut ctx.accounts.oracle;
-        o.set(signal_price, valuation_price, Clock::get()?.unix_timestamp);
+        o.set(btc_price, cbbtc_price, Clock::get()?.unix_timestamp);
         Ok(())
     }
 
@@ -709,35 +708,59 @@ fn fund_transfer<'info>(
     )
 }
 
-/// 读取模拟预言机的两个价格（信号、估值）及发布时间，检查非零且不超过 max_staleness_secs
-fn fresh_prices(
-    oracle: &MockOracle,
-    now: i64,
-    max_staleness_secs: i64,
-) -> Result<logic::FixPrices> {
-    let prices = logic::FixPrices {
-        signal: logic::PricePoint {
-            price: oracle.signal_price,
-            publish_time: oracle.signal_publish_time,
-        },
-        valuation: logic::PricePoint {
-            price: oracle.valuation_price,
-            publish_time: oracle.valuation_publish_time,
-        },
+/// 模拟预言机的两个价格源及发布时间；价格为 0 表示没有这个价格源
+fn oracle_feeds(oracle: &MockOracle) -> logic::FixPrices {
+    let feed = |price: u64, publish_time: i64| {
+        (price > 0).then_some(logic::PricePoint {
+            price,
+            publish_time,
+        })
     };
-    for p in [prices.signal, prices.valuation] {
-        require!(p.price > 0, FundErrorCode::BadPrice);
-        require!(
-            now >= p.publish_time && now - p.publish_time <= max_staleness_secs,
-            FundErrorCode::StalePrice
-        );
+    logic::FixPrices {
+        cbbtc: feed(oracle.cbbtc_price, oracle.cbbtc_publish_time),
+        btc: feed(oracle.btc_price, oracle.btc_publish_time),
     }
-    Ok(prices)
+}
+
+/// 读取价格源并检查是否过旧（fund-logic 看不到）。选定的价格源（signal_feed）过旧时报错；
+/// 另一个只是脱锚检查的参照，过旧时当作没有：fund-logic 会因此不买入，但卖出和定价照常。
+// 不内联：trade 的栈帧已经接近 SBF 的 4KB 上限
+#[inline(never)]
+fn fresh_prices(oracle: &MockOracle, cfg: &ConfigData, now: i64) -> Result<logic::FixPrices> {
+    let fresh = |p: &logic::PricePoint| {
+        now >= p.publish_time && now - p.publish_time <= cfg.max_staleness_secs
+    };
+    let feeds = oracle_feeds(oracle);
+    let (chosen, reference) = match cfg.signal_feed {
+        SignalFeedData::CbBtc => (feeds.cbbtc, feeds.btc),
+        SignalFeedData::Btc => (feeds.btc, None),
+    };
+    if let Some(p) = chosen {
+        require!(fresh(&p), FundErrorCode::StalePrice);
+    }
+    let reference = reference.filter(fresh);
+    Ok(match cfg.signal_feed {
+        SignalFeedData::CbBtc => logic::FixPrices {
+            cbbtc: chosen,
+            btc: reference,
+        },
+        SignalFeedData::Btc => logic::FixPrices {
+            cbbtc: None,
+            btc: chosen,
+        },
+    })
 }
 
 // ----------------------------------------------------------------------
 // 账户数据
 // ----------------------------------------------------------------------
+
+/// 信号价格源，对应 fund_logic::SignalFeed
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, Debug, PartialEq, Eq)]
+pub enum SignalFeedData {
+    CbBtc,
+    Btc,
+}
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, Debug)]
 pub struct ConfigData {
@@ -753,6 +776,7 @@ pub struct ConfigData {
     pub public_slippage_bps: u16,
     pub withdrawal_fee_bps: u16,
     pub subscription_cap_usdc: u64,
+    pub signal_feed: SignalFeedData,
     pub max_staleness_secs: i64, // 预言机价格最多允许多旧
     pub keeper: Pubkey,          // 清算地址：清算窗口内唯一能驱动结算的签名人
     pub fee_address: Pubkey, // 收费地址（管理人）：collect_fees 把取款费付到它的 USDC 关联代币账户
@@ -773,6 +797,10 @@ impl ConfigData {
             public_slippage_bps: self.public_slippage_bps,
             withdrawal_fee_bps: self.withdrawal_fee_bps,
             subscription_cap_usdc: self.subscription_cap_usdc,
+            signal_feed: match self.signal_feed {
+                SignalFeedData::CbBtc => logic::SignalFeed::CbBtc,
+                SignalFeedData::Btc => logic::SignalFeed::Btc,
+            },
         }
     }
 
@@ -944,7 +972,7 @@ pub struct EpochRecord {
     pub epoch: u64,
     pub first_epoch: u64,
     pub signal_price: u64,
-    pub valuation_price: u64,
+    pub reference_price: u64,
     pub moving_average: u64,
     pub subscription_usdc: u64,
     pub minted_shares: u64,
@@ -973,7 +1001,7 @@ impl EpochRecord {
         self.epoch = r.epoch;
         self.first_epoch = r.first_epoch;
         self.signal_price = r.signal_price;
-        self.valuation_price = r.valuation_price;
+        self.reference_price = r.reference_price;
         self.moving_average = r.moving_average;
         self.subscription_usdc = r.subscription_usdc;
         self.minted_shares = r.minted_shares;
@@ -1003,7 +1031,7 @@ impl EpochRecord {
             epoch: self.epoch,
             first_epoch: self.first_epoch,
             signal_price: self.signal_price,
-            valuation_price: self.valuation_price,
+            reference_price: self.reference_price,
             moving_average: self.moving_average,
             subscription_usdc: self.subscription_usdc,
             minted_shares: self.minted_shares,
@@ -1033,18 +1061,18 @@ impl EpochRecord {
 #[derive(InitSpace)]
 pub struct MockOracle {
     pub authority: Pubkey,
-    pub signal_price: u64, // BTC/USD
-    pub signal_publish_time: i64,
-    pub valuation_price: u64, // cbBTC/USD
-    pub valuation_publish_time: i64,
+    pub btc_price: u64, // BTC/USD，0 表示没有这个价格源
+    pub btc_publish_time: i64,
+    pub cbbtc_price: u64, // cbBTC/USD，0 表示没有这个价格源
+    pub cbbtc_publish_time: i64,
 }
 
 impl MockOracle {
-    fn set(&mut self, signal_price: u64, valuation_price: u64, now: i64) {
-        self.signal_price = signal_price;
-        self.signal_publish_time = now;
-        self.valuation_price = valuation_price;
-        self.valuation_publish_time = now;
+    fn set(&mut self, btc_price: u64, cbbtc_price: u64, now: i64) {
+        self.btc_price = btc_price;
+        self.btc_publish_time = now;
+        self.cbbtc_price = cbbtc_price;
+        self.cbbtc_publish_time = now;
     }
 }
 
@@ -1064,7 +1092,7 @@ pub struct Fixed {
     pub epoch: u64,       // 定价当天的日期序号
     pub first_epoch: u64, // 这次定价关闭的最早一期（中间的定价被跳过时更早）
     pub signal_price: u64,
-    pub valuation_price: u64,
+    pub reference_price: u64,
     pub moving_average: u64,
     pub target_btc: bool,
 }

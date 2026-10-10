@@ -102,14 +102,14 @@ _Avoid_: Daily limit, max adjustment
 ## Prices
 
 **Signal price** (信号价格):
-The price used for the moving average and the hold-cbBTC-or-USDC signal: Pyth cbBTC/USD when that feed exists, otherwise BTC/USD.
+The price used for the moving average and the hold-cbBTC-or-USDC signal: Pyth cbBTC/USD when that feed exists, otherwise BTC/USD. The `signal_feed` config says which, and changes only through the timelock.
 
 **Moving average** (均线):
 The average signal price over the last 50 fixing times, one per calendar day; a day with no settlement is backfilled with that day's published fixing price. A day never backfilled is skipped and an earlier day counts instead; prices are kept for 64 days, so with fewer than 50 prices in that span the target is USDC.
 
 **Valuation price** (估值价格):
-The Pyth cbBTC/USD price used for netting and to bound each trade's fill; the fund itself is never valued in USD.
+The price used for netting and to bound each trade's fill: the same feed as the signal price, so Pyth cbBTC/USD, or BTC/USD when there is no cbBTC/USD feed. The fund itself is never valued in USD.
 _Avoid_: BTC price (when the cbBTC price is meant), NAV
 
 **Depeg** (脱锚):
-The Pyth cbBTC/USD price deviating from BTC/USD by more than a set threshold, checked before every trade; while it lasts the fund may sell cbBTC but not buy it.
+The Pyth cbBTC/USD price deviating from the BTC/USD price (the *reference price*) by more than a set threshold, checked before every trade and at netting; while it lasts the fund may sell cbBTC but not buy it. If the reference price is missing, stale or not from the fixing window, the peg cannot be confirmed and buys are blocked the same way. With no cbBTC/USD feed there is nothing to compare, so there is no depeg check.

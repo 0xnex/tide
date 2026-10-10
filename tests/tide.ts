@@ -11,6 +11,7 @@
 //   第 6 天：恢复锚定 -> 为 Alice 买入 cbBTC，她领到份额
 //   治理：配置修改等 48 小时时间锁；申购可以立即暂停，赎回不受影响；只有管理员能操作
 //   申购上限：算上待成交的申购，超过就拒绝；撤销待成交申购退回 USDC、腾出额度
+//   价格源：前面用 cbBTC/USD 作信号（脱锚时不买入）；治理之后换成 BTC/USD，没有 cbBTC/USD 也照常定价
 //   回填：某天没人定价，第二天任何人用那天 01:00 发布的价格回填均线，只能回填一次
 //   第 7 天：排队从不关闭。定价时刻之后的请求进入下一期，每个用户每期一张排队记录；
 //            关闭这一期的定价时刻之前可以撤销、全额退回，之后被拒绝
@@ -399,6 +400,7 @@ describe("tide", () => {
         publicSlippageBps: PUBLIC_SLIPPAGE_BPS,
         withdrawalFeeBps: 100,
         subscriptionCapUsdc: new BN(SUBSCRIPTION_CAP * USDC),
+        signalFeed: { cbBtc: {} }, // 先用 cbBTC/USD 作信号，治理测试里换成 BTC/USD
         maxStalenessSecs: new BN(600),
         keeper: admin.publicKey, // 清算地址：这里就是管理员钱包
         feeAddress: manager.publicKey,
@@ -547,8 +549,9 @@ describe("tide", () => {
     await subscribe(alice, aliceUsdc, 1_000 * USDC);
     await fixDay(52_000, 50_440); // cbBTC 比 BTC 低 3%，超过 2% 阈值
     const r = await program.account.epochRecord.fetch(epochPda(today));
-    expect(r.signalPrice.toString()).to.equal(usd(52_000).toString());
-    expect(r.valuationPrice.toString()).to.equal(usd(50_440).toString());
+    // 信号用 cbBTC/USD，BTC/USD 是脱锚检查的参照
+    expect(r.signalPrice.toString()).to.equal(usd(50_440).toString());
+    expect(r.referencePrice.toString()).to.equal(usd(52_000).toString());
     expect(r.targetBtc).to.equal(true); // 目标仍是 cbBTC
     expect(await trade()).to.equal("DepegBlocksBuy");
     expect(await tokenBalance(fundPda("btc_vault"))).to.equal(0n);
@@ -618,7 +621,8 @@ describe("tide", () => {
 
   it("治理：配置修改等 48 小时，申购可以立即暂停，只有管理员能操作", async () => {
     const cfg0 = (await program.account.fund.fetch(fund)).config;
-    const proposed = { ...cfg0, tradeCapUsdc: new BN(2_000 * USDC) };
+    // 改单笔上限，并把信号价格源换成 BTC/USD（比如 Pyth 没有 cbBTC/USD 的网络）
+    const proposed = { ...cfg0, tradeCapUsdc: new BN(2_000 * USDC), signalFeed: { btc: {} } };
     const asAdmin = { admin: admin.publicKey, fund };
 
     // 其他人不能提议、生效、暂停、恢复：基金地址由管理员推出，换了签名人就对不上
@@ -652,6 +656,7 @@ describe("tide", () => {
     await program.methods.applyConfig().accountsPartial(asAdmin).rpc();
     const f = await program.account.fund.fetch(fund);
     expect(f.config.tradeCapUsdc.toNumber()).to.equal(2_000 * USDC);
+    expect(f.config.signalFeed).to.deep.equal({ btc: {} });
     expect(f.pendingConfig).to.equal(null);
     await warpTo(now + 1);
     expect(await errorName(program.methods.applyConfig().accountsPartial(asAdmin).rpc())).to.equal("NoPendingConfig");
@@ -751,5 +756,15 @@ describe("tide", () => {
     await warpTo(now + 1);
     await subscribe(alice, aliceUsdc, room + 1);
     expect(await outstanding()).to.be.at.most(SUBSCRIPTION_CAP * USDC);
+  });
+
+  it("BTC/USD 作信号：用 BTC/USD 定价和交易，cbBTC/USD 即使有也不用，不检查脱锚", async () => {
+    // cbBTC/USD 比 BTC/USD 低 12%：用 BTC/USD 时不比较，照常定价、交易
+    await fixDay(57_000, 50_000);
+    const r = await program.account.epochRecord.fetch(epochPda(today));
+    expect(r.signalPrice.toString()).to.equal(usd(57_000).toString());
+    expect(r.referencePrice.toNumber()).to.equal(0);
+    const [, why] = await tradeUntilDone();
+    expect(why).to.equal("NothingToTrade");
   });
 });
