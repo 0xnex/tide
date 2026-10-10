@@ -9,6 +9,7 @@
 //   第 4 天：Bob 赎回全部 -> 基金只有 USDC，赎回资产定价时就完成，份额清零
 //   第 5 天：Alice 再申购；BTC 高于均线，但 cbBTC 比 BTC 低 3%（脱锚）-> 不买入，申购款留在托管里
 //   第 6 天：恢复锚定 -> 为 Alice 买入 cbBTC，她领到份额
+//   治理：配置修改等 48 小时时间锁；申购可以立即暂停，赎回不受影响；只有管理员能操作
 //   第 7 天：排队从不关闭。定价时刻之后的请求进入下一期，每个用户每期一张排队记录；
 //            关闭这一期的定价时刻之前可以撤销、全额退回，之后被拒绝
 //
@@ -357,6 +358,7 @@ describe("tide", () => {
         minTradeIntervalSecs: new BN(TRADE_INTERVAL),
         keeperWindowSecs: new BN(KEEPER_WINDOW),
         publicSlippageBps: PUBLIC_SLIPPAGE_BPS,
+        withdrawalFeeBps: 100,
         maxStalenessSecs: new BN(600),
         keeper: admin.publicKey, // 清算地址：这里就是管理员钱包
       })
@@ -560,5 +562,53 @@ describe("tide", () => {
     expect(await exists(ticketPda(bob.publicKey, e7))).to.equal(false);
     expect(await errorName(claim(bob, bobUsdc, e8))).to.equal("EpochNotSettled");
     expect(await tokenBalance(escrow)).to.equal(BigInt(200 * USDC));
+  });
+
+  it("治理：配置修改等 48 小时，申购可以立即暂停，只有管理员能操作", async () => {
+    const cfg0 = (await program.account.fund.fetch(fund)).config;
+    const proposed = { ...cfg0, tradeCapUsdc: new BN(2_000 * USDC) };
+    const asAdmin = { admin: admin.publicKey, fund };
+
+    // 其他人不能提议、生效、暂停、恢复：基金地址由管理员推出，换了签名人就对不上
+    const byAlice = [
+      program.methods.proposeConfig(proposed),
+      program.methods.applyConfig(),
+      program.methods.pauseSubscriptions(),
+      program.methods.resumeSubscriptions(),
+    ];
+    for (const m of byAlice) {
+      expect(await errorName(m.accountsPartial({ admin: alice.publicKey, fund }).signers([alice]).rpc())).to.equal(
+        "ConstraintSeeds",
+      );
+    }
+
+    // 提议时就校验：取款费率最多 1%；定价时刻不能改
+    const bad = { ...cfg0, withdrawalFeeBps: 101 };
+    expect(await errorName(program.methods.proposeConfig(bad).accountsPartial(asAdmin).rpc())).to.equal("InvalidConfig");
+    const moved = { ...cfg0, settleOffsetSecs: new BN(2 * FIX_OFFSET) };
+    expect(await errorName(program.methods.proposeConfig(moved).accountsPartial(asAdmin).rpc())).to.equal(
+      "ConfigFieldFixed",
+    );
+
+    // 时间锁：提议之后 48 小时才能生效，时钟跳过去之后可以
+    const proposedAt = now;
+    await program.methods.proposeConfig(proposed).accountsPartial(asAdmin).rpc();
+    expect(await errorName(program.methods.applyConfig().accountsPartial(asAdmin).rpc())).to.equal("TimelockNotElapsed");
+    await warpTo(proposedAt + 2 * DAY - 1);
+    expect(await errorName(program.methods.applyConfig().accountsPartial(asAdmin).rpc())).to.equal("TimelockNotElapsed");
+    await warpTo(proposedAt + 2 * DAY);
+    await program.methods.applyConfig().accountsPartial(asAdmin).rpc();
+    const f = await program.account.fund.fetch(fund);
+    expect(f.config.tradeCapUsdc.toNumber()).to.equal(2_000 * USDC);
+    expect(f.pendingConfig).to.equal(null);
+    await warpTo(now + 1);
+    expect(await errorName(program.methods.applyConfig().accountsPartial(asAdmin).rpc())).to.equal("NoPendingConfig");
+
+    // 暂停只挡新的申购，赎回照常；恢复之后又可以申购
+    await program.methods.pauseSubscriptions().accountsPartial(asAdmin).rpc();
+    expect(await errorName(subscribe(alice, aliceUsdc, 100 * USDC))).to.equal("SubscriptionsPaused");
+    await redeem(alice, 1_000n);
+    await program.methods.resumeSubscriptions().accountsPartial(asAdmin).rpc();
+    await subscribe(alice, aliceUsdc, 100 * USDC);
   });
 });

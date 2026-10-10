@@ -47,6 +47,11 @@ pub const MAX_PENDING: usize = 8;
 /// 定价价格的发布时间必须落在 [定价时刻, 定价时刻 + FIX_WINDOW_SECS) 内。
 /// 调用人只能在这几十秒内发布的价格里挑，可利用的价差可以忽略。
 pub const FIX_WINDOW_SECS: i64 = 60;
+/// 配置修改的时间锁：提议之后至少 48 小时才能生效，持有人有时间先赎回。
+/// 写死在代码里，配置本身改不了它。
+pub const TIMELOCK_SECS: i64 = 172_800;
+/// 取款费率上限（ADR 0007），写死在代码里
+pub const MAX_WITHDRAWAL_FEE_BPS: u16 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FundError {
@@ -61,18 +66,21 @@ pub enum FundError {
     BelowMinSubscription,
     ZeroAmount,
     TooManyPrices,
-    PriceNotAtFixTime, // 定价价格的发布时间不在定价窗口内
-    NothingToTrade,    // 没有需要交易的东西
-    TradeTooSoon,      // 距离上一笔交易不到 min_trade_interval_secs
-    DepegBlocksBuy,    // 需要买入 cbBTC，但 cbBTC 脱锚
-    SliceNotSold,      // 这一期的赎回资产还没卖完
-    WrongEpochRecord,  // 传入的期记录与交易计划不符
-    TooManySlices,     // 未卖完的赎回资产已有 MAX_SLICES 期
-    FixPending,        // 已过今天的定价时刻、还没定价，基金调仓等待定价
-    KeeperOnly,        // 清算窗口内只有清算地址能驱动结算
-    WrongEpoch,        // 排队记录不是这一刻开放的那一期
-    TooLateToCancel,   // 已过关闭这一期的定价时刻，不能再撤销
-    NothingToCancel,   // 排队记录是空的
+    PriceNotAtFixTime,   // 定价价格的发布时间不在定价窗口内
+    NothingToTrade,      // 没有需要交易的东西
+    TradeTooSoon,        // 距离上一笔交易不到 min_trade_interval_secs
+    DepegBlocksBuy,      // 需要买入 cbBTC，但 cbBTC 脱锚
+    SliceNotSold,        // 这一期的赎回资产还没卖完
+    WrongEpochRecord,    // 传入的期记录与交易计划不符
+    TooManySlices,       // 未卖完的赎回资产已有 MAX_SLICES 期
+    FixPending,          // 已过今天的定价时刻、还没定价，基金调仓等待定价
+    KeeperOnly,          // 清算窗口内只有清算地址能驱动结算
+    WrongEpoch,          // 排队记录不是这一刻开放的那一期
+    TooLateToCancel,     // 已过关闭这一期的定价时刻，不能再撤销
+    NothingToCancel,     // 排队记录是空的
+    SubscriptionsPaused, // 管理员暂停了申购（赎回永远不能暂停）
+    TimelockNotElapsed,  // 配置提议还没过时间锁
+    ConfigFieldFixed,    // 定价时刻和均线窗口只能在创建时设定
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +96,7 @@ pub struct Config {
     pub min_trade_interval_secs: i64, // 两笔交易之间至少间隔多少秒
     pub keeper_window_secs: i64,      // 定价时刻之后多少秒内只有清算地址能驱动结算
     pub public_slippage_bps: u16,     // 窗口之后其他人交易的滑点上限，比 max_slippage_bps 更严
+    pub withdrawal_fee_bps: u16,      // 取款费率（领取赎回款时付给管理人），最多 1%；尚未收取
 }
 
 impl Config {
@@ -105,6 +114,7 @@ impl Config {
             min_trade_interval_secs: 60,
             keeper_window_secs: 1_800,
             public_slippage_bps: 10,
+            withdrawal_fee_bps: 100,
         }
     }
 
@@ -131,6 +141,9 @@ impl Config {
             || self.settle_offset_secs + self.keeper_window_secs > SECONDS_PER_DAY
             || self.public_slippage_bps > self.max_slippage_bps
         {
+            return Err(FundError::InvalidConfig);
+        }
+        if self.withdrawal_fee_bps > MAX_WITHDRAWAL_FEE_BPS {
             return Err(FundError::InvalidConfig);
         }
         Ok(())
@@ -175,6 +188,7 @@ pub struct FundState {
     pub slice_count: u8,
     pub pending: [Pending; MAX_PENDING], // 待成交申购，最早的在前
     pub pending_count: u8,
+    pub subscriptions_paused: bool, // 管理员可以立即暂停、恢复申购；赎回永远不能暂停
 }
 
 impl FundState {
@@ -198,6 +212,7 @@ impl FundState {
             slice_count: 0,
             pending: [Pending::default(); MAX_PENDING],
             pending_count: 0,
+            subscriptions_paused: false,
         }
     }
 
@@ -479,6 +494,35 @@ fn check_keeper_window(now_unix: i64, caller: Caller, cfg: &Config) -> Result<()
 }
 
 // ---------------------------------------------------------------------------
+// 治理：配置修改走时间锁
+// ---------------------------------------------------------------------------
+
+/// 提议一份完整的新配置，替换 current：先校验，返回最早可以生效的时刻。
+/// 新的提议取代还没生效的旧提议，重新计时。
+///
+/// 定价时刻和均线窗口不能改：
+/// - 期号按定价时刻划分。当天定价之后把定价时刻往后挪，这一刻的请求会被算进
+///   已经定价的那一期，冒领那一期别人的份额，别人的领取从此失败。
+/// - 均线窗口变长时，已记录的价格不够算均线，基金会一连几天持有 USDC：这是策略改动。
+pub fn propose_config(current: &Config, new: &Config, now_unix: i64) -> Result<i64, FundError> {
+    new.validate()?;
+    if new.settle_offset_secs != current.settle_offset_secs || new.window != current.window {
+        return Err(FundError::ConfigFieldFixed);
+    }
+    now_unix
+        .checked_add(TIMELOCK_SECS)
+        .ok_or(FundError::Overflow)
+}
+
+/// 提议的配置到了 effective_at 才能生效
+pub fn check_timelock(effective_at: i64, now_unix: i64) -> Result<(), FundError> {
+    if now_unix < effective_at {
+        return Err(FundError::TimelockNotElapsed);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // 申购、赎回排队
 // ---------------------------------------------------------------------------
 
@@ -547,6 +591,10 @@ pub fn request_subscription(
     }
     if amount < cfg.min_subscription {
         return Err(FundError::BelowMinSubscription);
+    }
+    // 暂停只挡新的申购：已经排队和待成交的照常定价、成交、领取
+    if s.subscriptions_paused {
+        return Err(FundError::SubscriptionsPaused);
     }
     enqueue(s, t, amount, 0, now_unix, cfg)
 }
@@ -1747,6 +1795,92 @@ mod tests {
     }
 
     #[test]
+    fn config_changes_wait_for_the_timelock() {
+        let now = 10 * DAY;
+        // 提议时就校验：取款费率最多 1%
+        let bad = Config {
+            withdrawal_fee_bps: 101,
+            ..cfg()
+        };
+        assert_eq!(
+            propose_config(&cfg(), &bad, now),
+            Err(FundError::InvalidConfig)
+        );
+        let new = Config {
+            trade_cap_usdc: 50_000 * USDC,
+            keeper_window_secs: 600,
+            ..cfg()
+        };
+        let at = propose_config(&cfg(), &new, now).unwrap();
+        assert_eq!(at, now + 48 * 3_600);
+        assert_eq!(check_timelock(at, now), Err(FundError::TimelockNotElapsed));
+        assert_eq!(
+            check_timelock(at, at - 1),
+            Err(FundError::TimelockNotElapsed)
+        );
+        assert_eq!(check_timelock(at, at), Ok(()));
+    }
+
+    #[test]
+    fn the_fixing_time_and_the_moving_average_window_cannot_be_changed() {
+        // 改定价时刻会让已经定价过的一期重新开放（新请求进到已经定价的期里，冒领别人的份额）；
+        // 改均线窗口会让均线暂时算不出来、基金悄悄换成 USDC。两者都不能通过治理修改。
+        let fixed = [
+            Config {
+                settle_offset_secs: 2 * 3_600,
+                ..cfg()
+            },
+            Config {
+                window: 60,
+                ..cfg()
+            },
+        ];
+        for new in fixed {
+            assert_eq!(
+                propose_config(&cfg(), &new, 10 * DAY),
+                Err(FundError::ConfigFieldFixed),
+                "{new:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pausing_blocks_new_subscriptions_only() {
+        let mut h = Harness::seeded(50_000 * USDC);
+        let mut ta = Ticket::default();
+        h.subscribe(&mut ta, 1_000 * USDC, 10 * DAY);
+        h.settle_day(10, 51_000 * USDC, 0);
+        h.claim(&mut ta).unwrap();
+
+        // 暂停之前已经排队的申购照常处理；暂停之后新的申购被拒绝
+        let (mut tb, mut tc, mut tr) = (Ticket::default(), Ticket::default(), Ticket::default());
+        h.subscribe(&mut tb, 500 * USDC, 11 * DAY);
+        h.subscribe(&mut tc, 200 * USDC, 11 * DAY);
+        h.s.subscriptions_paused = true;
+        let before = h.s.clone();
+        assert_eq!(
+            request_subscription(&mut h.s, &mut Ticket::default(), 100 * USDC, 11 * DAY, &h.c),
+            Err(FundError::SubscriptionsPaused)
+        );
+        assert_eq!(h.s, before);
+
+        // 赎回、撤销、定价、交易和领取都照常
+        h.redeem(&mut tr, 300 * USDC, 11 * DAY);
+        assert_eq!(h.cancel(&mut tc, 11 * DAY).unwrap().usdc, 200 * USDC);
+        let r = h.settle_day(11, 52_000 * USDC, 0);
+        assert_eq!(
+            (r.subscription_usdc, r.redemption_shares),
+            (500 * USDC, 300 * USDC)
+        );
+        assert!(h.claim(&mut tb).unwrap().0 > 0);
+        assert!(h.claim(&mut tr).unwrap().1 > 0);
+
+        // 恢复之后又可以申购
+        h.s.subscriptions_paused = false;
+        h.subscribe(&mut Ticket::default(), 100 * USDC, 12 * DAY);
+    }
+
+    #[test]
     fn config_validation() {
         let bad = [
             Config { window: 0, ..cfg() },
@@ -1796,6 +1930,11 @@ mod tests {
                 public_slippage_bps: 31,
                 ..cfg()
             },
+            // 取款费率在代码里封顶 1%
+            Config {
+                withdrawal_fee_bps: 101,
+                ..cfg()
+            },
         ];
         for c in bad {
             assert_eq!(c.validate(), Err(FundError::InvalidConfig), "{c:?}");
@@ -1805,6 +1944,7 @@ mod tests {
         assert_eq!(cfg().min_trade_interval_secs, 60);
         assert_eq!(cfg().keeper_window_secs, 1_800);
         assert_eq!(cfg().public_slippage_bps, 10);
+        assert_eq!(cfg().withdrawal_fee_bps, 100);
     }
 
     #[test]
@@ -2812,6 +2952,7 @@ mod tests {
         claimed: Vec<(u64, u64)>, // 每次定价（h.records 的下标）领取的 (份额, USDC)
         cancels: u32,
         cancels_rejected: u32,
+        paused_rejections: u32,
     }
 
     /// 排队记录还没被定价处理
@@ -2827,6 +2968,7 @@ mod tests {
                 claimed: vec![],
                 cancels: 0,
                 cancels_rejected: 0,
+                paused_rejections: 0,
             }
         }
 
@@ -2843,7 +2985,17 @@ mod tests {
             }
         }
 
+        /// 申购；暂停期间必须被拒绝、什么都不改
         fn subscribe(&mut self, h: &mut Harness, u: usize, amount: u64, now: i64) {
+            if h.s.subscriptions_paused {
+                let before = h.s.clone();
+                let mut t = Ticket::default();
+                let got = request_subscription(&mut h.s, &mut t, amount, now, &h.c);
+                assert_eq!(got, Err(FundError::SubscriptionsPaused));
+                assert_eq!(h.s, before);
+                self.paused_rejections += 1;
+                return;
+            }
             let i = self.ticket_at(h, u, now);
             h.subscribe(&mut self.tickets[u][i], amount, now);
         }
@@ -3063,7 +3215,7 @@ mod tests {
         let mut tally = Tally::default();
         let (mut late, mut dust, mut carried, mut illiquid_days) = (0, 0, 0, 0);
         let (mut public_fixes, mut public_fixes_rejected) = (0, 0);
-        let (mut late_cancels_rejected, mut cancels) = (0, 0);
+        let (mut late_cancels_rejected, mut cancels, mut paused_rejections) = (0, 0, 0);
         for seed in 1..=20u64 {
             let mut rng = Rng(seed * 7919);
             let mut h = Harness::seeded(50_000 * USDC);
@@ -3073,6 +3225,10 @@ mod tests {
             let mut valuation = price;
             let mut fail_pct = 30;
             for day in 10..300i64 {
+                // 管理员随机暂停、恢复申购：赎回、定价、交易和领取照常
+                if rng.below(15) == 0 {
+                    h.s.subscriptions_paused = !h.s.subscriptions_paused;
+                }
                 for u in 0..users.tickets.len() {
                     let r = rng.below(14);
                     if r < 2 {
@@ -3136,7 +3292,10 @@ mod tests {
                         }
                     }
                     users.subscribe(&mut h, u, (1 + rng.below(1_000)) * USDC, t);
-                    assert!(users.tickets[u].iter().any(|tk| tk.epoch == day as u64 + 1));
+                    assert!(
+                        h.s.subscriptions_paused
+                            || users.tickets[u].iter().any(|tk| tk.epoch == day as u64 + 1)
+                    );
                     users.random_cancels(&mut h, &mut rng, t);
                     users.assert_share_supply(&h);
                 }
@@ -3191,8 +3350,10 @@ mod tests {
                 users.claim_ready(&mut h);
                 users.assert_share_supply(&h);
             }
+            h.s.subscriptions_paused = false;
             users.drain(&mut h, 300, price);
             cancels += users.cancels;
+            paused_rejections += users.paused_rejections;
             tally.netted += h.records.iter().filter(|r| r.netted_btc > 0).count();
         }
         // 各种交易路径、晚定价、脱锚的两种情况、顺延和极小额赎回都应被覆盖到
@@ -3219,8 +3380,8 @@ mod tests {
             "{late} {dust} {carried} {illiquid_days}"
         );
         assert!(
-            cancels > 0 && late_cancels_rejected > 0,
-            "{cancels} {late_cancels_rejected}"
+            cancels > 0 && late_cancels_rejected > 0 && paused_rejections > 0,
+            "{cancels} {late_cancels_rejected} {paused_rejections}"
         );
     }
 

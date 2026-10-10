@@ -15,6 +15,9 @@
 //!   这一期的请求顺延到下一次 fix，一次 fix 可以关闭好几期
 //! - 用户调用 claim 领取份额（可以分几次领取已成交的部分）；赎回人要等这一期的赎回资产卖完才能领取 USDC
 //!
+//! - 治理：管理员（应为外部多签，比如 Squads）提议一份完整的新配置，48 小时之后才能生效；
+//!   唯一立即生效的操作是暂停、恢复申购。赎回永远不能暂停，管理员也不能动基金资产
+//!
 //! 原型限制（上主网前必须替换）：
 //! - 价格来自 MockOracle（管理员手动设置两个价格：BTC/USD 信号价格、cbBTC/USD 估值价格），
 //!   主网应改为 Pyth 的两个价格源
@@ -45,11 +48,7 @@ pub mod tide {
     /// 第 1 步：创建基金账户和份额代币
     pub fn initialize(ctx: Context<Initialize>, config: ConfigData) -> Result<()> {
         config.to_logic().validate().map_err(map_err)?;
-        require!(config.max_staleness_secs > 0, FundErrorCode::InvalidConfig);
-        require!(
-            config.keeper != Pubkey::default(),
-            FundErrorCode::InvalidConfig
-        );
+        check_program_config(&config)?;
         let fund = &mut ctx.accounts.fund;
         fund.admin = ctx.accounts.admin.key();
         fund.usdc_mint = ctx.accounts.usdc_mint.key();
@@ -59,6 +58,7 @@ pub mod tide {
         fund.market = ctx.accounts.market.key();
         fund.config = config;
         fund.state = StateData::from_logic(&logic::FundState::new());
+        fund.pending_config = None;
         fund.bump = ctx.bumps.fund;
         Ok(())
     }
@@ -76,6 +76,53 @@ pub mod tide {
         let mut st = fund.state.to_logic();
         logic::seed_prices(&mut st, &prices, &cfg).map_err(map_err)?;
         fund.state = StateData::from_logic(&st);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // 治理（只有管理员）
+    // ------------------------------------------------------------------
+
+    /// 提议一份完整的新配置，至少 48 小时之后才能 apply_config。
+    /// 新的提议取代还没生效的旧提议、重新计时；要撤回就提议当前配置。
+    pub fn propose_config(ctx: Context<AdminOnly>, config: ConfigData) -> Result<()> {
+        check_program_config(&config)?;
+        let now = Clock::get()?.unix_timestamp;
+        let current = ctx.accounts.fund.config.to_logic();
+        let effective_at =
+            logic::propose_config(&current, &config.to_logic(), now).map_err(map_err)?;
+        ctx.accounts.fund.pending_config = Some(PendingConfig {
+            config,
+            effective_at,
+        });
+        emit!(ConfigProposed { effective_at });
+        Ok(())
+    }
+
+    /// 时间锁过了之后让提议的配置生效
+    pub fn apply_config(ctx: Context<AdminOnly>) -> Result<()> {
+        let fund = &mut ctx.accounts.fund;
+        let pending = fund
+            .pending_config
+            .ok_or_else(|| error!(FundErrorCode::NoPendingConfig))?;
+        let now = Clock::get()?.unix_timestamp;
+        logic::check_timelock(pending.effective_at, now).map_err(map_err)?;
+        fund.config = pending.config;
+        fund.pending_config = None;
+        emit!(ConfigApplied {});
+        Ok(())
+    }
+
+    /// 立即暂停申购。已经排队和待成交的申购照常处理，赎回、结算和领取不受影响
+    pub fn pause_subscriptions(ctx: Context<AdminOnly>) -> Result<()> {
+        ctx.accounts.fund.state.subscriptions_paused = true;
+        emit!(SubscriptionPauseChanged { paused: true });
+        Ok(())
+    }
+
+    pub fn resume_subscriptions(ctx: Context<AdminOnly>) -> Result<()> {
+        ctx.accounts.fund.state.subscriptions_paused = false;
+        emit!(SubscriptionPauseChanged { paused: false });
         Ok(())
     }
 
@@ -528,6 +575,16 @@ pub mod tide {
     }
 }
 
+/// fund-logic 看不到的配置项：预言机价格最多多旧、清算地址
+fn check_program_config(config: &ConfigData) -> Result<()> {
+    require!(config.max_staleness_secs > 0, FundErrorCode::InvalidConfig);
+    require!(
+        config.keeper != Pubkey::default(),
+        FundErrorCode::InvalidConfig
+    );
+    Ok(())
+}
+
 /// 由基金 PDA 签名的代币转账；数量为 0 时跳过
 fn fund_transfer<'info>(
     token_program: &AccountInfo<'info>,
@@ -597,6 +654,7 @@ pub struct ConfigData {
     pub min_trade_interval_secs: i64,
     pub keeper_window_secs: i64,
     pub public_slippage_bps: u16,
+    pub withdrawal_fee_bps: u16,
     pub max_staleness_secs: i64, // 预言机价格最多允许多旧
     pub keeper: Pubkey,          // 清算地址：清算窗口内唯一能驱动结算的签名人
 }
@@ -615,6 +673,7 @@ impl ConfigData {
             min_trade_interval_secs: self.min_trade_interval_secs,
             keeper_window_secs: self.keeper_window_secs,
             public_slippage_bps: self.public_slippage_bps,
+            withdrawal_fee_bps: self.withdrawal_fee_bps,
         }
     }
 
@@ -661,6 +720,7 @@ pub struct StateData {
     pub slice_count: u8,
     pub pending: [PendingData; 8], // 必须等于 fund_logic::MAX_PENDING
     pub pending_count: u8,
+    pub subscriptions_paused: bool,
 }
 
 impl StateData {
@@ -691,6 +751,7 @@ impl StateData {
                 usdc: x.usdc,
             }),
             pending_count: s.pending_count,
+            subscriptions_paused: s.subscriptions_paused,
         }
     }
     fn to_logic(&self) -> logic::FundState {
@@ -720,8 +781,16 @@ impl StateData {
                 usdc: x.usdc,
             }),
             pending_count: self.pending_count,
+            subscriptions_paused: self.subscriptions_paused,
         }
     }
+}
+
+/// 还没生效的配置提议
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, Debug)]
+pub struct PendingConfig {
+    pub config: ConfigData,
+    pub effective_at: i64, // 最早生效时刻（提议时刻 + 48 小时）
 }
 
 #[account]
@@ -736,6 +805,8 @@ pub struct Fund {
     pub config: ConfigData,
     pub state: StateData,
     pub bump: u8,
+    // 放在最后：Option 的长度会变，放前面会让 state 的偏移随它变化
+    pub pending_config: Option<PendingConfig>,
 }
 
 #[account]
@@ -891,6 +962,19 @@ pub struct Fixed {
     pub valuation_price: u64,
     pub moving_average: u64,
     pub target_btc: bool,
+}
+
+#[event]
+pub struct ConfigProposed {
+    pub effective_at: i64,
+}
+
+#[event]
+pub struct ConfigApplied {}
+
+#[event]
+pub struct SubscriptionPauseChanged {
+    pub paused: bool,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug)]
@@ -1257,6 +1341,14 @@ pub enum FundErrorCode {
     TooLateToCancel,
     #[msg("排队记录是空的，没有可撤销的")]
     NothingToCancel,
+    #[msg("申购已暂停（赎回不受影响）")]
+    SubscriptionsPaused,
+    #[msg("配置提议还没过 48 小时时间锁")]
+    TimelockNotElapsed,
+    #[msg("没有待生效的配置提议")]
+    NoPendingConfig,
+    #[msg("定价时刻和均线窗口只能在创建时设定")]
+    ConfigFieldFixed,
 }
 
 fn map_err(e: logic::FundError) -> Error {
@@ -1285,6 +1377,9 @@ fn map_err(e: logic::FundError) -> Error {
         E::WrongEpoch => FundErrorCode::WrongEpoch,
         E::TooLateToCancel => FundErrorCode::TooLateToCancel,
         E::NothingToCancel => FundErrorCode::NothingToCancel,
+        E::SubscriptionsPaused => FundErrorCode::SubscriptionsPaused,
+        E::TimelockNotElapsed => FundErrorCode::TimelockNotElapsed,
+        E::ConfigFieldFixed => FundErrorCode::ConfigFieldFixed,
     };
     error!(code)
 }

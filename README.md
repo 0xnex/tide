@@ -4,7 +4,7 @@
 
 > **Devnet prototype. Do not use with real money.** The oracle and exchange are mocks. Mainnet needs a security audit and legal advice: pooling other people's money and charging a fee for managing it is regulated in many jurisdictions.
 
-> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code runs settlement as a fixing step plus capped trades. Redeemers are paid their slice's actual proceeds, and subscriptions become shares by the cbBTC they add. The signal still uses BTC/USD, and the withdrawal fee and governance are not built yet. Sections marked *(current code)* describe what runs today.
+> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code runs settlement as a fixing step plus capped trades. Redeemers are paid their slice's actual proceeds, and subscriptions become shares by the cbBTC they add. The config timelock and subscription pause are built. The signal still uses BTC/USD, and the withdrawal fee is not charged yet (its capped rate field exists). Sections marked *(current code)* describe what runs today.
 
 ---
 
@@ -263,8 +263,10 @@ flowchart LR
 | `public_slippage_bps` | 10 | Non-keeper callers after the window (≤ `max_slippage_bps`) | current |
 | `keeper_window_secs` | 1800 | Keeper-only time after the fixing time | current |
 | Subscription cap | 1,000,000 USDC | Per epoch, incl. pending | planned |
-| Withdrawal fee | 100 bps (max 100) | Of each redemption claim, to the manager; replaces `redemption_fee_bps` | planned |
-| `keeper` | set at creation | Keeper address; change via 48 h timelock (planned) | current |
+| `withdrawal_fee_bps` | 100 (max 100) | Of each redemption claim, to the manager; replaces `redemption_fee_bps`. Field and cap exist; charging is planned | planned |
+| `keeper` | set at creation | Keeper address; change via 48 h timelock | current |
+| Config timelock | 48 h, fixed in code | `propose_config` a whole config, `apply_config` after 48 h; a new proposal restarts the clock. `window` and `settle_offset_secs` are set at creation and cannot change | current |
+| Subscription pause | off | `pause_subscriptions` / `resume_subscriptions`, immediate, admin only; redemptions can never be paused | current |
 | Fee address | set at creation | Change via 48 h timelock | planned |
 
 ### Accounts (PDAs)
