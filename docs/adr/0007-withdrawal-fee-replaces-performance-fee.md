@@ -1,6 +1,6 @@
 # A 1% withdrawal fee replaces the performance fee
 
-The manager is paid 1% of the USDC each redeemer claims, sent to the fee address fixed at `initialize`. The rate is config, changeable only through the timelock and capped at 1% in code. It also replaces the optional redemption fee that stayed in the fund. There is no performance fee, no high-water mark and no per-user cost basis. Shares therefore stay ordinary transferable tokens. This supersedes ADR 0004 and is the only value that goes to a non-user.
+The manager is paid 1% of the USDC each redeemer claims, sent to the fee address set at `initialize`. The fee address and the rate are config, changeable only through the timelock; the rate is capped at 1% in code. It also replaces the optional redemption fee that stayed in the fund. There is no performance fee, no high-water mark and no per-user cost basis. Shares therefore stay ordinary transferable tokens. This supersedes ADR 0004 and is the only value that goes to a non-user.
 
 ## Considered Options
 

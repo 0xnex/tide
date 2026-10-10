@@ -71,7 +71,7 @@ flowchart LR
 9. **One settlement per epoch,** opened at its fixing time. Only the keeper may drive it during the keeper window; after that, anyone may.
 10. **Step atomicity.** Settlement is several instructions (ADR 0001). Within each instruction, all token movements and checks happen together, so a failure rolls that step back. The state between steps must always let the next step resume.
 11. **Price feeds.** The signal and moving average use Pyth cbBTC/USD when that feed exists, otherwise BTC/USD (ADR 0005). Netting and `min_out` use cbBTC/USD. When both feeds exist, a gap above the depeg threshold blocks buys (ADR 0003). A missed day's fixing price may be backfilled only with a Pyth update published in that day's fixing window.
-12. **Withdrawal fee.** 1% of the USDC a redeemer claims goes to the fee address fixed at `initialize`. `claim` only records it in `FundState.fees_owed` (the USDC stays in the payout vault) and `collect_fees` pays it out, so a problem with the fee address's token account can never block a claim. The rate is capped at 1% in code. There is no performance fee and no redemption fee (ADR 0007).
+12. **Withdrawal fee.** 1% of the USDC a redeemer claims goes to the fee address, set at `initialize` and changeable only through the 48-hour timelock. `claim` only records it in `FundState.fees_owed` (the USDC stays in the payout vault) and `collect_fees` pays it out, so a problem with the fee address's token account can never block a claim. The rate is capped at 1% in code. There is no performance fee and no redemption fee (ADR 0007).
 
 ## Keeping the two layers in sync
 
@@ -132,7 +132,7 @@ Changing seeds breaks existing deployments and the tests/scripts that derive the
 - [ ] Only the fund PDA can move vault tokens; signer seeds are `["fund", admin, bump]`.
 - [ ] No arithmetic that can overflow or underflow without a checked operation.
 - [ ] No path where a user can claim twice, claim another user's ticket, or claim before settlement.
-- [ ] No new instruction lets the admin take user funds. The admin cannot withdraw from vaults. The only value that goes to a non-user is the withdrawal fee, paid in USDC to the fee address fixed at `initialize` (ADR 0007).
+- [ ] No new instruction lets the admin take user funds. The admin cannot withdraw from vaults. The only value that goes to a non-user is the withdrawal fee, paid in USDC to the fee address (set at `initialize`, changed only through the timelock; ADR 0007).
 - [ ] The admin is a multisig. Config changes (trade cap, trade interval, slippage bounds, keeper window, depeg threshold, fee rate, keeper, fee address) go through a 48-hour timelock. The only immediate admin action is pausing subscriptions; redemptions can never be paused.
 - [ ] The fund cannot end up in a state where `fix` or `trade` always fails.
 

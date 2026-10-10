@@ -50,7 +50,7 @@ Exchanging the cbBTC in the redemption slice for subscription USDC inside the fu
 ## Fees
 
 **Manager** (管理人):
-The party that receives the withdrawal fee, paid to a fee address fixed when the fund is created.
+The party that receives the withdrawal fee, paid to a fee address set when the fund is created and changeable only through the 48-hour timelock.
 _Avoid_: Admin (the admin configures the fund; the manager is paid by it)
 
 **Withdrawal fee** (取款费):
