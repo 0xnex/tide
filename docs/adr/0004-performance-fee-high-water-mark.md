@@ -1,3 +1,5 @@
+> Status: superseded by ADR 0007.
+
 # Manager performance fee on a fund-level high-water mark
 
 The manager earns 5% (capped at 20% in code) of NAV gains above a high-water mark. This is the one deliberate exception to "the admin can never take user funds".

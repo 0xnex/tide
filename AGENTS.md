@@ -4,9 +4,9 @@ Guidance for AI coding agents (and human contributors) working on this repositor
 
 ## Project in one paragraph
 
-`tide` is a Solana (Anchor) program for a pooled BTC fund. Users queue USDC subscriptions and share redemptions; at 01:00 UTC each day the fixing price is recorded, compared with the 50-day moving average, and used to fix that epoch's NAV. Settlement then nets subscriptions against redemptions and rebalances the fund toward all-cbBTC (above the average) or all-USDC (below) through capped trades. Users then `claim` their shares or USDC. It is a **devnet prototype**: oracle and exchange are mocks.
+`tide` is a Solana (Anchor) program for a pooled BTC fund. Users queue USDC subscriptions and share redemptions; at 01:00 UTC each day the fixing price is recorded and compared with the 50-day moving average. Settlement then sets aside the redemption slice, nets subscriptions against it, and rebalances the fund toward all-cbBTC (above the average) or all-USDC (below) through capped trades. Shares follow actual execution, never a USD valuation. Users then `claim` their shares or USDC. It is a **devnet prototype**: oracle and exchange are mocks.
 
-**Design in transition.** The target design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/0001`–`0004` (decisions). The invariants below describe that target design. Settlement already runs as a `fix` step plus capped `trade` steps, and redeemers are paid what their redemption slice sells for. Until the rest of the migration lands, subscriptions are still filled at the fixing NAV, and there is no keeper window, performance fee or timelock yet. Treat any difference between that code and these invariants as migration work to do, not as a rule to restore.
+**Design in transition.** The target design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/` (decisions; 0005–0007 replace parts of 0002–0004). The invariants below describe that target design. Settlement already runs as a `fix` step plus capped `trade` steps, and redeemers are paid what their redemption slice sells for. Until the rest of the migration lands, subscriptions are still filled at a USD NAV from the fixing price, the signal still uses BTC/USD, and there is no keeper window, withdrawal fee or timelock yet. Treat any difference between that code and these invariants as migration work to do, not as a rule to restore.
 
 ## Replies
 
@@ -48,15 +48,16 @@ Use the terms defined in `CONTEXT.md`. Where each invariant applies:
 
 ```mermaid
 flowchart LR
-  Q["Queue<br/>never closes<br/>(2)"] --> FX["Fixing step<br/>NAV · fee · slice<br/>(1, 2, 3, 11, 12)"]
+  Q["Queue<br/>never closes<br/>(2)"] --> FX["Fixing step<br/>signal · slice · netting<br/>(1, 2, 3, 11)"]
   FX --> TR["Trade steps<br/>(6, 7, 10)"]
   TR --> CL["Claim<br/>(4, 5)"]
   TR -. "unfinished at next fixing" .-> FX
+  CL --> FE["Withdrawal fee<br/>(12)"]
 ```
 
-1. **Forward pricing.** Subscriptions and redemptions are only filled inside a settlement, against the NAV fixed at the fixing time that closes their epoch, after the performance fee has been accrued. Never fill against a NAV that was public before the request was submitted. Each part of a subscription becomes shares at the valuation price and NAV of the fixing time of the settlement in which it is filled. A redemption receives what its redemption slice actually sells for (ADR 0002).
-2. **Fixed pricing time.** NAV, the moving average and the signal use fixing prices published in `[fix_time, fix_time + FIX_WINDOW_SECS)`, never the price when an instruction is called. A request submitted after a fixing time belongs to the next epoch, so the queue never closes. A request can be cancelled until the fixing time that closes its epoch; a pending subscription can be cancelled at any time.
-3. **Internal accounting.** NAV uses `FundState.usdc`, `FundState.btc` and `FundState.share_supply`. Never derive NAV from token-account balances (prevents donation/inflation attacks). Redemption slices and pending subscriptions are tracked separately and are not fund assets.
+1. **Execution pricing.** Subscriptions and redemptions are only filled inside the settlement opened by the fixing time that closes their epoch, and only by actual execution (ADR 0002, 0006). A redemption receives what its redemption slice actually sells for. A subscription part becomes shares = fund asset it adds × share supply ÷ the fund's holding of that asset, counted only once the fund's own rebalance is complete. The fund is never valued in USD.
+2. **Fixed pricing time.** The moving average, the signal and netting use fixing prices published in `[fix_time, fix_time + FIX_WINDOW_SECS)`, never the price when an instruction is called. A request submitted after a fixing time belongs to the next epoch, so the queue never closes. A request can be cancelled until the fixing time that closes its epoch; a pending subscription can be cancelled at any time.
+3. **Internal accounting.** Share issuance and redemption slices use `FundState.usdc`, `FundState.btc` and `FundState.share_supply`. Never derive them from token-account balances (prevents donation/inflation attacks). Redemption slices and pending subscriptions are tracked separately and are not fund assets.
 4. **Exact claims.** `claim` uses `take_pro_rata`, which gives the last claimant the exact remainder. After all tickets of an epoch are claimed, `unclaimed_*` fields are zero and the sum of claims equals the epoch totals. Redemptions become claimable only once that epoch's redemption slice is fully sold.
 5. **Share supply.** `FundState.share_supply` must always equal (shares held by users, including the manager) + (shares queued for redemption). Tests assert this exactly.
 6. **No stuck states.** A settlement must never fail permanently. Work left at the next fixing time carries into the next settlement. Unsold redemption slices keep selling first, and pending subscriptions stay the user's until filled or cancelled. A depeg blocks buying cbBTC, never selling it or settling.
@@ -69,8 +70,8 @@ flowchart LR
 8. **Integer math only.** No floats in `fund-logic` or the program. Use `u128` intermediates and checked arithmetic; round in favor of the fund (down for amounts paid out, up for amounts the fund must sell to cover a payout).
 9. **One settlement per epoch,** opened at its fixing time. Only the keeper may drive it during the keeper window; after that, anyone may.
 10. **Step atomicity.** Settlement is several instructions (ADR 0001). Within each instruction, all token movements and checks happen together, so a failure rolls that step back. The state between steps must always let the next step resume.
-11. **Two price feeds.** The signal and moving average use Pyth BTC/USD; NAV, `min_out` and the depeg check use Pyth cbBTC/USD (ADR 0003). A missed day's fixing price may be backfilled only with a Pyth update published in that day's fixing window.
-12. **Performance fee.** Accrued at the fixing time before any fills, only on NAV above the high-water mark, which never resets. It is paid as new shares to the fee address fixed at `initialize`. The rate is capped at 20% in code (ADR 0004).
+11. **Price feeds.** The signal and moving average use Pyth cbBTC/USD when that feed exists, otherwise BTC/USD (ADR 0005). Netting and `min_out` use cbBTC/USD. When both feeds exist, a gap above the depeg threshold blocks buys (ADR 0003). A missed day's fixing price may be backfilled only with a Pyth update published in that day's fixing window.
+12. **Withdrawal fee.** 1% of the USDC a redeemer claims goes to the fee address fixed at `initialize`. The rate is capped at 1% in code. There is no performance fee and no redemption fee (ADR 0007).
 
 ## Keeping the two layers in sync
 
@@ -89,9 +90,9 @@ These are easy to break when editing:
 |---|---|
 | USDC | `u64`, 6 decimals |
 | BTC (wrapped) | `u64`, 8 decimals |
-| Shares | `u64`, 6 decimals; initial NAV is 1 share = 1 USDC |
+| Shares | `u64`, 6 decimals; the first subscriber gets 1 share per USDC |
 | Price | `u64`, micro-USD per 1 BTC |
-| NAV | `u128`, USDC base units per share base unit × `NAV_SCALE` (10¹²) |
+| NAV (current code only; removed by ADR 0006) | `u128`, USDC base units per share base unit × `NAV_SCALE` (10¹²) |
 | Basis points | `u16`, out of 10,000 |
 
 `initialize` enforces USDC = 6 decimals and BTC = 8 decimals. Don't relax this without updating every conversion.
@@ -131,7 +132,7 @@ Changing seeds breaks existing deployments and the tests/scripts that derive the
 - [ ] Only the fund PDA can move vault tokens; signer seeds are `["fund", admin, bump]`.
 - [ ] No arithmetic that can overflow or underflow without a checked operation.
 - [ ] No path where a user can claim twice, claim another user's ticket, or claim before settlement.
-- [ ] No new instruction lets the admin take user funds. The admin cannot withdraw from vaults. The only value that goes to a non-user is the performance fee, minted as shares to the fee address fixed at `initialize` (ADR 0004).
+- [ ] No new instruction lets the admin take user funds. The admin cannot withdraw from vaults. The only value that goes to a non-user is the withdrawal fee, paid in USDC to the fee address fixed at `initialize` (ADR 0007).
 - [ ] The admin is a multisig. Config changes (trade cap, trade interval, slippage, depeg threshold, fee rate, keeper, fee address) go through a 48-hour timelock. The only immediate admin action is pausing subscriptions; redemptions can never be paused.
 - [ ] The fund cannot end up in a state where `fix` or `trade` always fails.
 

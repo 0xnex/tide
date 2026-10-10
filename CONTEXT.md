@@ -1,6 +1,6 @@
 # Tide
 
-A pooled fund on Solana that holds either cbBTC or USDC, switching once a day according to whether BTC is above or below its 50-day moving average.
+A pooled fund on Solana that holds either cbBTC or USDC, switching once a day according to whether the signal price is above or below its 50-day moving average.
 
 ## How the terms relate
 
@@ -10,7 +10,7 @@ flowchart LR
   FX --> ST["Settlement"]
   SP["Signal price"] --> MA["Moving average"] --> TG["Target"]
   SP --> TG
-  VP["Valuation price"] --> ST
+  VP["Valuation price"] --> NET
   SUB["Subscription"] -- "unfilled part" --> PS["Pending subscription"]
   RED["Redemption"] --> RS["Redemption slice"]
   SUB & RS --> NET["Netting"]
@@ -18,13 +18,13 @@ flowchart LR
   TG --> RB
   RB -- "split into" --> TR["Trade"]
   KP["Keeper"] -- "drives" --> TR
-  ST -- "first accrues" --> PF["Performance fee"] -- "paid to" --> MG["Manager"]
+  RS -- "claimed, minus" --> WF["Withdrawal fee"] -- "paid to" --> MG["Manager"]
 ```
 
 ## Investors
 
 **Subscription** (申购):
-A user's request to put USDC into the fund in exchange for shares; it may be filled in parts, and each part becomes shares at the valuation price and NAV of the fixing time of the settlement in which it is filled.
+A user's request to put USDC into the fund in exchange for shares; it may be filled in parts, and each part becomes shares in proportion to the fund asset it actually adds (cbBTC bought or netted, or USDC when the target is USDC), counted once the fund's own rebalance is complete.
 _Avoid_: Deposit, purchase, buy (ambiguous with the fund's own trades)
 
 **Redemption** (赎回):
@@ -35,7 +35,7 @@ _Avoid_: Withdrawal, sell
 The redeemed shares' pro-rata portion of the fund's USDC and cbBTC at the fixing time, set aside for that day's redeemers and turned into USDC for them.
 
 **Pending subscription** (待成交申购):
-The part of a subscription's USDC not yet filled; it earns no shares and stays the user's until filled or cancelled. It is filled before newer subscriptions, counts toward the next epoch's subscription cap, and when the target is USDC it is filled at the next fixing time without any trade.
+The part of a subscription's USDC not yet filled; it earns no shares and stays the user's until filled or cancelled. It is filled before newer subscriptions, counts toward the next epoch's subscription cap, and when the target is USDC it is filled without any trade.
 _Avoid_: Unfilled deposit, carry-over
 
 **Subscription cap** (申购上限):
@@ -50,18 +50,15 @@ Exchanging the cbBTC in the redemption slice for subscription USDC inside the fu
 ## Fees
 
 **Manager** (管理人):
-The party that receives the performance fee, paid to a fee address fixed when the fund is created.
+The party that receives the withdrawal fee, paid to a fee address fixed when the fund is created.
 _Avoid_: Admin (the admin configures the fund; the manager is paid by it)
 
-**Performance fee** (业绩报酬):
-A share of the fund's gains above the high-water mark, paid to the manager as newly issued shares.
-_Avoid_: Profit fee, carry, redemption fee
+**Withdrawal fee** (取款费):
+1% of the USDC a redeemer claims, paid to the manager; it is the only fee the manager earns.
+_Avoid_: Performance fee, profit fee, carry
 
-**High-water mark** (历史高点):
-The highest NAV on which a performance fee has already been charged, starting at the initial NAV and never reset; no fee is charged until NAV exceeds it again.
-
-**Subscription fee / Redemption fee** (申购费 / 赎回费):
-An optional charge on each subscription or redemption that stays in the fund.
+**Subscription fee** (申购费):
+An optional charge on each subscription that stays in the fund.
 
 **Subscription pause** (暂停申购):
 The one action the admin may take immediately: stopping new subscriptions. Redemptions can never be paused, and the admin can never move fund assets.
@@ -69,10 +66,10 @@ The one action the admin may take immediately: stopping new subscriptions. Redem
 ## Settlement
 
 **Settlement** (结算):
-The daily process that fixes the NAV and signal at the fixing time, sets aside the redemption slice, nets it against subscriptions, then rebalances until every queued subscription and redemption is complete.
+The daily process that records the signal at the fixing time, sets aside the redemption slice, nets it against subscriptions, then rebalances until every queued subscription and redemption is complete.
 
 **Fixing time** (定价时刻):
-01:00 UTC each day; the NAV and the signal come from prices published then, whenever settlement actually runs.
+01:00 UTC each day; the signal and netting use prices published then, whenever settlement actually runs.
 
 **Keeper** (清算地址):
 The designated address that alone may drive settlement during the keeper window.
@@ -92,7 +89,7 @@ What the fund should hold after a settlement: all cbBTC when the signal price is
 _Avoid_: Position, regime, in-BTC
 
 **Rebalance** (调仓):
-The sequence of Jupiter trades in one settlement that first sells what is left of the redemption slices, then moves the fund's holdings to the target.
+The sequence of Jupiter trades in one settlement that first sells what is left of the redemption slices, then moves the fund's holdings to the target, then buys for pending subscriptions.
 _Avoid_: Adjustment, buy/sell (ambiguous with subscription and redemption)
 
 **Trade** (交易):
@@ -105,14 +102,14 @@ _Avoid_: Daily limit, max adjustment
 ## Prices
 
 **Signal price** (信号价格):
-The BTC/USD price used for the moving average and the hold-cbBTC-or-USDC signal.
+The price used for the moving average and the hold-cbBTC-or-USDC signal: Pyth cbBTC/USD when that feed exists, otherwise BTC/USD.
 
 **Moving average** (均线):
 The average signal price over the last 50 fixing times, one per calendar day; a day with no settlement is backfilled with that day's published fixing price.
 
 **Valuation price** (估值价格):
-The cbBTC/USD price used to value the fund's cbBTC holdings and to bound trade fills; it differs from the signal price because the fund holds cbBTC, not BTC.
-_Avoid_: BTC price (when the cbBTC price is meant)
+The Pyth cbBTC/USD price used for netting and to bound each trade's fill; the fund itself is never valued in USD.
+_Avoid_: BTC price (when the cbBTC price is meant), NAV
 
 **Depeg** (脱锚):
-The valuation price deviating from the signal price by more than a set threshold, checked before every trade; while it lasts the fund may sell cbBTC but not buy it.
+The Pyth cbBTC/USD price deviating from BTC/USD by more than a set threshold, checked before every trade; while it lasts the fund may sell cbBTC but not buy it.

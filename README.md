@@ -2,9 +2,9 @@
 
 **A pooled Bitcoin fund on Solana: hold cbBTC when BTC is above its 50-day moving average, hold USDC when it is below.**
 
-> **Devnet prototype. Do not use with real money.** The oracle and exchange are mocks. Mainnet needs a security audit and legal advice: pooling other people's money and charging a performance fee is regulated in many jurisdictions.
+> **Devnet prototype. Do not use with real money.** The oracle and exchange are mocks. Mainnet needs a security audit and legal advice: pooling other people's money and charging a fee for managing it is regulated in many jurisdictions.
 
-> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code runs settlement as a fixing step plus capped trades, with redeemers paid their slice's actual proceeds. Subscriptions are still filled at the fixing NAV, and the keeper window, performance fee and governance are not built yet. Sections marked *(current code)* describe what runs today.
+> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code runs settlement as a fixing step plus capped trades, with redeemers paid their slice's actual proceeds. Subscriptions are still filled at a USD NAV from the fixing price, the signal still uses BTC/USD, and the keeper window, withdrawal fee and governance are not built yet. Sections marked *(current code)* describe what runs today.
 
 ---
 
@@ -43,15 +43,12 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-  BTC["Pyth BTC/USD<br/>signal price"] --> MA["50-day moving average"]
-  BTC --> SIG{"price > MA?"}
+  SP["signal price<br/>Pyth cbBTC/USD<br/>(BTC/USD if no feed)"] --> MA["50-day moving average"]
+  SP --> SIG{"price > MA?"}
   MA --> SIG
   SIG -- yes --> T1["target: all cbBTC"]
   SIG -- no --> T2["target: all USDC"]
-  CB["Pyth cbBTC/USD<br/>valuation price"] --> NAV["NAV"]
-  NAV --> FEE["performance fee<br/>(gains above high-water mark)"]
-  FEE --> SL["set aside redemption slice"]
-  SL --> NET["net against subscriptions"]
+  SL["set aside redemption slice<br/>in kind, pro-rata"] --> NET["net against subscriptions<br/>at Pyth cbBTC/USD"]
 ```
 
 ### Where the money goes
@@ -70,7 +67,7 @@ Netting uses the valuation price. Only the difference trades on Jupiter, and eac
 
 ```mermaid
 flowchart LR
-  A["1. Unsold redemption slices<br/>oldest first"] --> B["2. Pending subscriptions<br/>oldest first"] --> C["3. Fund toward target"]
+  A["1. Unsold redemption slices<br/>oldest first"] --> C["2. Fund toward target"] --> B["3. Pending subscriptions<br/>oldest first"]
 ```
 
 ### Every trade
@@ -110,7 +107,7 @@ flowchart LR
 |---|---|
 | subscribe | At most 1M USDC per epoch, including pending |
 | cancel | Until 01:00 |
-| partial fill | Filled part becomes shares at that day's NAV |
+| partial fill | Filled part becomes shares by the cbBTC it adds, after the fund's rebalance ([ADR 0006](docs/adr/0006-shares-counted-in-fund-asset.md)) |
 | filled | Fully bought, or target is USDC (no trade needed) |
 | cancel rest | Any time; unfilled USDC refunded, no shares for it |
 
@@ -137,25 +134,23 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-  BTC["Pyth BTC/USD"] --> MA["moving average"] & SIG["signal"]
-  CB["Pyth cbBTC/USD"] --> NAV["NAV"] & MIN["trade min_out"]
+  CB["Pyth cbBTC/USD"] --> MA["moving average"] & SIG["signal"] & NT["netting"] & MIN["trade min_out"]
+  BTC["Pyth BTC/USD"] -. "only if no cbBTC feed" .-> MA
   BTC & CB --> G{"gap > 2%?"}
   G -- "yes: depeg" --> NB["no cbBTC buys<br/>sells and settlement continue"]
 ```
 
-Both use prices published in `[01:00, 01:01)` UTC. A missed day is backfilled with that day's Pyth price ([ADR 0003](docs/adr/0003-btc-signal-cbbtc-valuation.md)).
+The signal and netting use prices published in `[01:00, 01:01)` UTC. A missed day is backfilled with that day's Pyth price. The fund is never valued in USD ([ADR 0005](docs/adr/0005-signal-from-cbbtc-price.md), [ADR 0003](docs/adr/0003-btc-signal-cbbtc-valuation.md)).
 
-### Performance fee
+### Withdrawal fee
 
 ```mermaid
 flowchart LR
-  N["NAV at 01:00"] --> Q{"NAV > high-water mark?"}
-  Q -- no --> X["no fee"]
-  Q -- yes --> F["5% of gain above mark<br/>→ new shares to fee address"]
-  F --> H["mark := NAV after fee<br/>(never reset)"]
+  C["redeemer claims USDC"] --> F["1% → fee address<br/>(fixed at initialize)"]
+  C --> U["99% → redeemer"]
 ```
 
-The fee is charged before that epoch's subscriptions and redemptions and is capped at 20% in code ([ADR 0004](docs/adr/0004-performance-fee-high-water-mark.md)).
+There is no performance fee. Redeemers pay the 1% on losses too ([ADR 0007](docs/adr/0007-withdrawal-fee-replaces-performance-fee.md)).
 
 ### Governance
 
@@ -170,7 +165,7 @@ flowchart LR
 
 | Guarantee | How |
 |---|---|
-| Donations can't move the share price | NAV comes from internal records, not token balances |
+| Donations can't move the share price | Shares come from internal records, not token balances |
 | No rounding dust | The last claimant of an epoch gets the exact remainder |
 | Settlement never gets stuck | Unfinished work carries into the next settlement; a depeg only blocks buys |
 
@@ -267,7 +262,7 @@ flowchart LR
 | `min_trade_interval_secs` | 60 | Seconds between trades | current |
 | Public slippage bound | 10 bps | Non-keeper callers after 01:30 | planned |
 | Subscription cap | 1,000,000 USDC | Per epoch, incl. pending | planned |
-| Performance fee | 500 bps (max 2,000) | Above high-water mark | planned |
+| Withdrawal fee | 100 bps (max 100) | Of each redemption claim, to the manager; replaces `redemption_fee_bps` | planned |
 | Keeper, fee address | set at creation | Change via 48 h timelock | planned |
 
 ### Accounts (PDAs)
