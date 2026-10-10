@@ -66,6 +66,7 @@ pub enum FundError {
     WrongSliceRecord,  // 卖出赎回资产时传入的期记录与交易计划不符
     TooManySlices,     // 未卖完的赎回资产已有 MAX_SLICES 期
     FixPending,        // 已过今天的定价时刻、还没定价，基金调仓等待定价
+    KeeperOnly,        // 清算窗口内只有清算地址能驱动结算
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +80,8 @@ pub struct Config {
     pub depeg_threshold_bps: u16,     // cbBTC/USD 与 BTC/USD 相差超过这个幅度就不买入 cbBTC
     pub trade_cap_usdc: u64,          // 单笔交易上限（按估值价格折算的 USDC 名义金额）
     pub min_trade_interval_secs: i64, // 两笔交易之间至少间隔多少秒
+    pub keeper_window_secs: i64,      // 定价时刻之后多少秒内只有清算地址能驱动结算
+    pub public_slippage_bps: u16,     // 窗口之后其他人交易的滑点上限，比 max_slippage_bps 更严
 }
 
 impl Config {
@@ -94,6 +97,8 @@ impl Config {
             depeg_threshold_bps: 200,
             trade_cap_usdc: 200_000_000_000, // 200,000 USDC
             min_trade_interval_secs: 60,
+            keeper_window_secs: 1_800,
+            public_slippage_bps: 10,
         }
     }
 
@@ -113,6 +118,13 @@ impl Config {
             return Err(FundError::InvalidConfig);
         }
         if self.trade_cap_usdc == 0 || self.min_trade_interval_secs < 0 {
+            return Err(FundError::InvalidConfig);
+        }
+        // 窗口只按当天的定价时刻判断，所以不能跨过午夜（两者都已限制在一天以内，不会溢出）
+        if !(0..SECONDS_PER_DAY).contains(&self.keeper_window_secs)
+            || self.settle_offset_secs + self.keeper_window_secs > SECONDS_PER_DAY
+            || self.public_slippage_bps > self.max_slippage_bps
+        {
             return Err(FundError::InvalidConfig);
         }
         Ok(())
@@ -334,6 +346,24 @@ pub fn check_queue_open(s: &FundState, now_unix: i64, cfg: &Config) -> Result<()
     Ok(())
 }
 
+/// 驱动结算（定价、交易）的调用人
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Caller {
+    Keeper, // 配置里的清算地址
+    Public, // 其他任何人
+}
+
+/// 清算窗口（当天定价时刻起 keeper_window_secs 秒）内只有清算地址能驱动结算，
+/// 防止第三方抢在清算地址之前交易。窗口之后谁都可以，保证清算地址停机时基金照常推进。
+fn check_keeper_window(now_unix: i64, caller: Caller, cfg: &Config) -> Result<(), FundError> {
+    let fix_at = fix_time(day_of(now_unix), cfg);
+    let in_window = now_unix >= fix_at && now_unix < fix_at.saturating_add(cfg.keeper_window_secs);
+    if in_window && caller == Caller::Public {
+        return Err(FundError::KeeperOnly);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 申购、赎回排队
 // ---------------------------------------------------------------------------
@@ -463,7 +493,8 @@ pub fn claim(t: &mut Ticket, r: &mut EpochRecord) -> Result<(u64, u64), FundErro
 /// 把 slice_usdc 转入待领取账户（slice_btc 留在 BTC 账户里，之后卖出）。
 ///
 /// 顺序：
-///   1. 检查时间：今天还没定价，且已过定价时刻；两个定价价格都在定价窗口内发布
+///   1. 检查调用人和时间：清算窗口内只有清算地址；今天还没定价，且已过定价时刻；
+///      两个定价价格都在定价窗口内发布
 ///   2. 记录信号价格，计算均线和目标
 ///   3. 按估值价格计算净值
 ///   4. 销毁赎回份额，按份额比例从基金划出赎回资产（USDC 和 cbBTC 都向下取整，对留下的人有利）
@@ -475,9 +506,11 @@ pub fn fix(
     s: &mut FundState,
     now_unix: i64,
     prices: &FixPrices,
+    caller: Caller,
     cfg: &Config,
 ) -> Result<EpochRecord, FundError> {
     cfg.validate()?;
+    check_keeper_window(now_unix, caller, cfg)?;
     if prices.signal.price == 0 || prices.valuation.price == 0 {
         return Err(FundError::BadPrice);
     }
@@ -614,7 +647,7 @@ pub struct TradePlan {
     pub bucket: TradeBucket,
 }
 
-/// 规划下一笔交易。没有交易时返回原因：
+/// 规划下一笔交易。清算窗口内其他调用人得到 KeeperOnly。没有交易时返回原因：
 /// - FixPending：已过今天的定价时刻、还没定价，基金调仓要等定价
 /// - NothingToTrade：赎回资产都卖完了，基金也已经是目标持仓
 /// - DepegBlocksBuy：下一笔是买入 cbBTC，但 cbBTC 脱锚
@@ -629,14 +662,20 @@ pub fn plan_trade(
     s: &FundState,
     now_unix: i64,
     prices: &MarketPrices,
+    caller: Caller,
     cfg: &Config,
 ) -> Result<TradePlan, FundError> {
     cfg.validate()?;
+    check_keeper_window(now_unix, caller, cfg)?;
     if prices.signal == 0 || prices.valuation == 0 {
         return Err(FundError::BadPrice);
     }
     let price = prices.valuation;
-    let slip = cfg.max_slippage_bps;
+    // 窗口之后的其他调用人用更严的滑点上限：能从一笔交易里挤出的价值更少
+    let slip = match caller {
+        Caller::Keeper => cfg.max_slippage_bps,
+        Caller::Public => cfg.public_slippage_bps,
+    };
     // 上限折算成 cbBTC 向下取整；至少 1 sat，保证价格再高也能卖完
     let cap_btc = usdc_to_btc(cfg.trade_cap_usdc, price)?.max(1);
     let plan = if let Some(slice) = s.oldest_slice() {
@@ -844,7 +883,16 @@ mod tests {
         }
 
         fn fix_with(&mut self, now: i64, p: &FixPrices) -> Result<EpochRecord, FundError> {
-            let r = fix(&mut self.s, now, p, &self.c)?;
+            self.fix_as(now, p, Caller::Keeper)
+        }
+
+        fn fix_as(
+            &mut self,
+            now: i64,
+            p: &FixPrices,
+            caller: Caller,
+        ) -> Result<EpochRecord, FundError> {
+            let r = fix(&mut self.s, now, p, caller, &self.c)?;
             assert_eq!(r.epoch as usize, self.records.len());
             self.records.push(r);
             // 赎回资产按比例向下取整、发行份额向下取整：留下的人的净值不会因为别人的申购赎回下降
@@ -921,7 +969,18 @@ mod tests {
             p: MarketPrices,
             fee_bps: u16,
         ) -> Result<TradePlan, FundError> {
-            let plan = plan_trade(&self.s, now, &p, &self.c)?;
+            self.trade_as(now, p, Caller::Keeper, fee_bps)
+        }
+
+        /// 以 caller 的身份规划并成交一笔交易
+        fn trade_as(
+            &mut self,
+            now: i64,
+            p: MarketPrices,
+            caller: Caller,
+            fee_bps: u16,
+        ) -> Result<TradePlan, FundError> {
+            let plan = plan_trade(&self.s, now, &p, caller, &self.c)?;
             self.fill(now, &plan, exec(&plan, p.valuation, fee_bps))?;
             Ok(plan)
         }
@@ -1090,8 +1149,9 @@ mod tests {
                 publish_time: tv,
             },
         };
-        let run_both =
-            |now: i64, ts: i64, tv: i64| fix(&mut s.clone(), now, &at(ts, tv), &cfg()).map(|_| ());
+        let run_both = |now: i64, ts: i64, tv: i64| {
+            fix(&mut s.clone(), now, &at(ts, tv), Caller::Keeper, &cfg()).map(|_| ())
+        };
         let run = |now: i64, t: i64| run_both(now, t, t);
         assert_eq!(run(now, fix_at), Ok(()));
         assert_eq!(run(now, fix_at + FIX_WINDOW_SECS - 1), Ok(()));
@@ -1179,6 +1239,24 @@ mod tests {
                 min_trade_interval_secs: -1,
                 ..cfg()
             },
+            Config {
+                keeper_window_secs: -1,
+                ..cfg()
+            },
+            Config {
+                keeper_window_secs: SECONDS_PER_DAY,
+                ..cfg()
+            },
+            // 清算窗口不能跨过午夜：窗口只按当天的定价时刻判断
+            Config {
+                settle_offset_secs: 23 * 3_600 + 50 * 60,
+                ..cfg()
+            },
+            // 公开滑点上限必须不比清算地址的宽
+            Config {
+                public_slippage_bps: 31,
+                ..cfg()
+            },
         ];
         for c in bad {
             assert_eq!(c.validate(), Err(FundError::InvalidConfig), "{c:?}");
@@ -1186,6 +1264,8 @@ mod tests {
         assert!(cfg().validate().is_ok());
         assert_eq!(cfg().trade_cap_usdc, 200_000 * USDC);
         assert_eq!(cfg().min_trade_interval_secs, 60);
+        assert_eq!(cfg().keeper_window_secs, 1_800);
+        assert_eq!(cfg().public_slippage_bps, 10);
     }
 
     #[test]
@@ -1295,6 +1375,60 @@ mod tests {
     }
 
     #[test]
+    fn only_the_keeper_drives_settlement_inside_the_keeper_window() {
+        let mut h = Harness::seeded(50_000 * USDC);
+        h.c.trade_cap_usdc = 1_000 * USDC; // 3 笔才能买完
+        let mut t = Ticket::default();
+        h.subscribe(&mut t, 3_000 * USDC, 10 * DAY);
+        let fix_at = 10 * DAY + ONE_AM;
+        let window_end = fix_at + h.c.keeper_window_secs;
+        let p = at_fix(10, 51_000 * USDC);
+        // 窗口内（01:00–01:30）其他人不能定价
+        assert_eq!(
+            fix(&mut h.s.clone(), fix_at + 10, &p, Caller::Public, &h.c),
+            Err(FundError::KeeperOnly)
+        );
+        assert_eq!(
+            fix(&mut h.s.clone(), window_end - 1, &p, Caller::Public, &h.c),
+            Err(FundError::KeeperOnly)
+        );
+        // 窗口之后谁都可以（定价价格仍然是 1 点发布的）
+        assert!(fix(&mut h.s.clone(), window_end, &p, Caller::Public, &h.c).is_ok());
+        h.fix_with(fix_at + 10, &p).unwrap(); // 清算地址
+
+        // 交易同理
+        let m = same(51_000 * USDC);
+        assert_eq!(
+            h.trade_as(fix_at + 60, m, Caller::Public, 0),
+            Err(FundError::KeeperOnly)
+        );
+        h.trade_as(window_end, m, Caller::Public, 0).unwrap();
+        // 窗口之外的其他时刻也不受限制
+        h.trade_as(10 * DAY + 20 * 3600, m, Caller::Public, 0)
+            .unwrap();
+    }
+
+    #[test]
+    fn public_trades_use_the_tighter_slippage_bound() {
+        let mut h = Harness::seeded(50_000 * USDC);
+        let mut t = Ticket::default();
+        h.subscribe(&mut t, 1_000 * USDC, 10 * DAY);
+        h.fix_day(10, 51_000 * USDC);
+        let now = 10 * DAY + 2 * ONE_AM; // 窗口之后
+        let p = same(50_000 * USDC);
+        // 1000 USDC @ 50,000 = 2,000,000 sat；清算地址减 0.3%，其他人减 0.1%
+        let keeper = plan_trade(&h.s, now, &p, Caller::Keeper, &h.c).unwrap();
+        let public = plan_trade(&h.s, now, &p, Caller::Public, &h.c).unwrap();
+        assert_eq!((keeper.min_out, public.min_out), (1_994_000, 1_998_000));
+        // 交易所收 0.18%：清算地址能成交，其他人的这一笔回滚
+        assert_eq!(
+            h.trade_as(now, p, Caller::Public, 18),
+            Err(FundError::SlippageExceeded)
+        );
+        h.trade_as(now, p, Caller::Keeper, 18).unwrap();
+    }
+
+    #[test]
     fn trade_min_out_uses_the_valuation_price_at_execution() {
         let mut h = Harness::seeded(50_000 * USDC);
         let mut t = Ticket::default();
@@ -1306,7 +1440,7 @@ mod tests {
             signal: 52_600 * USDC,
             valuation: 52_500 * USDC,
         };
-        let plan = plan_trade(&h.s, now, &p, &h.c).unwrap();
+        let plan = plan_trade(&h.s, now, &p, Caller::Keeper, &h.c).unwrap();
         // 1000 USDC @ 52,500 = 1,904,761 sat，减 0.3% = 1,899,046
         assert_eq!(plan.min_out, 1_899_046);
     }
@@ -1319,7 +1453,7 @@ mod tests {
         h.fix_day(10, 51_000 * USDC);
         let t0 = 10 * DAY + ONE_AM;
         let p = same(51_000 * USDC);
-        let plan = plan_trade(&h.s, t0, &p, &h.c).unwrap();
+        let plan = plan_trade(&h.s, t0, &p, Caller::Keeper, &h.c).unwrap();
         let before = h.s.clone();
         assert_eq!(
             h.fill(t0, &plan, plan.min_out - 1),
@@ -1652,8 +1786,15 @@ mod tests {
             },
         };
         // 晚上 9 点才定价：净值、发行份额、赎回资产都只取决于定价价格
-        let a = fix(&mut h.s.clone(), fix_at, &on_time, &h.c).unwrap();
-        let b = fix(&mut h.s.clone(), 11 * DAY + 21 * 3600, &late, &h.c).unwrap();
+        let a = fix(&mut h.s.clone(), fix_at, &on_time, Caller::Keeper, &h.c).unwrap();
+        let b = fix(
+            &mut h.s.clone(),
+            11 * DAY + 21 * 3600,
+            &late,
+            Caller::Keeper,
+            &h.c,
+        )
+        .unwrap();
         assert_eq!(a, b);
         assert!(b.slice_btc > 0 && b.minted_shares > 0);
     }
@@ -1727,6 +1868,8 @@ mod tests {
         too_soon: u32,
         depeg_blocked: u32,
         depeg_sells: u32,
+        keeper_only: u32,
+        public_plans: u32,
     }
 
     /// 在 [from, until) 之间随机时刻尝试交易：每次价格在 p 附近小幅波动，
@@ -1753,7 +1896,14 @@ mod tests {
                 valuation: rng.wiggle(p.valuation, 30),
             };
             let depegged = is_depegged(m.signal, m.valuation, h.c.depeg_threshold_bps);
-            let plan = match plan_trade(&h.s, now, &m, &h.c) {
+            let caller = if rng.below(4) == 0 {
+                Caller::Public
+            } else {
+                Caller::Keeper
+            };
+            let fix_at = fix_time(day_of(now), &h.c);
+            let in_window = (fix_at..fix_at + h.c.keeper_window_secs).contains(&now);
+            let plan = match plan_trade(&h.s, now, &m, caller, &h.c) {
                 Ok(plan) => plan,
                 // 都做完了，或者基金调仓要等今天的定价
                 Err(FundError::NothingToTrade | FundError::FixPending) => return,
@@ -1767,21 +1917,35 @@ mod tests {
                     tally.depeg_blocked += 1;
                     continue;
                 }
+                Err(FundError::KeeperOnly) => {
+                    assert!(caller == Caller::Public && in_window);
+                    tally.keeper_only += 1;
+                    continue;
+                }
                 Err(e) => panic!("plan_trade: {e:?}"),
             };
+            assert!(
+                !(caller == Caller::Public && in_window),
+                "窗口内只有清算地址能交易"
+            );
+            if caller == Caller::Public {
+                tally.public_plans += 1;
+            }
             assert!(btc_value_of(&plan, m.valuation) <= h.c.trade_cap_usdc);
-            if plan.min_out > 0 && rng.below(100) < fail_pct {
+            // 随机失败，或者交易所的手续费超过这个调用人的滑点上限
+            let got = if plan.min_out > 0 && rng.below(100) < fail_pct {
+                plan.min_out - 1
+            } else {
+                exec(&plan, m.valuation, fee_bps)
+            };
+            if got < plan.min_out {
                 let before = h.s.clone();
-                assert_eq!(
-                    h.fill(now, &plan, plan.min_out - 1),
-                    Err(FundError::SlippageExceeded)
-                );
+                assert_eq!(h.fill(now, &plan, got), Err(FundError::SlippageExceeded));
                 assert_eq!(h.s, before);
                 tally.failed_fills += 1;
                 continue;
             }
-            h.fill(now, &plan, exec(&plan, m.valuation, fee_bps))
-                .unwrap();
+            h.fill(now, &plan, got).unwrap();
             match (plan.side, plan.bucket) {
                 (Side::BuyBtc, _) => {
                     assert!(!depegged, "脱锚时不能买入");
@@ -1950,6 +2114,7 @@ mod tests {
                 "seed {seed}: {tally:?}"
             );
             assert!(tally.failed_fills > 0 && tally.too_soon > 0, "{tally:?}");
+            assert!(tally.keeper_only > 0 && tally.public_plans > 0, "{tally:?}");
             // 价值守恒：基金总资产 ≈ 用户份额价值之和（误差为取整尘埃），按估值价格计
             let n = nav(&h.s, valuation).unwrap();
             let user_value: u128 = users.held.iter().map(|&x| x as u128 * n / NAV_SCALE).sum();
@@ -1970,6 +2135,7 @@ mod tests {
     fn random_simulation_with_trading_costs_never_gets_stuck() {
         let mut tally = Tally::default();
         let (mut late, mut dust, mut carried, mut illiquid_days) = (0, 0, 0, 0);
+        let (mut public_fixes, mut public_fixes_rejected) = (0, 0);
         for seed in 1..=20u64 {
             let mut rng = Rng(seed * 7919);
             let mut h = Harness::seeded(50_000 * USDC);
@@ -1977,6 +2143,7 @@ mod tests {
             let mut users = Users::new(6);
             let mut price = 50_000 * USDC;
             let mut valuation = price;
+            let mut fail_pct = 30;
             for day in 10..300i64 {
                 for u in 0..users.tickets.len() {
                     if !users.tickets[u].is_empty() {
@@ -2011,12 +2178,7 @@ mod tests {
                 // 当天任意时刻定价；定价价格在定价窗口内发布
                 let fix_at = day * DAY + ONE_AM;
                 let now = fix_at + rng.below((DAY - 2 * ONE_AM) as u64) as i64;
-                let fail_pct = if rng.below(20) == 0 {
-                    illiquid_days += 1;
-                    100
-                } else {
-                    30
-                };
+                // 昨天没有流动性时，一直持续到今天定价之后，让赎回资产跨过定价时刻
                 random_trades(
                     &mut h,
                     &mut rng,
@@ -2027,6 +2189,12 @@ mod tests {
                     fail_pct,
                     &mut tally,
                 );
+                fail_pct = if rng.below(20) == 0 {
+                    illiquid_days += 1;
+                    100
+                } else {
+                    30
+                };
                 if now > fix_at {
                     late += 1;
                     let t = fix_at + rng.below((now - fix_at) as u64) as i64;
@@ -2050,7 +2218,22 @@ mod tests {
                         publish_time: publish(&mut rng),
                     },
                 };
-                match h.fix_with(now, &p) {
+                // 随机调用人：清算窗口内其他人被拒绝，由清算地址定价
+                let in_window = now < fix_at + h.c.keeper_window_secs;
+                let caller = if rng.below(3) == 0 {
+                    Caller::Public
+                } else {
+                    Caller::Keeper
+                };
+                let caller = if caller == Caller::Public && in_window {
+                    assert_eq!(h.fix_as(now, &p, caller), Err(FundError::KeeperOnly));
+                    public_fixes_rejected += 1;
+                    Caller::Keeper
+                } else {
+                    caller
+                };
+                match h.fix_as(now, &p, caller) {
+                    Ok(_) if caller == Caller::Public => public_fixes += 1,
                     Ok(_) | Err(FundError::TooManySlices) => {}
                     Err(e) => panic!("fix: {e:?}"),
                 }
@@ -2081,6 +2264,11 @@ mod tests {
         assert!(
             tally.depeg_blocked > 0 && tally.depeg_sells > 0 && tally.failed_fills > 0,
             "{tally:?}"
+        );
+        assert!(tally.keeper_only > 0 && tally.public_plans > 0, "{tally:?}");
+        assert!(
+            public_fixes > 0 && public_fixes_rejected > 0,
+            "{public_fixes} {public_fixes_rejected}"
         );
         assert!(
             late > 0 && dust > 0 && carried > 0 && illiquid_days > 0,

@@ -1,7 +1,8 @@
 //! BTC 50 日均线基金（Solana / Anchor，devnet 原型）
 //!
 //! - 任何人用 USDC 申购、用份额赎回；都先排队，在下一次定价时按定价净值成交
-//! - 结算分多步（ADR 0001），任何人都可以驱动：
+//! - 结算分多步（ADR 0001）。定价时刻后 keeper_window_secs 秒内只有清算地址（config.keeper）
+//!   能驱动，之后任何人都可以，但其他人的交易用更严的滑点上限：
 //!     fix：每天 UTC 1 点之后调用一次，记录 1 点的定价价格 -> 算 50 日均线和目标 ->
 //!          按净值发行申购份额、销毁赎回份额并按比例划出赎回资产
 //!     trade：之后反复调用，每次一笔不超过 trade_cap_usdc 的交易，间隔至少
@@ -40,6 +41,10 @@ pub mod tide {
     pub fn initialize(ctx: Context<Initialize>, config: ConfigData) -> Result<()> {
         config.to_logic().validate().map_err(map_err)?;
         require!(config.max_staleness_secs > 0, FundErrorCode::InvalidConfig);
+        require!(
+            config.keeper != Pubkey::default(),
+            FundErrorCode::InvalidConfig
+        );
         let fund = &mut ctx.accounts.fund;
         fund.admin = ctx.accounts.admin.key();
         fund.usdc_mint = ctx.accounts.usdc_mint.key();
@@ -200,7 +205,8 @@ pub mod tide {
 
         let cfg = fund_cfg.to_logic();
         let mut st = ctx.accounts.fund.state.to_logic();
-        let record = logic::fix(&mut st, now, &prices, &cfg).map_err(map_err)?;
+        let caller = fund_cfg.caller(&ctx.accounts.cranker.key());
+        let record = logic::fix(&mut st, now, &prices, caller, &cfg).map_err(map_err)?;
 
         let admin = ctx.accounts.fund.admin;
         let fund_bump = ctx.accounts.fund.bump;
@@ -300,7 +306,8 @@ pub mod tide {
         };
         let cfg = fund_cfg.to_logic();
         let mut st = ctx.accounts.fund.state.to_logic();
-        let plan = logic::plan_trade(&st, now, &prices, &cfg).map_err(map_err)?;
+        let caller = fund_cfg.caller(&ctx.accounts.cranker.key());
+        let plan = logic::plan_trade(&st, now, &prices, caller, &cfg).map_err(map_err)?;
 
         let admin = ctx.accounts.fund.admin;
         let fund_bump = ctx.accounts.fund.bump;
@@ -464,7 +471,10 @@ pub struct ConfigData {
     pub depeg_threshold_bps: u16,
     pub trade_cap_usdc: u64,
     pub min_trade_interval_secs: i64,
+    pub keeper_window_secs: i64,
+    pub public_slippage_bps: u16,
     pub max_staleness_secs: i64, // 预言机价格最多允许多旧
+    pub keeper: Pubkey,          // 清算地址：清算窗口内唯一能驱动结算的签名人
 }
 
 impl ConfigData {
@@ -479,6 +489,17 @@ impl ConfigData {
             depeg_threshold_bps: self.depeg_threshold_bps,
             trade_cap_usdc: self.trade_cap_usdc,
             min_trade_interval_secs: self.min_trade_interval_secs,
+            keeper_window_secs: self.keeper_window_secs,
+            public_slippage_bps: self.public_slippage_bps,
+        }
+    }
+
+    /// 签名人是不是清算地址
+    fn caller(&self, signer: &Pubkey) -> logic::Caller {
+        if *signer == self.keeper {
+            logic::Caller::Keeper
+        } else {
+            logic::Caller::Public
         }
     }
 }
@@ -862,7 +883,7 @@ pub struct Claim<'info> {
 
 #[derive(Accounts)]
 pub struct Fix<'info> {
-    /// 任何人都可以触发定价，并支付本期记录账户的租金
+    /// 清算窗口内只能是清算地址，之后任何人都可以；支付本期记录账户的租金
     #[account(mut)]
     pub cranker: Signer<'info>,
     #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump,
@@ -890,7 +911,7 @@ pub struct Fix<'info> {
 
 #[derive(Accounts)]
 pub struct Trade<'info> {
-    /// 任何人都可以触发交易
+    /// 清算窗口内只能是清算地址，之后任何人都可以（滑点上限更严）
     pub cranker: Signer<'info>,
     #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump,
               has_one = oracle, has_one = market)]
@@ -1019,6 +1040,8 @@ pub enum FundErrorCode {
     TooManySlices,
     #[msg("已过今天的定价时刻、还没定价，基金调仓等待定价")]
     FixPending,
+    #[msg("清算窗口内只有清算地址能驱动结算")]
+    KeeperOnly,
 }
 
 fn map_err(e: logic::FundError) -> Error {
@@ -1045,6 +1068,7 @@ fn map_err(e: logic::FundError) -> Error {
         E::WrongSliceRecord => FundErrorCode::WrongSliceRecord,
         E::TooManySlices => FundErrorCode::TooManySlices,
         E::FixPending => FundErrorCode::FixPending,
+        E::KeeperOnly => FundErrorCode::KeeperOnly,
     };
     error!(code)
 }

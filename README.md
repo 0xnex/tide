@@ -4,7 +4,7 @@
 
 > **Devnet prototype. Do not use with real money.** The oracle and exchange are mocks. Mainnet needs a security audit and legal advice: pooling other people's money and charging a fee for managing it is regulated in many jurisdictions.
 
-> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code runs settlement as a fixing step plus capped trades, with redeemers paid their slice's actual proceeds. Subscriptions are still filled at a USD NAV from the fixing price, the signal still uses BTC/USD, and the keeper window, withdrawal fee and governance are not built yet. Sections marked *(current code)* describe what runs today.
+> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code runs settlement as a fixing step plus capped trades, with redeemers paid their slice's actual proceeds. Subscriptions are still filled at a USD NAV from the fixing price, the signal still uses BTC/USD, and the withdrawal fee and governance are not built yet. Sections marked *(current code)* describe what runs today.
 
 ---
 
@@ -242,8 +242,8 @@ flowchart LR
 | `seed_prices(prices)` | admin | Pre-load historical prices, before the first settlement only |
 | `request_subscription(amount)` | anyone | Queue a subscription |
 | `request_redemption(shares)` | holder | Queue a redemption |
-| `fix` | anyone | Fixing step, once a day after `settle_offset_secs` |
-| `trade` | anyone | One capped trade; answers `NothingToTrade`, `TradeTooSoon`, `DepegBlocksBuy` or `FixPending` when there is none |
+| `fix` | keeper in 01:00–01:30, then anyone | Fixing step, once a day after `settle_offset_secs` |
+| `trade` | keeper in 01:00–01:30, then anyone | One capped trade; others in the window get `KeeperOnly`; answers `NothingToTrade`, `TradeTooSoon`, `DepegBlocksBuy` or `FixPending` when there is none |
 | `claim` | subscriber / redeemer | Collect shares or USDC |
 | `init_mock_oracle`, `set_mock_price`, `init_mock_market`, `set_mock_market_fee` | admin | Devnet only |
 
@@ -260,10 +260,12 @@ flowchart LR
 | `depeg_threshold_bps` | 200 | cbBTC vs BTC gap that stops buys | current |
 | `trade_cap_usdc` | 200,000 USDC | Max notional per trade | current |
 | `min_trade_interval_secs` | 60 | Seconds between trades | current |
-| Public slippage bound | 10 bps | Non-keeper callers after 01:30 | planned |
+| `public_slippage_bps` | 10 | Non-keeper callers after the window (≤ `max_slippage_bps`) | current |
+| `keeper_window_secs` | 1800 | Keeper-only time after the fixing time | current |
 | Subscription cap | 1,000,000 USDC | Per epoch, incl. pending | planned |
 | Withdrawal fee | 100 bps (max 100) | Of each redemption claim, to the manager; replaces `redemption_fee_bps` | planned |
-| Keeper, fee address | set at creation | Change via 48 h timelock | planned |
+| `keeper` | set at creation | Keeper address; change via 48 h timelock (planned) | current |
+| Fee address | set at creation | Change via 48 h timelock | planned |
 
 ### Accounts (PDAs)
 

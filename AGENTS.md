@@ -6,7 +6,7 @@ Guidance for AI coding agents (and human contributors) working on this repositor
 
 `tide` is a Solana (Anchor) program for a pooled BTC fund. Users queue USDC subscriptions and share redemptions; at 01:00 UTC each day the fixing price is recorded and compared with the 50-day moving average. Settlement then sets aside the redemption slice, nets subscriptions against it, and rebalances the fund toward all-cbBTC (above the average) or all-USDC (below) through capped trades. Shares follow actual execution, never a USD valuation. Users then `claim` their shares or USDC. It is a **devnet prototype**: oracle and exchange are mocks.
 
-**Design in transition.** The target design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/` (decisions; 0005–0007 replace parts of 0002–0004). The invariants below describe that target design. Settlement already runs as a `fix` step plus capped `trade` steps, and redeemers are paid what their redemption slice sells for. Until the rest of the migration lands, subscriptions are still filled at a USD NAV from the fixing price, the signal still uses BTC/USD, and there is no keeper window, withdrawal fee or timelock yet. Treat any difference between that code and these invariants as migration work to do, not as a rule to restore.
+**Design in transition.** The target design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/` (decisions; 0005–0007 replace parts of 0002–0004). The invariants below describe that target design. Settlement already runs as a `fix` step plus capped `trade` steps, and redeemers are paid what their redemption slice sells for. Until the rest of the migration lands, subscriptions are still filled at a USD NAV from the fixing price, the signal still uses BTC/USD, and there is no withdrawal fee or timelock yet. Treat any difference between that code and these invariants as migration work to do, not as a rule to restore.
 
 ## Replies
 
@@ -82,7 +82,7 @@ These are easy to break when editing:
 - `StateData.slices` is `[SliceData; 8]` as a literal mirroring `fund_logic::Slice`; it must equal `fund_logic::MAX_SLICES` (compile-time assertion).
 - `EpochRecord` (program) mirrors `fund_logic::EpochRecord`, including the four `unclaimed_*` fields. Update `set_from_logic`, `set_unclaimed`, and `to_logic`.
 - Every `fund_logic::FundError` variant needs a matching `FundErrorCode` and an arm in `map_err`. The match is exhaustive, so the compiler will remind you.
-- `ConfigData` has one extra field (`max_staleness_secs`) that is checked in the program, not in `fund-logic`.
+- `ConfigData` has two extra fields checked in the program, not in `fund-logic`: `max_staleness_secs` and `keeper` (mapped to `fund_logic::Caller`).
 
 ## Units
 
@@ -133,7 +133,7 @@ Changing seeds breaks existing deployments and the tests/scripts that derive the
 - [ ] No arithmetic that can overflow or underflow without a checked operation.
 - [ ] No path where a user can claim twice, claim another user's ticket, or claim before settlement.
 - [ ] No new instruction lets the admin take user funds. The admin cannot withdraw from vaults. The only value that goes to a non-user is the withdrawal fee, paid in USDC to the fee address fixed at `initialize` (ADR 0007).
-- [ ] The admin is a multisig. Config changes (trade cap, trade interval, slippage, depeg threshold, fee rate, keeper, fee address) go through a 48-hour timelock. The only immediate admin action is pausing subscriptions; redemptions can never be paused.
+- [ ] The admin is a multisig. Config changes (trade cap, trade interval, slippage bounds, keeper window, depeg threshold, fee rate, keeper, fee address) go through a 48-hour timelock. The only immediate admin action is pausing subscriptions; redemptions can never be paused.
 - [ ] The fund cannot end up in a state where `fix` or `trade` always fails.
 
 ## Things not to do

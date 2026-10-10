@@ -17,7 +17,8 @@
 //   ANCHOR_WALLET=~/.config/solana/id.json \
 //   yarn ts-node scripts/crank.ts
 //
-// 注意：模拟预言机由管理员钱包签名，所以这个脚本必须用管理员钱包运行。
+// 注意：脚本以清算地址（config.keeper）签名定价和交易；01:00–01:30 只有它能驱动结算。
+// devnet 上模拟预言机也由管理员钱包签名，所以清算地址要设成管理员钱包，并用这个钱包运行。
 import * as anchor from "@coral-xyz/anchor";
 import { BN, Program } from "@coral-xyz/anchor";
 import { PublicKey } from "@solana/web3.js";
@@ -69,8 +70,11 @@ async function main() {
     return price.toNumber() / 1e6;
   }
 
-  console.log(`已写入价格：${await postPrice()} USD`);
   const f = await program.account.fund.fetch(fund);
+  if (!f.config.keeper.equals(admin)) {
+    throw new Error(`钱包 ${admin.toBase58()} 不是清算地址 ${f.config.keeper.toBase58()}，01:00–01:30 会被拒绝`);
+  }
+  console.log(`已写入价格：${await postPrice()} USD`);
   try {
     const sig = await program.methods
       .fix()

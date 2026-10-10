@@ -5,7 +5,7 @@
 //   第 1 天：Alice 申购 1000、Bob 申购 3000；价格高于均线 -> 分 4 笔买入 cbBTC
 //   第 2 天：Alice 赎回全部份额；价格上涨 10% -> 分 2 笔卖出她那份 cbBTC，卖完才能领取；
 //            中途一笔成交低于 min_out，只回滚那一笔
-//   第 3 天：价格跌破均线 -> 分几笔全部换成 USDC
+//   第 3 天：价格跌破均线 -> 分几笔全部换成 USDC；清算窗口内 Alice 不能交易，窗口之后可以
 //   第 4 天：Bob 赎回全部 -> 基金只有 USDC，赎回资产定价时就完成，份额清零
 //   第 5 天：Alice 再申购；BTC 高于均线，但 cbBTC 比 BTC 低 3%（脱锚）-> 不买入，定价照常完成
 //   第 6 天：恢复锚定 -> 买入 cbBTC
@@ -32,6 +32,9 @@ const USDC = 1_000_000;
 const DAY = 86_400;
 const FIX_OFFSET = 3_600; // UTC 01:00
 const TRADE_INTERVAL = 60;
+const KEEPER_WINDOW = 1_800; // 01:00–01:30 只有清算地址能驱动结算
+const PUBLIC_SLIPPAGE_BPS = 10; // 窗口之后其他人的滑点上限
+const MARKET_FEE_BPS = 18; // 模拟交易所的手续费：0.075% 手续费 + 约 0.1% 滑点
 const usd = (x: number) => new BN(Math.round(x * USDC)); // 价格单位：微美元
 
 describe("tide", () => {
@@ -134,10 +137,12 @@ describe("tide", () => {
       .rpc();
   }
 
-  function fixIx() {
-    return program.account.fund.fetch(fund).then((f) =>
-      program.methods.fix().accountsPartial({
-        cranker: admin.publicKey,
+  async function fixIx(signer: Keypair = admin) {
+    const f = await program.account.fund.fetch(fund);
+    return program.methods
+      .fix()
+      .accountsPartial({
+        cranker: signer.publicKey,
         fund,
         epochRecord: epochPda(f.state.epoch),
         oracle,
@@ -146,21 +151,23 @@ describe("tide", () => {
         subscriptionEscrow: fundPda("subscription_escrow"),
         shareEscrow: fundPda("share_escrow"),
         payoutVault: fundPda("payout_vault"),
-      }),
-    );
+      })
+      .signers(signer === admin ? [] : [signer]);
   }
 
   // 第二天 01:00:30 写入两个价格并定价（模拟预言机的价格必须在定价窗口内发布）。
-  // price：BTC/USD 信号价格；valuation：cbBTC/USD 估值价格，默认与 BTC 同价
+  // price：BTC/USD 信号价格；valuation：cbBTC/USD 估值价格，默认与 BTC 同价。
+  // 先确认清算窗口内其他人不能定价
   async function fixDay(p: number, v: number = p) {
     today += 1;
     await warpTo(today * DAY + FIX_OFFSET + 30);
     await setPrice(p, v);
+    expect(await errorName((await fixIx(alice)).rpc())).to.equal("KeeperOnly");
     await (await fixIx()).rpc();
   }
 
-  /** 在当前时钟交易一笔；卖出赎回资产时带上最早一期未卖完的记录。返回错误名或 null */
-  async function trade(): Promise<string | null> {
+  /** 在当前时钟交易一笔（默认由清算地址签名）；卖出赎回资产时带上最早一期未卖完的记录。返回错误名或 null */
+  async function trade(signer: Keypair = admin): Promise<string | null> {
     // 保持预言机价格新鲜（同一时刻已经写入过就不再写，避免重复交易）
     if (pricedAt !== now) await setPrice(price, valuation);
     const f = await program.account.fund.fetch(fund);
@@ -169,7 +176,7 @@ describe("tide", () => {
       program.methods
         .trade()
         .accountsPartial({
-          cranker: admin.publicKey,
+          cranker: signer.publicKey,
           fund,
           oracle,
           market,
@@ -180,6 +187,7 @@ describe("tide", () => {
           payoutVault: fundPda("payout_vault"),
           sliceRecord,
         })
+        .signers(signer === admin ? [] : [signer])
         .rpc(),
     );
   }
@@ -275,7 +283,7 @@ describe("tide", () => {
 
     await program.methods.initMockOracle(usd(50_000), usd(50_000)).accounts({ authority: admin.publicKey }).rpc();
     await program.methods
-      .initMockMarket(18) // 0.075% 手续费 + 约 0.1% 滑点
+      .initMockMarket(MARKET_FEE_BPS)
       .accounts({ authority: admin.publicKey, usdcMint: usdcMint.publicKey, btcMint: btcMint.publicKey })
       .rpc();
     // 给模拟交易所注入流动性
@@ -295,7 +303,10 @@ describe("tide", () => {
         depegThresholdBps: 200,
         tradeCapUsdc: new BN(1_000 * USDC),
         minTradeIntervalSecs: new BN(TRADE_INTERVAL),
+        keeperWindowSecs: new BN(KEEPER_WINDOW),
+        publicSlippageBps: PUBLIC_SLIPPAGE_BPS,
         maxStalenessSecs: new BN(600),
+        keeper: admin.publicKey, // 清算地址：这里就是管理员钱包
       })
       .accountsPartial({ admin: admin.publicKey, fund, usdcMint: usdcMint.publicKey, btcMint: btcMint.publicKey, shareMint, oracle, market })
       .rpc();
@@ -358,7 +369,7 @@ describe("tide", () => {
     const btcBefore = await tokenBalance(fundPda("btc_vault"));
     expect(await trade()).to.equal("SlippageExceeded");
     expect(await tokenBalance(fundPda("btc_vault"))).to.equal(btcBefore);
-    await setMarketFee(18);
+    await setMarketFee(MARKET_FEE_BPS);
 
     // 下一笔照常卖完；之后基金已经是目标持仓，没有可交易的
     const [n, why] = await tradeUntilDone();
@@ -376,10 +387,22 @@ describe("tide", () => {
     expect(await tokenBalance(fundPda("payout_vault"))).to.equal(0n);
   });
 
-  it("第3天：跌破均线，分几笔全部换成 USDC", async () => {
+  it("第3天：跌破均线，分几笔全部换成 USDC；窗口内只有清算地址能交易", async () => {
     await fixDay(40_000);
     const f0 = await program.account.fund.fetch(fund);
     expect(f0.state.targetBtc).to.equal(false);
+
+    // 01:01：Alice 不是清算地址，被拒绝
+    await warpTo(now + TRADE_INTERVAL);
+    expect(await trade(alice)).to.equal("KeeperOnly");
+    // 01:30 之后谁都可以，但滑点上限是 0.1%：交易所收 0.18% 时这一笔回滚，收 0.05% 时成交
+    await warpTo(today * DAY + FIX_OFFSET + KEEPER_WINDOW);
+    expect(await trade(alice)).to.equal("SlippageExceeded");
+    await setMarketFee(5);
+    await warpTo(now + 1);
+    expect(await trade(alice)).to.equal(null);
+    await setMarketFee(MARKET_FEE_BPS);
+
     const [n, why] = await tradeUntilDone();
     expect(n).to.be.greaterThan(1);
     expect(why).to.equal("NothingToTrade");
