@@ -4,7 +4,7 @@
 
 > **Devnet prototype. Do not use with real money.** The oracle and exchange are mocks. Mainnet needs a security audit and legal advice: pooling other people's money and charging a performance fee is regulated in many jurisdictions.
 
-> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code still runs the original design: one atomic `settle` that swaps the whole fund. Sections marked *(current code)* describe what runs today.
+> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code runs settlement as a fixing step plus capped trades, with redeemers paid their slice's actual proceeds. Subscriptions are still filled at the fixing NAV, and the keeper window, performance fee and governance are not built yet. Sections marked *(current code)* describe what runs today.
 
 ---
 
@@ -233,7 +233,7 @@ Run the crank daily at 01:00 UTC. The mock price must be posted within 60 s:
 ```mermaid
 flowchart LR
   BN["Binance API<br/>BTC price"] --> CR["crank.ts"] -- "set_mock_price" --> O["mock oracle"]
-  CR -- "settle" --> P["tide program"]
+  CR -- "fix, then trade<br/>every 60 s until done" --> P["tide program"]
 ```
 
 ---
@@ -247,9 +247,10 @@ flowchart LR
 | `seed_prices(prices)` | admin | Pre-load historical prices, before the first settlement only |
 | `request_subscription(amount)` | anyone | Queue a subscription |
 | `request_redemption(shares)` | holder | Queue a redemption |
-| `settle` | anyone | Daily settlement after `settle_offset_secs` |
+| `fix` | anyone | Fixing step, once a day after `settle_offset_secs` |
+| `trade` | anyone | One capped trade; answers `NothingToTrade`, `TradeTooSoon`, `DepegBlocksBuy` or `FixPending` when there is none |
 | `claim` | subscriber / redeemer | Collect shares or USDC |
-| `init_mock_oracle`, `set_mock_price`, `init_mock_market` | admin | Devnet only |
+| `init_mock_oracle`, `set_mock_price`, `init_mock_market`, `set_mock_market_fee` | admin | Devnet only |
 
 ### Configuration
 
@@ -262,8 +263,8 @@ flowchart LR
 | `min_subscription` | 1 USDC | Minimum subscription | current |
 | `max_staleness_secs` | 600 | Max oracle price age | current |
 | `depeg_threshold_bps` | 200 | cbBTC vs BTC gap that stops buys | current |
-| Trade cap | 200,000 USDC | Max notional per trade | planned |
-| Min trade interval | 60 s | Time between trades | planned |
+| `trade_cap_usdc` | 200,000 USDC | Max notional per trade | current |
+| `min_trade_interval_secs` | 60 | Seconds between trades | current |
 | Public slippage bound | 10 bps | Non-keeper callers after 01:30 | planned |
 | Subscription cap | 1,000,000 USDC | Per epoch, incl. pending | planned |
 | Performance fee | 500 bps (max 2,000) | Above high-water mark | planned |
@@ -321,7 +322,7 @@ flowchart LR
 
 ### Known limitations
 
-- *(current code)* A day without `settle` leaves a gap; the average covers the last 50 *observed* prices.
+- *(current code)* A day without `fix` leaves a gap; the average covers the last 50 *observed* prices.
 - cbBTC carries custodian risk. The depeg rule stops new buys but cannot recover lost value.
 - Redemptions pay out only after the slice is fully sold, which can take more than a day in thin liquidity or a depeg.
 

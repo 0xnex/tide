@@ -1,13 +1,18 @@
 // 每日结算脚本（devnet 原型用）
 //
-// 做两件事：
+// 做三件事：
 //   1. 从 Binance 公开行情读取 BTC 价格，写入模拟预言机的两个价格源（主网版本应改用 Pyth，删除这一步）。
 //      Binance 没有 cbBTC 行情，devnet 上把 cbBTC/USD 当作与 BTC/USD 同价；
 //      Pyth 上线后分别读取 BTC/USD 和 cbBTC/USD。
-//   2. 调用 settle 完成当天结算
+//   2. 调用 fix 完成当天的定价步骤
+//   3. 每隔最小交易间隔调用一次 trade（每次之前刷新价格），直到程序回答没有可交易的：
+//      NothingToTrade（都做完了）、DepegBlocksBuy（脱锚，等下一次）或 FixPending（定价没成功，
+//      未卖完的赎回资产已经卖完，基金调仓等下一次定价）。
+//      成交低于 min_out 的那一笔会回滚，等下一个间隔重试。
 //
 // 用法（每天 UTC 01:00 用 cron 运行一次。模拟预言机的价格就是定价价格，
-// 必须在 1 点后 60 秒内写入并结算，否则当天会被拒绝，第二天再结算）：
+// 必须在 1 点后 60 秒内写入并定价，否则当天的定价会被拒绝，但交易照常进行，
+// 当天的申购赎回顺延到第二天定价）：
 //   ANCHOR_PROVIDER_URL=https://api.devnet.solana.com \
 //   ANCHOR_WALLET=~/.config/solana/id.json \
 //   yarn ts-node scripts/crank.ts
@@ -20,6 +25,13 @@ import { Tide } from "../target/types/tide";
 
 const IDL = require("../target/idl/tide.json");
 
+// 停止交易的回答（都做完了 / 脱锚 / 今天的定价没成功，基金调仓等下一次定价）；
+// 其余的可重试错误等下一个间隔再试
+const DONE = ["NothingToTrade", "DepegBlocksBuy", "FixPending"];
+const RETRY = ["TradeTooSoon", "SlippageExceeded", "StalePrice"];
+// 定价步骤可以跳过、直接去交易的回答
+const FIX_SKIPPABLE = ["AlreadySettled", "TooManySlices", "PriceNotAtFixTime", "TooEarly"];
+
 async function btcPriceMicroUsd(): Promise<BN> {
   const r = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT");
   if (!r.ok) throw new Error(`读取价格失败：HTTP ${r.status}`);
@@ -28,6 +40,13 @@ async function btcPriceMicroUsd(): Promise<BN> {
   if (!(p > 0)) throw new Error(`价格无效：${j.price}`);
   return new BN(Math.round(p * 1_000_000));
 }
+
+/** 程序返回的错误名（没有就是 undefined） */
+function errorName(e: any): string | undefined {
+  return e?.error?.errorCode?.code;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
   const provider = anchor.AnchorProvider.env();
@@ -40,34 +59,79 @@ async function main() {
   const oracle = pda([Buffer.from("oracle"), admin.toBuffer()]);
   const market = pda([Buffer.from("market"), admin.toBuffer()]);
   const shareMint = pda([Buffer.from("share_mint"), fund.toBuffer()]);
+  const fundPda = (name: string) => pda([Buffer.from(name), fund.toBuffer()]);
+  const epochPda = (epoch: BN) => pda([Buffer.from("epoch"), fund.toBuffer(), epoch.toArrayLike(Buffer, "le", 8)]);
 
-  const price = await btcPriceMicroUsd();
   // 信号价格（BTC/USD）和估值价格（cbBTC/USD）
-  await program.methods.setMockPrice(price, price).accounts({ authority: admin, oracle }).rpc();
-  console.log(`已写入价格：${price.toNumber() / 1e6} USD`);
+  async function postPrice() {
+    const price = await btcPriceMicroUsd();
+    await program.methods.setMockPrice(price, price).accountsPartial({ authority: admin, oracle }).rpc();
+    return price.toNumber() / 1e6;
+  }
 
+  console.log(`已写入价格：${await postPrice()} USD`);
   const f = await program.account.fund.fetch(fund);
-  const sig = await program.methods
-    .settle()
-    .accountsPartial({
-      cranker: admin,
-      fund,
-      epochRecord: pda([Buffer.from("epoch"), fund.toBuffer(), f.state.epoch.toArrayLike(Buffer, "le", 8)]),
-      oracle,
-      market,
-      marketUsdc: pda([Buffer.from("market_usdc"), market.toBuffer()]),
-      marketBtc: pda([Buffer.from("market_btc"), market.toBuffer()]),
-      shareMint,
-      usdcVault: pda([Buffer.from("usdc_vault"), fund.toBuffer()]),
-      btcVault: pda([Buffer.from("btc_vault"), fund.toBuffer()]),
-      subscriptionEscrow: pda([Buffer.from("subscription_escrow"), fund.toBuffer()]),
-      shareEscrow: pda([Buffer.from("share_escrow"), fund.toBuffer()]),
-      payoutVault: pda([Buffer.from("payout_vault"), fund.toBuffer()]),
-    })
-    .rpc();
+  try {
+    const sig = await program.methods
+      .fix()
+      .accountsPartial({
+        cranker: admin,
+        fund,
+        epochRecord: epochPda(f.state.epoch),
+        oracle,
+        shareMint,
+        usdcVault: fundPda("usdc_vault"),
+        subscriptionEscrow: fundPda("subscription_escrow"),
+        shareEscrow: fundPda("share_escrow"),
+        payoutVault: fundPda("payout_vault"),
+      })
+      .rpc();
+    console.log(`定价完成：${sig}`);
+  } catch (e) {
+    const name = errorName(e);
+    if (!name || !FIX_SKIPPABLE.includes(name)) throw e;
+    console.log(`跳过定价（${name}），继续交易`);
+  }
+
+  const intervalMs = f.config.minTradeIntervalSecs.toNumber() * 1000;
+  for (;;) {
+    const s = (await program.account.fund.fetch(fund)).state;
+    const sliceRecord = s.sliceCount > 0 ? epochPda(s.slices[0].epoch) : null;
+    await postPrice();
+    try {
+      const sig = await program.methods
+        .trade()
+        .accountsPartial({
+          cranker: admin,
+          fund,
+          oracle,
+          market,
+          marketUsdc: pda([Buffer.from("market_usdc"), market.toBuffer()]),
+          marketBtc: pda([Buffer.from("market_btc"), market.toBuffer()]),
+          usdcVault: fundPda("usdc_vault"),
+          btcVault: fundPda("btc_vault"),
+          payoutVault: fundPda("payout_vault"),
+          sliceRecord,
+        })
+        .rpc();
+      console.log(`交易完成：${sig}`);
+    } catch (e) {
+      const name = errorName(e);
+      if (name && DONE.includes(name)) {
+        console.log(`停止交易：${name}`);
+        break;
+      }
+      if (!name || !RETRY.includes(name)) throw e;
+      console.log(`本次未成交（${name}），${intervalMs / 1000} 秒后重试`);
+    }
+    await sleep(intervalMs);
+  }
+
   const after = await program.account.fund.fetch(fund);
-  console.log(`结算完成：${sig}`);
-  console.log(`当前持有：${after.state.inBtc ? "BTC" : "USDC"}，第 ${after.state.epoch.toNumber()} 期开放申购赎回`);
+  console.log(
+    `目标持仓：${after.state.targetBtc ? "cbBTC" : "USDC"}；未卖完的赎回资产 ${after.state.sliceCount} 期；` +
+      `第 ${after.state.epoch.toNumber()} 期开放申购赎回`,
+  );
 }
 
 main().catch((e) => {

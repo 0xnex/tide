@@ -6,7 +6,7 @@ Guidance for AI coding agents (and human contributors) working on this repositor
 
 `tide` is a Solana (Anchor) program for a pooled BTC fund. Users queue USDC subscriptions and share redemptions; at 01:00 UTC each day the fixing price is recorded, compared with the 50-day moving average, and used to fix that epoch's NAV. Settlement then nets subscriptions against redemptions and rebalances the fund toward all-cbBTC (above the average) or all-USDC (below) through capped trades. Users then `claim` their shares or USDC. It is a **devnet prototype**: oracle and exchange are mocks.
 
-**Design in transition.** The target design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/0001`–`0004` (decisions). The invariants below describe that target design. Until the migration lands, the code still runs the original single-instruction `settle`. Treat any difference between that code and these invariants as migration work to do, not as a rule to restore.
+**Design in transition.** The target design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/0001`–`0004` (decisions). The invariants below describe that target design. Settlement already runs as a `fix` step plus capped `trade` steps, and redeemers are paid what their redemption slice sells for. Until the rest of the migration lands, subscriptions are still filled at the fixing NAV, and there is no keeper window, performance fee or timelock yet. Treat any difference between that code and these invariants as migration work to do, not as a rule to restore.
 
 ## Architecture
 
@@ -74,6 +74,7 @@ These are easy to break when editing:
 
 - `StateData` (program) mirrors `fund_logic::FundState` field-for-field. Update `from_logic` / `to_logic` together.
 - `StateData.prices` is `[u64; 64]` as a **literal** (the IDL needs it). It must equal `fund_logic::MAX_WINDOW`; a compile-time assertion enforces this.
+- `StateData.slices` is `[SliceData; 8]` as a literal mirroring `fund_logic::Slice`; it must equal `fund_logic::MAX_SLICES` (compile-time assertion).
 - `EpochRecord` (program) mirrors `fund_logic::EpochRecord`, including the four `unclaimed_*` fields. Update `set_from_logic`, `set_unclaimed`, and `to_logic`.
 - Every `fund_logic::FundError` variant needs a matching `FundErrorCode` and an arm in `map_err`. The match is exhaustive, so the compiler will remind you.
 - `ConfigData` has one extra field (`max_staleness_secs`) that is checked in the program, not in `fund-logic`.
@@ -117,7 +118,7 @@ Changing seeds breaks existing deployments and the tests/scripts that derive the
 `MockOracle`, `MockMarket`, `init_mock_oracle`, `set_mock_price`, and `init_mock_market` exist only for devnet. When replacing them:
 
 - **Oracle (Pyth):** check publish time against `max_staleness_secs`, reject wide confidence intervals, convert the exponent to micro-USD carefully.
-- **Exchange (Jupiter):** compute the route off-chain, pass route accounts into `settle` (or a separate `rebalance` instruction), and keep the on-chain `min_out` check against the oracle. Never trust a price supplied by the caller.
+- **Exchange (Jupiter):** compute the route off-chain, pass route accounts into `trade`, and keep the on-chain `min_out` check against the oracle. Never trust a price supplied by the caller.
 - Remove the mock instructions from mainnet builds (e.g. behind a cargo feature).
 
 ## Security checklist for any change
@@ -128,7 +129,7 @@ Changing seeds breaks existing deployments and the tests/scripts that derive the
 - [ ] No path where a user can claim twice, claim another user's ticket, or claim before settlement.
 - [ ] No new instruction lets the admin take user funds. The admin cannot withdraw from vaults. The only value that goes to a non-user is the performance fee, minted as shares to the fee address fixed at `initialize` (ADR 0004).
 - [ ] The admin is a multisig. Config changes (trade cap, trade interval, slippage, depeg threshold, fee rate, keeper, fee address) go through a 48-hour timelock. The only immediate admin action is pausing subscriptions; redemptions can never be paused.
-- [ ] The fund cannot end up in a state where `settle` always fails.
+- [ ] The fund cannot end up in a state where `fix` or `trade` always fails.
 
 ## Things not to do
 
@@ -140,7 +141,7 @@ Changing seeds breaks existing deployments and the tests/scripts that derive the
 ## Style
 
 - Rust: `rustfmt` defaults (edition 2021). Small pure functions in `fund-logic`; return `Result<_, FundError>`.
-- Comments explain *why*, especially around rounding direction and ordering inside `settle`.
+- Comments explain *why*, especially around rounding direction and ordering inside `fix` and `trade`.
 - TypeScript: keep helper functions in tests small; derive PDAs with the same seeds as the program.
 
 ## Agent skills
