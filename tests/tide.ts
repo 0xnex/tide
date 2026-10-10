@@ -5,6 +5,8 @@
 //   第 2 天：Alice 赎回全部份额；价格上涨 10%（仍高于均线）-> 卖出部分 BTC 付款
 //   第 3 天：价格跌破均线 -> 基金全部换成 USDC
 //   第 4 天：Bob 赎回全部 -> 份额清零
+//   第 5 天：Alice 再申购；BTC 高于均线，但 cbBTC 比 BTC 低 3%（脱锚）-> 不买入，结算照常完成
+//   第 6 天：恢复锚定 -> 买入 cbBTC
 import * as anchor from "@coral-xyz/anchor";
 import { BN, Program } from "@coral-xyz/anchor";
 import {
@@ -95,10 +97,14 @@ describe("tide", () => {
     return ata;
   }
 
-  async function settleDay(price: number) {
+  // price：BTC/USD 信号价格；valuation：cbBTC/USD 估值价格，默认与 BTC 同价
+  async function settleDay(price: number, valuation: number = price) {
     today += 1;
     await warpTo(today * DAY + 3_600 + 30); // UTC 01:00:30，模拟预言机的价格必须在定价窗口（1 点后 60 秒）内发布
-    await program.methods.setMockPrice(usd(price)).accounts({ authority: admin.publicKey, oracle }).rpc();
+    await program.methods
+      .setMockPrice(usd(price), usd(valuation))
+      .accounts({ authority: admin.publicKey, oracle })
+      .rpc();
     const f = await program.account.fund.fetch(fund);
     await program.methods
       .settle()
@@ -194,7 +200,7 @@ describe("tide", () => {
     fund = pda([Buffer.from("fund"), admin.publicKey.toBuffer()]);
     shareMint = pda([Buffer.from("share_mint"), fund.toBuffer()]);
 
-    await program.methods.initMockOracle(usd(50_000)).accounts({ authority: admin.publicKey }).rpc();
+    await program.methods.initMockOracle(usd(50_000), usd(50_000)).accounts({ authority: admin.publicKey }).rpc();
     await program.methods
       .initMockMarket(18) // 模拟 Binance：0.075% 手续费 + 约 0.1% 滑点
       .accounts({ authority: admin.publicKey, usdcMint: usdcMint.publicKey, btcMint: btcMint.publicKey })
@@ -213,6 +219,7 @@ describe("tide", () => {
         subscriptionFeeBps: 0,
         redemptionFeeBps: 0,
         minSubscription: new BN(USDC),
+        depegThresholdBps: 200,
         maxStalenessSecs: new BN(600),
       })
       .accountsPartial({ admin: admin.publicKey, fund, usdcMint: usdcMint.publicKey, btcMint: btcMint.publicKey, shareMint, oracle, market })
@@ -305,5 +312,31 @@ describe("tide", () => {
     const f = await program.account.fund.fetch(fund);
     expect(f.state.shareSupply.toNumber()).to.equal(0);
     expect(await tokenBalance(pda([Buffer.from("share_escrow"), fund.toBuffer()]))).to.equal(0n);
+  });
+
+  it("第5天：cbBTC 脱锚，不买入，结算照常完成", async () => {
+    await subscribe(alice, aliceUsdc, 1_000 * USDC);
+    const f0 = await program.account.fund.fetch(fund);
+    const usdcVault = pda([Buffer.from("usdc_vault"), fund.toBuffer()]);
+    const vaultBefore = await tokenBalance(usdcVault); // 之前全部赎回可能留下取整尘埃
+    await settleDay(52_000, 50_440); // cbBTC 比 BTC 低 3%，超过 2% 阈值
+    const r = await program.account.epochRecord.fetch(
+      pda([Buffer.from("epoch"), fund.toBuffer(), f0.state.epoch.toArrayLike(Buffer, "le", 8)]),
+    );
+    expect(r.signalPrice.toString()).to.equal(usd(52_000).toString());
+    expect(r.valuationPrice.toString()).to.equal(usd(50_440).toString());
+    expect(r.inBtcAfter).to.equal(true); // 目标仍是 cbBTC
+    const f = await program.account.fund.fetch(fund);
+    expect(f.state.inBtc).to.equal(false);
+    expect(await tokenBalance(pda([Buffer.from("btc_vault"), fund.toBuffer()]))).to.equal(0n);
+    expect(await tokenBalance(usdcVault)).to.equal(vaultBefore + BigInt(1_000 * USDC)); // 申购款原样留在 USDC
+    await claim(alice, aliceUsdc);
+  });
+
+  it("第6天：恢复锚定，买入 cbBTC", async () => {
+    await settleDay(53_000);
+    const f = await program.account.fund.fetch(fund);
+    expect(f.state.inBtc).to.equal(true);
+    expect(await tokenBalance(pda([Buffer.from("usdc_vault"), fund.toBuffer()]))).to.equal(0n);
   });
 });

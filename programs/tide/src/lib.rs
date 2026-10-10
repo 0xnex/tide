@@ -7,7 +7,8 @@
 //! - 用户在结算之后调用 claim 领取份额或 USDC
 //!
 //! 原型限制（上主网前必须替换）：
-//! - 价格来自 MockOracle（管理员手动设置），主网应改为 Pyth 等预言机
+//! - 价格来自 MockOracle（管理员手动设置两个价格：BTC/USD 信号价格、cbBTC/USD 估值价格），
+//!   主网应改为 Pyth 的两个价格源
 //! - 兑换走 MockMarket（按预言机价格成交、收固定手续费），主网应改为 Jupiter
 //!
 //! 所有记账逻辑在 fund-logic crate 中（纯 Rust，有完整单元测试），本文件只负责
@@ -190,20 +191,33 @@ pub mod tide {
         let now = Clock::get()?.unix_timestamp;
         let oracle = &ctx.accounts.oracle;
         let fund_cfg = ctx.accounts.fund.config;
-        require!(oracle.price > 0, FundErrorCode::BadPrice);
-        require!(
-            now >= oracle.publish_time && now - oracle.publish_time <= fund_cfg.max_staleness_secs,
-            FundErrorCode::StalePrice
-        );
-        let price = oracle.price;
-        // 模拟预言机只有一个价格，同时充当定价价格和最新价格：它必须在定价窗口内发布，
+        for (price, publish_time) in [
+            (oracle.signal_price, oracle.signal_publish_time),
+            (oracle.valuation_price, oracle.valuation_publish_time),
+        ] {
+            require!(price > 0, FundErrorCode::BadPrice);
+            require!(
+                now >= publish_time && now - publish_time <= fund_cfg.max_staleness_secs,
+                FundErrorCode::StalePrice
+            );
+        }
+        // 模拟预言机每个价格源只有一个价格，同时充当定价价格和最新价格：它必须在定价窗口内发布，
         // 并且不超过 max_staleness_secs，所以目前只能在 1 点后几十秒内结算。
         // 换成 Pyth 后，定价价格用 1 点的历史价格更新，最新价格单独传入。
         let prices = logic::SettlePrices {
-            fix: price,
-            fix_publish_time: oracle.publish_time,
-            exec: price,
+            signal_fix: logic::PricePoint {
+                price: oracle.signal_price,
+                publish_time: oracle.signal_publish_time,
+            },
+            valuation_fix: logic::PricePoint {
+                price: oracle.valuation_price,
+                publish_time: oracle.valuation_publish_time,
+            },
+            signal_exec: oracle.signal_price,
+            valuation_exec: oracle.valuation_price,
         };
+        // 交易所交易的是 cbBTC：模拟交易所按与 min_out 相同的最新估值价格成交
+        let price = prices.valuation_exec;
 
         let cfg = fund_cfg.to_logic();
         let mut st = ctx.accounts.fund.state.to_logic();
@@ -343,7 +357,8 @@ pub mod tide {
         emit!(Settled {
             epoch: out.record.epoch,
             day: out.record.day,
-            price: out.record.price,
+            signal_price: out.record.signal_price,
+            valuation_price: out.record.valuation_price,
             moving_average: out.record.moving_average,
             nav: out.record.nav,
             in_btc: out.record.in_btc_after,
@@ -355,18 +370,24 @@ pub mod tide {
     // 原型专用：模拟预言机和模拟交易所（主网版本删除）
     // ------------------------------------------------------------------
 
-    pub fn init_mock_oracle(ctx: Context<InitMockOracle>, price: u64) -> Result<()> {
+    pub fn init_mock_oracle(
+        ctx: Context<InitMockOracle>,
+        signal_price: u64,
+        valuation_price: u64,
+    ) -> Result<()> {
         let o = &mut ctx.accounts.oracle;
         o.authority = ctx.accounts.authority.key();
-        o.price = price;
-        o.publish_time = Clock::get()?.unix_timestamp;
+        o.set(signal_price, valuation_price, Clock::get()?.unix_timestamp);
         Ok(())
     }
 
-    pub fn set_mock_price(ctx: Context<SetMockPrice>, price: u64) -> Result<()> {
+    pub fn set_mock_price(
+        ctx: Context<SetMockPrice>,
+        signal_price: u64,
+        valuation_price: u64,
+    ) -> Result<()> {
         let o = &mut ctx.accounts.oracle;
-        o.price = price;
-        o.publish_time = Clock::get()?.unix_timestamp;
+        o.set(signal_price, valuation_price, Clock::get()?.unix_timestamp);
         Ok(())
     }
 
@@ -394,6 +415,7 @@ pub struct ConfigData {
     pub subscription_fee_bps: u16,
     pub redemption_fee_bps: u16,
     pub min_subscription: u64,
+    pub depeg_threshold_bps: u16,
     pub max_staleness_secs: i64, // 预言机价格最多允许多旧
 }
 
@@ -406,6 +428,7 @@ impl ConfigData {
             subscription_fee_bps: self.subscription_fee_bps,
             redemption_fee_bps: self.redemption_fee_bps,
             min_subscription: self.min_subscription,
+            depeg_threshold_bps: self.depeg_threshold_bps,
         }
     }
 }
@@ -504,7 +527,8 @@ pub struct EpochRecord {
     pub fund: Pubkey,
     pub epoch: u64,
     pub day: i64,
-    pub price: u64,
+    pub signal_price: u64,
+    pub valuation_price: u64,
     pub moving_average: u64,
     pub nav: u128,
     pub subscription_usdc: u64,
@@ -523,7 +547,8 @@ impl EpochRecord {
     fn set_from_logic(&mut self, r: &logic::EpochRecord) {
         self.epoch = r.epoch;
         self.day = r.day;
-        self.price = r.price;
+        self.signal_price = r.signal_price;
+        self.valuation_price = r.valuation_price;
         self.moving_average = r.moving_average;
         self.nav = r.nav;
         self.subscription_usdc = r.subscription_usdc;
@@ -543,7 +568,8 @@ impl EpochRecord {
         logic::EpochRecord {
             epoch: self.epoch,
             day: self.day,
-            price: self.price,
+            signal_price: self.signal_price,
+            valuation_price: self.valuation_price,
             moving_average: self.moving_average,
             nav: self.nav,
             subscription_usdc: self.subscription_usdc,
@@ -559,13 +585,24 @@ impl EpochRecord {
     }
 }
 
-/// 原型专用：模拟预言机，价格单位为“每枚 BTC 的微美元”（USD × 1e6）
+/// 原型专用：模拟预言机，两个价格源，单位为“每枚 BTC 的微美元”（USD × 1e6）
 #[account]
 #[derive(InitSpace)]
 pub struct MockOracle {
     pub authority: Pubkey,
-    pub price: u64,
-    pub publish_time: i64,
+    pub signal_price: u64, // BTC/USD
+    pub signal_publish_time: i64,
+    pub valuation_price: u64, // cbBTC/USD
+    pub valuation_publish_time: i64,
+}
+
+impl MockOracle {
+    fn set(&mut self, signal_price: u64, valuation_price: u64, now: i64) {
+        self.signal_price = signal_price;
+        self.signal_publish_time = now;
+        self.valuation_price = valuation_price;
+        self.valuation_publish_time = now;
+    }
 }
 
 /// 原型专用：模拟交易所，按预言机价格成交，收 fee_bps 手续费
@@ -583,7 +620,8 @@ pub struct MockMarket {
 pub struct Settled {
     pub epoch: u64,
     pub day: i64,
-    pub price: u64,
+    pub signal_price: u64,
+    pub valuation_price: u64,
     pub moving_average: u64,
     pub nav: u128,
     pub in_btc: bool,

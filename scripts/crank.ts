@@ -1,7 +1,9 @@
 // 每日结算脚本（devnet 原型用）
 //
 // 做两件事：
-//   1. 从 Binance 公开行情读取 BTC 价格，写入模拟预言机（主网版本应改用 Pyth，删除这一步）
+//   1. 从 Binance 公开行情读取 BTC 价格，写入模拟预言机的两个价格源（主网版本应改用 Pyth，删除这一步）。
+//      Binance 没有 cbBTC 行情，devnet 上把 cbBTC/USD 当作与 BTC/USD 同价；
+//      Pyth 上线后分别读取 BTC/USD 和 cbBTC/USD。
 //   2. 调用 settle 完成当天结算
 //
 // 用法（每天 UTC 01:00 用 cron 运行一次。模拟预言机的价格就是定价价格，
@@ -40,7 +42,8 @@ async function main() {
   const shareMint = pda([Buffer.from("share_mint"), fund.toBuffer()]);
 
   const price = await btcPriceMicroUsd();
-  await program.methods.setMockPrice(price).accounts({ authority: admin, oracle }).rpc();
+  // 信号价格（BTC/USD）和估值价格（cbBTC/USD）
+  await program.methods.setMockPrice(price, price).accounts({ authority: admin, oracle }).rpc();
   console.log(`已写入价格：${price.toNumber() / 1e6} USD`);
 
   const f = await program.account.fund.fetch(fund);

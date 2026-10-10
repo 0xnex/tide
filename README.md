@@ -261,10 +261,10 @@ flowchart LR
 | `subscription_fee_bps` / `redemption_fee_bps` | 0 | Subscription / redemption fee, kept in fund | current |
 | `min_subscription` | 1 USDC | Minimum subscription | current |
 | `max_staleness_secs` | 600 | Max oracle price age | current |
+| `depeg_threshold_bps` | 200 | cbBTC vs BTC gap that stops buys | current |
 | Trade cap | 200,000 USDC | Max notional per trade | planned |
 | Min trade interval | 60 s | Time between trades | planned |
 | Public slippage bound | 10 bps | Non-keeper callers after 01:30 | planned |
-| Depeg threshold | 200 bps | cbBTC vs BTC gap that stops buys | planned |
 | Subscription cap | 1,000,000 USDC | Per epoch, incl. pending | planned |
 | Performance fee | 500 bps (max 2,000) | Above high-water mark | planned |
 | Keeper, fee address | set at creation | Change via 48 h timelock | planned |
