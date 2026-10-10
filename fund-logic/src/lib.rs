@@ -7,7 +7,10 @@
 //! - 价格：每 1 枚 BTC 值多少“微美元”（USD × 1e6），即 USDC 原始单位
 //!
 //! 规则：
-//! - 申购、赎回先排队，01:00 之前提交的参加当天的结算，之后的等下一次。
+//! - 申购、赎回随时可以排队，排队从不关闭。每个请求属于关闭它的定价时刻那一“期”，
+//!   期号就是那个定价时刻的日期序号：01:00 之前提交的属于当天，之后提交的属于第二天。
+//!   某天没有定价（跳过）时，这一期的请求顺延到下一次定价，一次定价可以关闭好几期。
+//! - 请求在关闭它的定价时刻之前可以撤销，全额退回；定价时刻之后不能撤销。
 //! - 基金从不按美元估值（ADR 0006）：赎回资产按份额比例从基金划出实物；申购带来多少
 //!   基金资产（买到的 cbBTC，或目标为 USDC 时的 USDC），就按基金每份对应的资产发多少份额。
 //! - 结算分多步（ADR 0001）：定价步骤（fix）记录价格、算出目标、
@@ -20,8 +23,8 @@
 //!   基金调仓按新的目标重新计算，结算永远不会卡住。
 //! - 信号和轧差用“定价时刻”（当天 UTC 0 点 + settle_offset）发布的价格，
 //!   不用调用 fix 那一刻的价格：调用人不能挑一天里对自己最有利的时刻。
-//! - 定价时刻到当天定价步骤之间，暂停申购和赎回：定价价格已经公开，
-//!   这段时间排队的请求要等下一次定价。
+//! - 定价时刻到当天定价步骤之间提交的请求属于下一期：定价价格已经公开，
+//!   这段时间的请求不能按它成交，也不能撤销已经排队的请求。
 //! - 两个价格（ADR 0003）：信号价格（BTC/USD）用于均线和信号，因为策略跟踪的是 BTC；
 //!   估值价格（cbBTC/USD）用于轧差和交易的 min_out，因为基金实际持有的是 cbBTC。
 //! - 定价时记录当天的信号价格，如果高于最近 window 个信号价格的平均值，目标是持有 cbBTC；
@@ -58,7 +61,6 @@ pub enum FundError {
     BelowMinSubscription,
     ZeroAmount,
     TooManyPrices,
-    QueueClosed,       // 已过定价时刻、当天还没定价，暂停申购赎回
     PriceNotAtFixTime, // 定价价格的发布时间不在定价窗口内
     NothingToTrade,    // 没有需要交易的东西
     TradeTooSoon,      // 距离上一笔交易不到 min_trade_interval_secs
@@ -68,6 +70,9 @@ pub enum FundError {
     TooManySlices,     // 未卖完的赎回资产已有 MAX_SLICES 期
     FixPending,        // 已过今天的定价时刻、还没定价，基金调仓等待定价
     KeeperOnly,        // 清算窗口内只有清算地址能驱动结算
+    WrongEpoch,        // 排队记录不是这一刻开放的那一期
+    TooLateToCancel,   // 已过关闭这一期的定价时刻，不能再撤销
+    NothingToCancel,   // 排队记录是空的
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,16 +158,20 @@ pub struct FundState {
     pub usdc: u64,                     // 基金持有的 USDC（不含排队中的申购款、赎回资产）
     pub btc: u64,                      // 基金持有的 cbBTC（不含赎回资产）
     pub share_supply: u64,             // 已发行份额（含排队赎回、尚未销毁的份额）
-    pub queued_subscription_usdc: u64, // 本期排队的申购款
-    pub queued_redemption_shares: u64, // 本期排队赎回的份额
-    pub prices: [u64; MAX_WINDOW],     // 每日信号价格环形缓冲
-    pub price_count: u8,               // 已记录的价格数量（最多 window）
-    pub price_head: u8,                // 下一个写入位置
-    pub target_btc: bool,              // 最近一次定价的目标：true 持有 cbBTC，false 持有 USDC
-    pub last_fix_day: i64,             // 最近一次定价的日期序号（unix 秒 / 86400），-1 表示从未定价
-    pub last_trade_time: i64,          // 最近一笔交易的时间（unix 秒）
-    pub epoch: u64,                    // 当前开放申购/赎回的期号
-    pub slices: [Slice; MAX_SLICES],   // 未卖完的赎回资产，最早的在前
+    pub queued_subscription_usdc: u64, // 下一次定价要处理的排队申购款（可能包含好几期）
+    pub queued_redemption_shares: u64, // 下一次定价要处理的排队赎回份额
+    // 已过今天的定价时刻、今天还没定价时提交的请求（第 next_epoch 期）：今天的定价不处理它们。
+    // 今天没有定价的话，它们并入上面的排队，由下一次定价一起处理。
+    pub next_epoch: u64,
+    pub next_subscription_usdc: u64,
+    pub next_redemption_shares: u64,
+    pub prices: [u64; MAX_WINDOW],   // 每日信号价格环形缓冲
+    pub price_count: u8,             // 已记录的价格数量（最多 window）
+    pub price_head: u8,              // 下一个写入位置
+    pub target_btc: bool,            // 最近一次定价的目标：true 持有 cbBTC，false 持有 USDC
+    pub last_fix_day: i64,           // 最近一次定价的日期序号（unix 秒 / 86400），-1 表示从未定价
+    pub last_trade_time: i64,        // 最近一笔交易的时间（unix 秒）
+    pub slices: [Slice; MAX_SLICES], // 未卖完的赎回资产，最早的在前
     pub slice_count: u8,
     pub pending: [Pending; MAX_PENDING], // 待成交申购，最早的在前
     pub pending_count: u8,
@@ -176,13 +185,15 @@ impl FundState {
             share_supply: 0,
             queued_subscription_usdc: 0,
             queued_redemption_shares: 0,
+            next_epoch: 0,
+            next_subscription_usdc: 0,
+            next_redemption_shares: 0,
             prices: [0; MAX_WINDOW],
             price_count: 0,
             price_head: 0,
             target_btc: false,
             last_fix_day: -1,
             last_trade_time: 0,
-            epoch: 0,
             slices: [Slice::default(); MAX_SLICES],
             slice_count: 0,
             pending: [Pending::default(); MAX_PENDING],
@@ -207,11 +218,13 @@ impl Default for FundState {
     }
 }
 
-/// 一期定价的结果，存到链上，用户据此领取份额或 USDC。
+/// 一次定价的结果，存到链上，用户据此领取份额或 USDC。
+/// 它关闭 first_epoch..=epoch 这几期：epoch 是定价当天的日期序号，
+/// 更早的是被跳过的定价顺延过来的。这几期的请求合在一起按比例领取。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EpochRecord {
     pub epoch: u64,
-    pub day: i64,
+    pub first_epoch: u64,
     pub signal_price: u64,         // 定价时刻的 BTC/USD，记入均线
     pub valuation_price: u64,      // 定价时刻的 cbBTC/USD，用于轧差
     pub moving_average: u64,       // 价格不足 window 个时为 0
@@ -234,6 +247,13 @@ pub struct EpochRecord {
     pub unclaimed_redemption_shares: u64,
     pub unclaimed_payout_usdc: u64,
     pub unclaimed_refund_usdc: u64,
+}
+
+impl EpochRecord {
+    /// 这次定价是否关闭了第 epoch 期
+    pub fn covers(&self, epoch: u64) -> bool {
+        (self.first_epoch..=self.epoch).contains(&epoch)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,13 +394,70 @@ pub fn fix_time(day: i64, cfg: &Config) -> i64 {
     day * SECONDS_PER_DAY + cfg.settle_offset_secs
 }
 
-/// 申购赎回是否开放：定价时刻之后、当天定价步骤之前关闭。
-pub fn check_queue_open(s: &FundState, now_unix: i64, cfg: &Config) -> Result<(), FundError> {
+fn epoch_of_day(day: i64) -> Result<u64, FundError> {
+    u64::try_from(day).map_err(|_| FundError::Overflow)
+}
+
+fn day_of_epoch(epoch: u64) -> Result<i64, FundError> {
+    i64::try_from(epoch).map_err(|_| FundError::Overflow)
+}
+
+/// 这一刻提交的请求属于哪一期：关闭它的下一个定价时刻所在的日期序号。
+/// 当天定价时刻之前提交的属于当天，之后提交的属于第二天，不管当天的定价步骤执行了没有。
+pub fn request_epoch(now_unix: i64, cfg: &Config) -> Result<u64, FundError> {
     let day = day_of(now_unix);
-    if now_unix >= fix_time(day, cfg) && s.last_fix_day < day {
-        return Err(FundError::QueueClosed);
+    if now_unix < fix_time(day, cfg) {
+        epoch_of_day(day)
+    } else {
+        epoch_of_day(day.checked_add(1).ok_or(FundError::Overflow)?)
     }
+}
+
+/// 下一次定价最早在哪一天：今天，或者今天已经定价过时的明天（last_fix_day ≥ -1，不会溢出）
+fn next_fix_day(s: &FundState, now_unix: i64) -> i64 {
+    day_of(now_unix).max(s.last_fix_day.saturating_add(1))
+}
+
+/// 第 epoch 期的请求是否由下一次定价处理（否则在 next_* 里，等再下一次）
+fn joins_next_fix(s: &FundState, epoch: u64, now_unix: i64) -> Result<bool, FundError> {
+    Ok(day_of_epoch(epoch)? <= next_fix_day(s, now_unix))
+}
+
+/// next_* 那一期的定价时刻已过、那天却没有定价（跳过）时，并入下一次定价要处理的排队。
+fn roll_queue(s: &mut FundState, now_unix: i64) -> Result<(), FundError> {
+    let empty = s.next_subscription_usdc == 0 && s.next_redemption_shares == 0;
+    if empty || !joins_next_fix(s, s.next_epoch, now_unix)? {
+        return Ok(());
+    }
+    s.queued_subscription_usdc = s
+        .queued_subscription_usdc
+        .checked_add(s.next_subscription_usdc)
+        .ok_or(FundError::Overflow)?;
+    s.queued_redemption_shares = s
+        .queued_redemption_shares
+        .checked_add(s.next_redemption_shares)
+        .ok_or(FundError::Overflow)?;
+    s.next_epoch = 0;
+    s.next_subscription_usdc = 0;
+    s.next_redemption_shares = 0;
     Ok(())
+}
+
+/// 第 epoch 期请求所在的排队（申购款, 赎回份额）。调用前先 roll_queue。
+fn queue_of(
+    s: &mut FundState,
+    epoch: u64,
+    now_unix: i64,
+) -> Result<(&mut u64, &mut u64), FundError> {
+    if joins_next_fix(s, epoch, now_unix)? {
+        return Ok((
+            &mut s.queued_subscription_usdc,
+            &mut s.queued_redemption_shares,
+        ));
+    }
+    // 不由下一次定价处理的只能是明天这一期（roll_queue 已经并入更早的）
+    s.next_epoch = epoch;
+    Ok((&mut s.next_subscription_usdc, &mut s.next_redemption_shares))
 }
 
 /// 驱动结算（定价、交易）的调用人
@@ -405,7 +482,7 @@ fn check_keeper_window(now_unix: i64, caller: Caller, cfg: &Config) -> Result<()
 // 申购、赎回排队
 // ---------------------------------------------------------------------------
 
-/// 用户的排队记录。一个用户同时只能有一期未领取的记录。
+/// 用户在某一期的排队记录。每个用户每一期一张，所以可以同时有好几期没领取。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Ticket {
     pub epoch: u64,
@@ -420,7 +497,44 @@ impl Ticket {
     }
 }
 
-/// 外层必须先确认：ticket 为空，或 ticket.epoch == s.epoch（同一期可以追加）。
+/// 把请求加进它这一期的排队记录和排队。t 必须是空的，或者正是这一刻开放的那一期
+/// （外层按 request_epoch 推出排队记录的地址）。
+fn enqueue(
+    s: &mut FundState,
+    t: &mut Ticket,
+    usdc: u64,
+    shares: u64,
+    now_unix: i64,
+    cfg: &Config,
+) -> Result<(), FundError> {
+    let epoch = request_epoch(now_unix, cfg)?;
+    if !t.is_empty() && t.epoch != epoch {
+        return Err(FundError::WrongEpoch);
+    }
+    let mut n = s.clone();
+    roll_queue(&mut n, now_unix)?;
+    let (queued_usdc, queued_shares) = queue_of(&mut n, epoch, now_unix)?;
+    *queued_usdc = queued_usdc.checked_add(usdc).ok_or(FundError::Overflow)?;
+    *queued_shares = queued_shares
+        .checked_add(shares)
+        .ok_or(FundError::Overflow)?;
+    let ticket = Ticket {
+        epoch,
+        subscription_usdc: t
+            .subscription_usdc
+            .checked_add(usdc)
+            .ok_or(FundError::Overflow)?,
+        redemption_shares: t
+            .redemption_shares
+            .checked_add(shares)
+            .ok_or(FundError::Overflow)?,
+        shares_claimed: t.shares_claimed,
+    };
+    *s = n;
+    *t = ticket;
+    Ok(())
+}
+
 pub fn request_subscription(
     s: &mut FundState,
     t: &mut Ticket,
@@ -428,26 +542,13 @@ pub fn request_subscription(
     now_unix: i64,
     cfg: &Config,
 ) -> Result<(), FundError> {
-    check_queue_open(s, now_unix, cfg)?;
     if amount == 0 {
         return Err(FundError::ZeroAmount);
     }
     if amount < cfg.min_subscription {
         return Err(FundError::BelowMinSubscription);
     }
-    if !t.is_empty() && t.epoch != s.epoch {
-        return Err(FundError::NothingToClaim); // 上一期还没领取，外层应先 claim
-    }
-    t.epoch = s.epoch;
-    t.subscription_usdc = t
-        .subscription_usdc
-        .checked_add(amount)
-        .ok_or(FundError::Overflow)?;
-    s.queued_subscription_usdc = s
-        .queued_subscription_usdc
-        .checked_add(amount)
-        .ok_or(FundError::Overflow)?;
-    Ok(())
+    enqueue(s, t, amount, 0, now_unix, cfg)
 }
 
 pub fn request_redemption(
@@ -457,23 +558,59 @@ pub fn request_redemption(
     now_unix: i64,
     cfg: &Config,
 ) -> Result<(), FundError> {
-    check_queue_open(s, now_unix, cfg)?;
     if shares == 0 {
         return Err(FundError::ZeroAmount);
     }
-    if !t.is_empty() && t.epoch != s.epoch {
-        return Err(FundError::NothingToClaim);
+    enqueue(s, t, 0, shares, now_unix, cfg)
+}
+
+/// 第 epoch 期的请求最晚在什么时刻之前可以撤销：关闭它的定价时刻，
+/// 即这一期自己的定价时刻，或者它被跳过时今天的定价时刻
+pub fn cancel_deadline(epoch: u64, now_unix: i64, cfg: &Config) -> Result<i64, FundError> {
+    Ok(fix_time(day_of_epoch(epoch)?.max(day_of(now_unix)), cfg))
+}
+
+/// 撤销的结果：外层从申购托管退回 usdc，从份额托管退回 shares。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CancelOutcome {
+    pub usdc: u64,
+    pub shares: u64,
+}
+
+/// 撤销一张还没定价的排队记录，申购款和赎回份额全额退回，记录清空。
+/// 只能在关闭这一期的定价时刻之前：今天的定价时刻已过、今天还没定价时，定价价格已经公开，
+/// 这时撤销等于看到价格再决定要不要成交，所以拒绝。被跳过的定价顺延到下一次，
+/// 在下一个定价时刻之前又可以撤销。
+pub fn cancel(
+    s: &mut FundState,
+    t: &mut Ticket,
+    now_unix: i64,
+    cfg: &Config,
+) -> Result<CancelOutcome, FundError> {
+    if t.is_empty() {
+        return Err(FundError::NothingToCancel);
     }
-    t.epoch = s.epoch;
-    t.redemption_shares = t
-        .redemption_shares
-        .checked_add(shares)
+    if day_of_epoch(t.epoch)? <= s.last_fix_day
+        || now_unix >= cancel_deadline(t.epoch, now_unix, cfg)?
+    {
+        return Err(FundError::TooLateToCancel);
+    }
+    let mut n = s.clone();
+    roll_queue(&mut n, now_unix)?;
+    let (queued_usdc, queued_shares) = queue_of(&mut n, t.epoch, now_unix)?;
+    *queued_usdc = queued_usdc
+        .checked_sub(t.subscription_usdc)
         .ok_or(FundError::Overflow)?;
-    s.queued_redemption_shares = s
-        .queued_redemption_shares
-        .checked_add(shares)
+    *queued_shares = queued_shares
+        .checked_sub(t.redemption_shares)
         .ok_or(FundError::Overflow)?;
-    Ok(())
+    let out = CancelOutcome {
+        usdc: t.subscription_usdc,
+        shares: t.redemption_shares,
+    };
+    *s = n;
+    *t = Ticket::default();
+    Ok(out)
 }
 
 /// 从剩余池子里按比例领取：part / pool_basis × pool_amount，向下取整；
@@ -514,7 +651,7 @@ pub fn claim(t: &mut Ticket, r: &mut EpochRecord) -> Result<ClaimOutcome, FundEr
     if t.is_empty() {
         return Err(FundError::NothingToClaim);
     }
-    if t.epoch != r.epoch {
+    if !r.covers(t.epoch) {
         return Err(FundError::EpochNotSettled);
     }
     // 先算出两部分，再修改：没有进展时什么都不改
@@ -582,6 +719,8 @@ pub fn claim(t: &mut Ticket, r: &mut EpochRecord) -> Result<ClaimOutcome, FundEr
 // ---------------------------------------------------------------------------
 
 /// 定价步骤：在定价时刻之后调用一次，开启当天的结算。
+/// 关闭所有由这次定价处理的期：当天这一期，以及被跳过的定价顺延过来的更早几期；
+/// 定价时刻之后才提交的请求属于下一期，留在排队里。
 /// 外层据此转账：销毁赎回份额（record.redemption_shares）；基金主账户的 slice_usdc 和
 /// 申购托管的 netted_usdc 转入待领取账户；申购费 fee_usdc 从申购托管转入主账户；
 /// 为轧差发行 record.minted_shares 份。赎回资产的 cbBTC、待成交申购和退款的 USDC 留在原处。
@@ -625,6 +764,8 @@ pub fn fix(
 
     // 在副本上计算，最后一次性写回：出错时状态不变
     let mut n = s.clone();
+    roll_queue(&mut n, now_unix)?;
+    let epoch = epoch_of_day(day)?;
     let price = prices.valuation.price;
 
     // 2. 信号价格进均线，决定目标
@@ -693,7 +834,7 @@ pub fn fix(
 
     // 剩下要卖的赎回资产和待成交申购各自排队
     let slice = Slice {
-        epoch: n.epoch,
+        epoch,
         btc: slice_btc
             .checked_sub(netted_btc)
             .ok_or(FundError::Overflow)?,
@@ -715,7 +856,7 @@ pub fn fix(
     if pending_usdc > 0 {
         // 退款时 net_subscription 为 0，所以这里一定还有空位
         n.pending[n.pending_count as usize] = Pending {
-            epoch: n.epoch,
+            epoch,
             usdc: pending_usdc,
         };
         n.pending_count += 1;
@@ -723,8 +864,8 @@ pub fn fix(
     let payout = if slice_sold_out { slice.usdc } else { 0 };
 
     let record = EpochRecord {
-        epoch: n.epoch,
-        day,
+        epoch,
+        first_epoch: epoch_of_day(s.last_fix_day.saturating_add(1))?,
         signal_price: signal,
         valuation_price: price,
         moving_average: ma.unwrap_or(0),
@@ -747,7 +888,12 @@ pub fn fix(
         unclaimed_refund_usdc: refund_usdc,
     };
     n.last_fix_day = day;
-    n.epoch = n.epoch.checked_add(1).ok_or(FundError::Overflow)?;
+    // 定价时刻之后提交的请求（下一期）由下一次定价处理
+    n.queued_redemption_shares = n.next_redemption_shares;
+    n.queued_subscription_usdc = n.next_subscription_usdc;
+    n.next_epoch = 0;
+    n.next_redemption_shares = 0;
+    n.next_subscription_usdc = 0;
     *s = n;
     Ok(FixOutcome { record, fee_usdc })
 }
@@ -1060,7 +1206,7 @@ mod tests {
         at_fix2(day, price, price)
     }
 
-    /// 基金状态加上每一期的记录（下标即期号），模拟链上的账户。
+    /// 基金状态加上每次定价的记录（按期号递增），模拟链上的账户。
     /// usdc_tokens / btc_tokens 按程序的转账记录基金名下的代币（托管、主账户、待领取账户），
     /// 用来核对内部记账：不能凭空多出或少掉资产。
     struct Harness {
@@ -1097,6 +1243,24 @@ mod tests {
             request_redemption(&mut self.s, t, shares, now, &self.c).unwrap();
         }
 
+        /// 撤销排队记录，退回的申购款离开基金名下
+        fn cancel(&mut self, t: &mut Ticket, now: i64) -> Result<CancelOutcome, FundError> {
+            let out = cancel(&mut self.s, t, now, &self.c)?;
+            self.usdc_tokens -= out.usdc;
+            self.assert_ledger();
+            Ok(out)
+        }
+
+        /// 第 epoch 期的记录
+        fn rec(&self, epoch: u64) -> EpochRecord {
+            *self.records.iter().find(|r| r.epoch == epoch).unwrap()
+        }
+
+        /// 关闭第 epoch 期的那次定价的记录（期号是排队记录的期号）
+        fn covering(&mut self, epoch: u64) -> Option<&mut EpochRecord> {
+            self.records.iter_mut().find(|r| r.covers(epoch))
+        }
+
         fn fix_with(&mut self, now: i64, p: &FixPrices) -> Result<EpochRecord, FundError> {
             self.fix_as(now, p, Caller::Keeper)
         }
@@ -1110,7 +1274,10 @@ mod tests {
             let before = self.s.clone();
             let out = fix(&mut self.s, now, p, caller, &self.c)?;
             let r = out.record;
-            assert_eq!(r.epoch as usize, self.records.len());
+            // 每次定价接着上一次，关闭中间所有的期
+            let first = self.records.last().map_or(0, |p| p.epoch + 1);
+            assert_eq!(r.first_epoch, first);
+            assert!(r.first_epoch <= r.epoch);
             self.records.push(r);
             // 赎回资产按比例向下取整，留下的人每份对应的两种资产都不减少；
             // 轧差发的份额向下取整，每份 cbBTC 不减少（USDC 只剩零头，允许被摊薄）。
@@ -1146,6 +1313,7 @@ mod tests {
                 self.usdc_tokens,
                 self.s.usdc
                     + self.s.queued_subscription_usdc
+                    + self.s.next_subscription_usdc
                     + pending.iter().map(|x| x.usdc).sum::<u64>()
                     + slices.iter().map(|x| x.usdc).sum::<u64>()
                     + payouts
@@ -1164,7 +1332,7 @@ mod tests {
         }
 
         fn claim(&mut self, t: &mut Ticket) -> Result<(u64, u64), FundError> {
-            let r = &mut self.records[t.epoch as usize];
+            let r = self.covering(t.epoch).ok_or(FundError::EpochNotSettled)?;
             let out = claim(t, r)?;
             let usdc = out.payout_usdc + out.refund_usdc;
             self.usdc_tokens -= usdc;
@@ -1173,10 +1341,10 @@ mod tests {
 
         /// 成交一笔计划好的交易；卖出赎回资产或为申购买入时传入那一期的记录
         fn fill(&mut self, now: i64, plan: &TradePlan, got: u64) -> Result<(), FundError> {
-            let r = plan
-                .bucket
-                .record_epoch()
-                .map(|e| &mut self.records[e as usize]);
+            let r = match plan.bucket.record_epoch() {
+                Some(e) => self.records.iter_mut().find(|r| r.epoch == e),
+                None => None,
+            };
             let before = self.s.clone();
             fill_trade(&mut self.s, plan, got, now, r)?;
             // 申购发份额按数量向下取整：已有持有人每份对应的基金资产不减少
@@ -1245,7 +1413,7 @@ mod tests {
             let r = self.fix_day(day, price);
             let (_, why, _) = self.trade_until_done(day * DAY + ONE_AM, same(price), fee_bps);
             assert_eq!(why, FundError::NothingToTrade);
-            self.records[r.epoch as usize]
+            self.rec(r.epoch)
         }
     }
 
@@ -1356,12 +1524,15 @@ mod tests {
         let mut t = Ticket::default();
         h.subscribe(&mut t, 5 * USDC, 1 * DAY);
         let r = h.settle_day(1, 1 * USDC, 0);
-        let mut wrong = r;
-        wrong.epoch = 99;
-        assert_eq!(
-            claim(&mut t.clone(), &mut wrong),
-            Err(FundError::EpochNotSettled)
-        );
+        // 记录必须关闭这张排队记录的那一期
+        for (first, last) in [(t.epoch + 1, t.epoch + 3), (0, t.epoch - 1)] {
+            let mut wrong = r;
+            (wrong.first_epoch, wrong.epoch) = (first, last);
+            assert_eq!(
+                claim(&mut t.clone(), &mut wrong),
+                Err(FundError::EpochNotSettled)
+            );
+        }
         h.claim(&mut t).unwrap();
         assert_eq!(h.claim(&mut t), Err(FundError::NothingToClaim));
     }
@@ -1424,42 +1595,155 @@ mod tests {
     }
 
     #[test]
-    fn queue_closed_between_fix_time_and_fixing_step() {
+    fn a_request_after_the_fixing_time_joins_the_next_epoch() {
         let mut h = Harness::seeded(50_000 * USDC);
         let fix_at = 10 * DAY + ONE_AM;
-        let mut ta = Ticket::default();
-        h.subscribe(&mut ta, 100 * USDC, fix_at - 1); // 00:59:59 还开放
-
-        // 定价价格公开之后，到当天定价步骤之前，申购赎回都关闭
-        let mut tb = Ticket::default();
-        let closed = Err(FundError::QueueClosed);
+        let (mut ta, mut tb, mut tc) = (Ticket::default(), Ticket::default(), Ticket::default());
+        h.subscribe(&mut ta, 100 * USDC, fix_at - 1); // 00:59:59：第 10 期
+                                                      // 定价价格已经公开、当天还没定价：排队照常开放，进入第 11 期
+        h.subscribe(&mut tb, 200 * USDC, fix_at);
+        assert_eq!((ta.epoch, tb.epoch), (10, 11));
+        let r = h.settle_day(10, 50_000 * USDC, 0);
         assert_eq!(
-            request_subscription(&mut h.s, &mut tb, 100 * USDC, fix_at, &cfg()),
-            closed
+            (r.first_epoch, r.epoch, r.subscription_usdc),
+            (0, 10, 100 * USDC)
         );
+        assert_eq!(h.claim(&mut tb), Err(FundError::EpochNotSettled));
+        // 定价之后提交的也属于第 11 期；还没领取的第 10 期记录不能再追加
+        h.subscribe(&mut tc, 300 * USDC, fix_at + 3_600);
+        assert_eq!(tc.epoch, 11);
         assert_eq!(
-            request_redemption(&mut h.s, &mut tb, 1, fix_at + 12 * 3600, &cfg()),
-            closed
+            request_subscription(&mut h.s, &mut ta.clone(), USDC, fix_at + 3_600, &h.c),
+            Err(FundError::WrongEpoch)
         );
-        assert_eq!(tb, Ticket::default());
-
-        // 定价之后重新开放，进入下一期
-        let r = h.settle_day(10, 51_000 * USDC, 0);
         h.claim(&mut ta).unwrap();
-        h.subscribe(&mut tb, 100 * USDC, fix_at + 60);
-        assert_eq!(tb.epoch, r.epoch + 1);
 
-        // 某天没人定价：定价时刻之后一直关闭，第二天 0 点重新开放
-        let mut tc = Ticket::default();
+        let r = h.settle_day(11, 50_000 * USDC, 0);
         assert_eq!(
-            request_subscription(&mut h.s, &mut tc, 100 * USDC, 11 * DAY + ONE_AM, &cfg()),
-            closed
+            (r.first_epoch, r.epoch, r.subscription_usdc),
+            (11, 11, 500 * USDC)
         );
+        assert_eq!(h.claim(&mut tb).unwrap(), (200 * USDC, 0));
+        assert_eq!(h.claim(&mut tc).unwrap(), (300 * USDC, 0));
+    }
+
+    #[test]
+    fn requests_of_skipped_fixings_roll_into_the_next_one() {
+        let mut h = Harness::seeded(50_000 * USDC);
+        h.settle_day(9, 50_000 * USDC, 0);
+        let mut t = [Ticket::default(); 4];
+        h.subscribe(&mut t[0], 100 * USDC, 10 * DAY); // 第 10 期
+        h.subscribe(&mut t[1], 200 * USDC, 10 * DAY + 2 * ONE_AM); // 第 11 期，第 10 天没人定价
+        h.subscribe(&mut t[2], 300 * USDC, 11 * DAY + 5 * ONE_AM); // 第 12 期，第 11 天也没人定价
+        h.subscribe(&mut t[3], 400 * USDC, 12 * DAY + 2 * ONE_AM); // 第 13 期：定价时刻之后
+        assert_eq!(t.map(|x| x.epoch), [10, 11, 12, 13]);
+
+        // 第 12 天 3 点才定价：关闭第 10–12 期，合在一起处理；第 13 期等下一次
+        let fix_at = 12 * DAY + 3 * ONE_AM;
+        let r = h.fix_with(fix_at, &at_fix(12, 50_000 * USDC)).unwrap();
         assert_eq!(
-            request_subscription(&mut h.s, &mut tc, 100 * USDC, 12 * DAY - 1, &cfg()),
-            closed
+            (r.first_epoch, r.epoch, r.subscription_usdc),
+            (10, 12, 600 * USDC)
         );
-        h.subscribe(&mut tc, 100 * USDC, 12 * DAY);
+        let (_, why, _) = h.trade_until_done(fix_at, same(50_000 * USDC), 0);
+        assert_eq!(why, FundError::NothingToTrade);
+        assert_eq!(h.claim(&mut t[0]).unwrap(), (100 * USDC, 0));
+        assert_eq!(h.claim(&mut t[1]).unwrap(), (200 * USDC, 0));
+        assert_eq!(h.claim(&mut t[2]).unwrap(), (300 * USDC, 0));
+        assert_eq!(h.claim(&mut t[3]), Err(FundError::EpochNotSettled));
+        assert_eq!(h.rec(12).unclaimed_shares, 0);
+
+        let r = h.settle_day(13, 50_000 * USDC, 0);
+        assert_eq!((r.first_epoch, r.subscription_usdc), (13, 400 * USDC));
+        assert_eq!(h.claim(&mut t[3]).unwrap(), (400 * USDC, 0));
+    }
+
+    #[test]
+    fn a_user_can_have_requests_in_several_epochs() {
+        let mut h = Harness::seeded(50_000 * USDC);
+        let mut t10 = Ticket::default();
+        h.subscribe(&mut t10, 1_000 * USDC, 10 * DAY);
+        h.settle_day(10, 50_000 * USDC, 0);
+        h.claim(&mut t10).unwrap();
+
+        // 第 10 天定价之后：赎回 400 份、申购 100，都进第 11 期这张记录
+        let (mut t11, mut t12) = (Ticket::default(), Ticket::default());
+        h.redeem(&mut t11, 400 * USDC, 10 * DAY + 2 * ONE_AM);
+        h.subscribe(&mut t11, 100 * USDC, 10 * DAY + 3 * ONE_AM);
+        // 第 11 天定价时刻之后、定价之前：同一个用户再开第 12 期
+        let late = 11 * DAY + 2 * ONE_AM;
+        assert_eq!(
+            request_subscription(&mut h.s, &mut t11.clone(), 200 * USDC, late, &h.c),
+            Err(FundError::WrongEpoch)
+        );
+        h.subscribe(&mut t12, 200 * USDC, late);
+        assert_eq!((t11.epoch, t12.epoch), (11, 12));
+
+        // 第 11 天的定价只处理第 11 期
+        h.fix_with(11 * DAY + 3 * ONE_AM, &at_fix(11, 50_000 * USDC))
+            .unwrap();
+        let (_, why, _) = h.trade_until_done(11 * DAY + 3 * ONE_AM, same(50_000 * USDC), 0);
+        assert_eq!(why, FundError::NothingToTrade);
+        assert_eq!(h.claim(&mut t11).unwrap(), (100 * USDC, 400 * USDC));
+        assert_eq!(h.claim(&mut t12), Err(FundError::EpochNotSettled));
+        h.settle_day(12, 50_000 * USDC, 0);
+        assert_eq!(h.claim(&mut t12).unwrap(), (200 * USDC, 0));
+        assert_eq!(h.s.share_supply, 900 * USDC);
+    }
+
+    #[test]
+    fn a_request_can_be_cancelled_until_its_fixing_time() {
+        let mut h = Harness::seeded(50_000 * USDC);
+        let mut holder = Ticket::default();
+        h.subscribe(&mut holder, 1_000 * USDC, 9 * DAY);
+        h.settle_day(9, 50_000 * USDC, 0);
+        h.claim(&mut holder).unwrap();
+        let fix_at = 10 * DAY + ONE_AM;
+
+        // 定价时刻之前撤销：申购款和赎回份额全额退回
+        let mut ta = Ticket::default();
+        h.subscribe(&mut ta, 300 * USDC, 10 * DAY);
+        h.redeem(&mut ta, 200 * USDC, 10 * DAY);
+        assert_eq!(
+            h.cancel(&mut ta, fix_at - 1),
+            Ok(CancelOutcome {
+                usdc: 300 * USDC,
+                shares: 200 * USDC
+            })
+        );
+        assert!(ta.is_empty());
+        assert_eq!(
+            h.cancel(&mut ta, fix_at - 1),
+            Err(FundError::NothingToCancel)
+        );
+
+        // 定价时刻之后不能撤销，即使当天还没定价：定价价格已经公开
+        let mut tb = Ticket::default();
+        h.subscribe(&mut tb, 50 * USDC, 10 * DAY);
+        let before = h.s.clone();
+        assert_eq!(h.cancel(&mut tb, fix_at), Err(FundError::TooLateToCancel));
+        assert_eq!(h.s, before);
+        // 定价时刻之后提交的属于下一期，在下一期的定价时刻之前可以撤销
+        let (mut tc, mut td) = (Ticket::default(), Ticket::default());
+        h.subscribe(&mut tc, 500 * USDC, fix_at + 60);
+        h.subscribe(&mut td, 70 * USDC, fix_at + 60);
+        assert_eq!(h.cancel(&mut tc, fix_at + 120).unwrap().usdc, 500 * USDC);
+
+        // 第 10 天没人定价：tb 顺延，第 11 天的定价时刻之前又可以撤销
+        let fix11 = 11 * DAY + ONE_AM;
+        assert_eq!(h.cancel(&mut tb, fix11 - 1).unwrap().usdc, 50 * USDC);
+        assert_eq!(h.cancel(&mut td, fix11), Err(FundError::TooLateToCancel));
+        let r = h.fix_day(11, 50_000 * USDC);
+        assert_eq!(
+            (r.first_epoch, r.subscription_usdc, r.redemption_shares),
+            (10, 70 * USDC, 0)
+        );
+        // 定价之后更不能撤销
+        assert_eq!(h.cancel(&mut td, 12 * DAY), Err(FundError::TooLateToCancel));
+        let (_, why, _) = h.trade_until_done(fix11, same(50_000 * USDC), 0);
+        assert_eq!(why, FundError::NothingToTrade);
+        assert_eq!(h.claim(&mut td).unwrap(), (70 * USDC, 0));
+        assert_eq!(h.s.share_supply, 1_070 * USDC);
     }
 
     #[test]
@@ -1613,8 +1897,8 @@ mod tests {
         // 第一笔：1000 USDC @ 51,000 = 1,960,784 sat。基金还没有份额：1 USDC 换 1 份
         let t0 = 10 * DAY + ONE_AM;
         let first = h.trade_at(t0, same(51_000 * USDC), 0).unwrap();
-        assert_eq!(first.bucket, TradeBucket::Subscription { epoch: 0 });
-        assert_eq!(h.records[0].minted_shares, 1_000 * USDC);
+        assert_eq!(first.bucket, TradeBucket::Subscription { epoch: 10 });
+        assert_eq!(h.rec(10).minted_shares, 1_000 * USDC);
         // 先领已成交的部分：A 占 3/4
         assert_eq!(h.claim(&mut ta).unwrap(), (750 * USDC, 0));
         assert_eq!(h.claim(&mut ta), Err(FundError::NothingToClaim));
@@ -1622,7 +1906,7 @@ mod tests {
         // 第二笔：1000 USDC @ 50,000 = 2,000,000 sat
         // 份额 = 2,000,000 × 1,000,000,000 ÷ 1,960,784 = 1,020,000,163
         h.trade_at(t0 + 60, same(50_000 * USDC), 0).unwrap();
-        let r = h.records[0];
+        let r = h.rec(10);
         assert!(r.subscription_filled);
         assert_eq!(r.minted_shares, 2_020_000_163);
         assert_eq!((h.s.btc, h.s.share_supply), (3_960_784, 2_020_000_163));
@@ -1632,8 +1916,8 @@ mod tests {
         assert!(ta.is_empty() && tb.is_empty());
         assert_eq!(
             (
-                h.records[0].unclaimed_shares,
-                h.records[0].unclaimed_subscription_usdc
+                h.rec(10).unclaimed_shares,
+                h.rec(10).unclaimed_subscription_usdc
             ),
             (0, 0)
         );
@@ -1664,7 +1948,7 @@ mod tests {
         assert_eq!(
             h.s.oldest_slice(),
             Some(&Slice {
-                epoch: 1,
+                epoch: 11,
                 btc: 403_469,
                 usdc: 300 * USDC
             })
@@ -1691,7 +1975,7 @@ mod tests {
             (
                 Side::WithoutTrade,
                 1_000 * USDC,
-                TradeBucket::Subscription { epoch: 0 }
+                TradeBucket::Subscription { epoch: 10 }
             )
         );
         assert_eq!(h.claim(&mut ta).unwrap(), (1_000 * USDC, 0));
@@ -1735,7 +2019,7 @@ mod tests {
             [
                 (TradeBucket::Fund, 1_000 * USDC),
                 (TradeBucket::Fund, 500 * USDC),
-                (TradeBucket::Subscription { epoch: 1 }, 1_000 * USDC)
+                (TradeBucket::Subscription { epoch: 11 }, 1_000 * USDC)
             ]
         );
         // 基金 2,941,176 sat、1500 份；B 买到 1,960,784 sat → 1000 份
@@ -1760,8 +2044,8 @@ mod tests {
         assert_eq!(
             buckets,
             [
-                TradeBucket::Subscription { epoch: 0 },
-                TradeBucket::Subscription { epoch: 1 }
+                TradeBucket::Subscription { epoch: 10 },
+                TradeBucket::Subscription { epoch: 11 }
             ]
         );
         assert!(h.claim(&mut ta).unwrap().0 > 0);
@@ -1792,9 +2076,9 @@ mod tests {
         assert_eq!(
             buckets,
             [
-                TradeBucket::Slice { epoch: 2 },
-                TradeBucket::Subscription { epoch: 1 },
-                TradeBucket::Subscription { epoch: 2 }
+                TradeBucket::Slice { epoch: 12 },
+                TradeBucket::Subscription { epoch: 11 },
+                TradeBucket::Subscription { epoch: 12 }
             ]
         );
     }
@@ -1877,7 +2161,7 @@ mod tests {
             (
                 Side::BuyBtc,
                 1_000 * USDC,
-                TradeBucket::Subscription { epoch: 0 }
+                TradeBucket::Subscription { epoch: 10 }
             )
         );
         assert_eq!(h.trade_at(t0 + 59, p, 0), Err(FundError::TradeTooSoon));
@@ -2018,7 +2302,7 @@ mod tests {
         let plan = h.trade_at(t0 + 3_600, same(51_000 * USDC), 0).unwrap();
         assert_eq!(
             (plan.side, plan.bucket),
-            (Side::BuyBtc, TradeBucket::Subscription { epoch: 0 })
+            (Side::BuyBtc, TradeBucket::Subscription { epoch: 10 })
         );
         assert_eq!(h.claim(&mut t).unwrap(), (1_000 * USDC, 0));
 
@@ -2039,7 +2323,7 @@ mod tests {
         assert_eq!(
             buckets,
             [
-                (Side::SellBtc, TradeBucket::Slice { epoch: 1 }),
+                (Side::SellBtc, TradeBucket::Slice { epoch: 11 }),
                 (Side::SellBtc, TradeBucket::Fund)
             ]
         );
@@ -2067,7 +2351,7 @@ mod tests {
         let t11 = 11 * DAY + ONE_AM;
         assert_eq!(
             h.trade_at(t11, p, 0).unwrap().bucket,
-            TradeBucket::Slice { epoch: 1 }
+            TradeBucket::Slice { epoch: 11 }
         );
         assert_eq!(
             h.trade_at(t11 + 60, p, 0).unwrap().bucket,
@@ -2092,7 +2376,7 @@ mod tests {
             .unwrap();
         // 第 13 天 1 点之后、定价之前：B 没卖完的赎回资产照常卖出
         let plan = h.trade_at(13 * DAY + ONE_AM + 60, p, 0).unwrap();
-        assert_eq!(plan.bucket, TradeBucket::Slice { epoch: 2 });
+        assert_eq!(plan.bucket, TradeBucket::Slice { epoch: 12 });
         assert_eq!(
             h.trade_at(13 * DAY + ONE_AM + 120, p, 0),
             Err(FundError::FixPending)
@@ -2123,20 +2407,20 @@ mod tests {
         // 两笔卖出，第二笔时价格跌到 50,000
         let t0 = 11 * DAY + ONE_AM;
         let first = h.trade_at(t0, same(51_000 * USDC), 0).unwrap();
-        assert_eq!(first.bucket, TradeBucket::Slice { epoch: 1 });
+        assert_eq!(first.bucket, TradeBucket::Slice { epoch: 11 });
         assert_eq!(first.amount_in, 1_960_784);
         assert_eq!(h.claim(&mut ta), Err(FundError::SliceNotSold));
         h.trade_at(t0 + 60, same(50_000 * USDC), 0).unwrap();
         // 1,960,784 sat × 51,000 + 1,960,784 sat × 50,000
         let proceeds = 999_999_840 + 980_392_000;
-        let r = h.records[1];
+        let r = h.rec(11);
         assert!(r.slice_sold_out);
         assert_eq!(r.payout_usdc, proceeds);
 
         let (_, a) = h.claim(&mut ta).unwrap();
         let (_, b) = h.claim(&mut tb).unwrap();
         assert_eq!((a, b), (proceeds / 2, proceeds / 2));
-        assert_eq!(h.records[1].unclaimed_payout_usdc, 0);
+        assert_eq!(h.rec(11).unclaimed_payout_usdc, 0);
         // 卖出所得不进入基金：基金还是只有留下的 cbBTC
         assert_eq!((h.s.usdc, h.s.btc), (0, 1_960_784));
         assert_eq!(
@@ -2175,8 +2459,8 @@ mod tests {
         assert_eq!(
             buckets,
             [
-                TradeBucket::Slice { epoch: 1 },
-                TradeBucket::Slice { epoch: 2 },
+                TradeBucket::Slice { epoch: 11 },
+                TradeBucket::Slice { epoch: 12 },
                 TradeBucket::Fund
             ]
         );
@@ -2214,7 +2498,7 @@ mod tests {
                 (
                     Side::WithoutTrade,
                     2_000 * USDC,
-                    TradeBucket::Subscription { epoch: 0 }
+                    TradeBucket::Subscription { epoch: 10 }
                 )
             ]
         );
@@ -2245,11 +2529,11 @@ mod tests {
         assert_eq!(plans.len(), 6);
         assert!(plans
             .iter()
-            .all(|p| p.bucket == TradeBucket::Slice { epoch: 1 }
+            .all(|p| p.bucket == TradeBucket::Slice { epoch: 11 }
                 && btc_value(p.amount_in, 52_000 * USDC).unwrap() <= 200_000 * USDC));
         let (_, ua) = h.claim(&mut ta).unwrap();
         let (_, ub) = h.claim(&mut tb).unwrap();
-        assert_eq!(ua + ub, h.records[1].payout_usdc);
+        assert_eq!(ua + ub, h.rec(11).payout_usdc);
         assert!(ua.abs_diff(ub) <= 1);
         assert_eq!((h.s.usdc, h.s.btc), (0, 0));
         // 基金还能继续运作
@@ -2278,7 +2562,7 @@ mod tests {
         let (_, why, _) = h.trade_until_done(11 * DAY + ONE_AM, same(fix / 100 * 99), 25);
         assert_eq!(why, FundError::NothingToTrade);
         let (_, a_usdc) = h.claim(&mut ta).unwrap();
-        assert_eq!(a_usdc, h.records[1].payout_usdc);
+        assert_eq!(a_usdc, h.rec(11).payout_usdc);
 
         // 按份额比例，向下取整对留下的人有利
         let b_btc = btc_before - (btc_before as u128 * a as u128 / (a + b) as u128) as u64;
@@ -2521,19 +2805,82 @@ mod tests {
         }
     }
 
-    /// 模拟里的用户：排队记录、持有的份额，以及每一期已领取的总额
+    /// 模拟里的用户：还没领完的排队记录（每期一张）、持有的份额，以及每次定价已领取的总额
     struct Users {
-        tickets: Vec<Ticket>,
+        tickets: Vec<Vec<Ticket>>,
         held: Vec<u64>,
-        claimed: Vec<(u64, u64)>, // 每一期领取的 (份额, USDC)
+        claimed: Vec<(u64, u64)>, // 每次定价（h.records 的下标）领取的 (份额, USDC)
+        cancels: u32,
+        cancels_rejected: u32,
+    }
+
+    /// 排队记录还没被定价处理
+    fn unfixed(t: &Ticket, h: &Harness) -> bool {
+        !t.is_empty() && t.epoch as i64 > h.s.last_fix_day
     }
 
     impl Users {
         fn new(n: usize) -> Self {
             Users {
-                tickets: vec![Ticket::default(); n],
+                tickets: vec![vec![]; n],
                 held: vec![0; n],
                 claimed: vec![],
+                cancels: 0,
+                cancels_rejected: 0,
+            }
+        }
+
+        /// 用户 u 在 now 开放的那一期的排队记录（没有就新开一张）
+        fn ticket_at(&mut self, h: &Harness, u: usize, now: i64) -> usize {
+            let epoch = request_epoch(now, &h.c).unwrap();
+            let list = &mut self.tickets[u];
+            match list.iter().position(|t| t.epoch == epoch && !t.is_empty()) {
+                Some(i) => i,
+                None => {
+                    list.push(Ticket::default());
+                    list.len() - 1
+                }
+            }
+        }
+
+        fn subscribe(&mut self, h: &mut Harness, u: usize, amount: u64, now: i64) {
+            let i = self.ticket_at(h, u, now);
+            h.subscribe(&mut self.tickets[u][i], amount, now);
+        }
+
+        fn redeem(&mut self, h: &mut Harness, u: usize, shares: u64, now: i64) {
+            let i = self.ticket_at(h, u, now);
+            self.held[u] -= shares;
+            h.redeem(&mut self.tickets[u][i], shares, now);
+        }
+
+        /// 随机撤销还没定价的排队记录：关闭它的定价时刻之前必须成功、全额退回，之后必须被拒绝
+        fn random_cancels(&mut self, h: &mut Harness, rng: &mut Rng, now: i64) {
+            for u in 0..self.tickets.len() {
+                for i in 0..self.tickets[u].len() {
+                    let t = self.tickets[u][i];
+                    if !unfixed(&t, h) || rng.below(8) != 0 {
+                        continue;
+                    }
+                    let closes_at = cancel_deadline(t.epoch, now, &h.c).unwrap();
+                    match h.cancel(&mut self.tickets[u][i], now) {
+                        Ok(out) => {
+                            assert!(now < closes_at);
+                            assert_eq!(
+                                (out.usdc, out.shares),
+                                (t.subscription_usdc, t.redemption_shares)
+                            );
+                            self.held[u] += out.shares;
+                            self.cancels += 1;
+                        }
+                        Err(FundError::TooLateToCancel) => {
+                            assert!(now >= closes_at);
+                            self.cancels_rejected += 1;
+                        }
+                        Err(e) => panic!("cancel: {e:?}"),
+                    }
+                }
+                self.tickets[u].retain(|t| !t.is_empty());
             }
         }
 
@@ -2541,31 +2888,37 @@ mod tests {
         fn claim_ready(&mut self, h: &mut Harness) {
             self.claimed.resize(h.records.len(), (0, 0));
             for u in 0..self.tickets.len() {
-                let t = self.tickets[u];
-                if t.is_empty() || t.epoch >= h.s.epoch {
-                    continue;
-                }
-                match h.claim(&mut self.tickets[u]) {
-                    Ok((sh, us)) => {
-                        self.held[u] += sh;
-                        self.claimed[t.epoch as usize].0 += sh;
-                        self.claimed[t.epoch as usize].1 += us;
+                for i in 0..self.tickets[u].len() {
+                    let t = self.tickets[u][i];
+                    if t.is_empty() || unfixed(&t, h) {
+                        continue;
                     }
-                    Err(FundError::SliceNotSold) => assert!(t.redemption_shares > 0),
-                    // 申购还在成交中，没有新的份额
-                    Err(FundError::NothingToClaim) => assert!(t.subscription_usdc > 0),
-                    Err(e) => panic!("claim: {e:?}"),
+                    let k = h.records.iter().position(|r| r.covers(t.epoch)).unwrap();
+                    match h.claim(&mut self.tickets[u][i]) {
+                        Ok((sh, us)) => {
+                            self.held[u] += sh;
+                            self.claimed[k].0 += sh;
+                            self.claimed[k].1 += us;
+                        }
+                        Err(FundError::SliceNotSold) => assert!(t.redemption_shares > 0),
+                        // 申购还在成交中，没有新的份额
+                        Err(FundError::NothingToClaim) => assert!(t.subscription_usdc > 0),
+                        Err(e) => panic!("claim: {e:?}"),
+                    }
                 }
+                self.tickets[u].retain(|t| !t.is_empty());
             }
         }
 
-        /// 已发行份额 = 用户持有 + 还没定价的排队赎回份额 + 已发行、在托管账户里等申购人领取的份额。
+        /// 已发行份额 = 用户持有 + 还没定价的排队赎回份额（可能有好几期）
+        /// + 已发行、在托管账户里等申购人领取的份额。
         /// 申购可以分几次领取，取整剩下的零头要等全部成交后最后一次领取。
         fn assert_share_supply(&self, h: &Harness) {
             let queued: u64 = self
                 .tickets
                 .iter()
-                .filter(|t| t.epoch == h.s.epoch)
+                .flatten()
+                .filter(|t| unfixed(t, h))
                 .map(|t| t.redemption_shares)
                 .sum();
             let unclaimed: u64 = h.records.iter().map(|r| r.unclaimed_shares).sum();
@@ -2590,7 +2943,7 @@ mod tests {
             assert_eq!(h.s.slice_count, 0, "赎回资产都应卖完");
             assert_eq!(h.s.pending_count, 0, "申购都应成交");
             assert!(
-                self.tickets.iter().all(|t| t.is_empty()),
+                self.tickets.iter().all(|l| l.is_empty()),
                 "每张记录都应领取"
             );
             assert_eq!(self.claimed.len(), h.records.len());
@@ -2626,24 +2979,25 @@ mod tests {
             let mut price = 50_000 * USDC;
             let mut valuation = price;
             for day in 10..400i64 {
-                for u in 0..users.tickets.len() {
-                    if !users.tickets[u].is_empty() {
-                        continue;
-                    }
-                    match rng.below(10) {
-                        0 | 1 => {
-                            let amt = (1 + rng.below(5_000)) * USDC;
-                            h.subscribe(&mut users.tickets[u], amt, day * DAY);
+                // 0 点和当晚（定价之后，属于下一期）随机申购赎回，再随机撤销
+                let random_requests = |users: &mut Users, h: &mut Harness, rng: &mut Rng, now| {
+                    for u in 0..users.tickets.len() {
+                        match rng.below(14) {
+                            0 | 1 => {
+                                let amt = (1 + rng.below(5_000)) * USDC;
+                                users.subscribe(h, u, amt, now);
+                            }
+                            2 if users.held[u] > 0 => {
+                                let sh = 1 + rng.below(users.held[u]);
+                                users.redeem(h, u, sh, now);
+                            }
+                            _ => {}
                         }
-                        2 if users.held[u] > 0 => {
-                            let sh = 1 + rng.below(users.held[u]);
-                            users.held[u] -= sh;
-                            h.redeem(&mut users.tickets[u], sh, day * DAY);
-                        }
-                        _ => {}
                     }
-                }
-                users.assert_share_supply(&h);
+                    users.random_cancels(h, rng, now);
+                    users.assert_share_supply(h);
+                };
+                random_requests(&mut users, &mut h, &mut rng, day * DAY);
                 // 价格随机游走（±8%）；cbBTC 相对 BTC 偏离 -150..=150 bps，不触发脱锚
                 price = rng.wiggle(price, 800).max(1_000 * USDC);
                 valuation = rng.wiggle(price, 150);
@@ -2668,6 +3022,7 @@ mod tests {
                 );
                 users.claim_ready(&mut h);
                 users.assert_share_supply(&h);
+                random_requests(&mut users, &mut h, &mut rng, fix_at + DAY - 2 * ONE_AM);
             }
             users.drain(&mut h, 400, valuation);
             tally.netted += h.records.iter().filter(|r| r.netted_btc > 0).count();
@@ -2682,6 +3037,7 @@ mod tests {
             );
             assert!(tally.failed_fills > 0 && tally.too_soon > 0, "{tally:?}");
             assert!(tally.keeper_only > 0 && tally.public_plans > 0, "{tally:?}");
+            assert!(users.cancels > 0, "seed {seed}: 没有撤销");
             // 价值守恒：基金总资产 ≈ 用户份额价值之和（误差为取整尘埃），按估值价格计
             let assets = fund_value(&h.s, valuation);
             let supply = h.s.share_supply as u128;
@@ -2707,6 +3063,7 @@ mod tests {
         let mut tally = Tally::default();
         let (mut late, mut dust, mut carried, mut illiquid_days) = (0, 0, 0, 0);
         let (mut public_fixes, mut public_fixes_rejected) = (0, 0);
+        let (mut late_cancels_rejected, mut cancels) = (0, 0);
         for seed in 1..=20u64 {
             let mut rng = Rng(seed * 7919);
             let mut h = Harness::seeded(50_000 * USDC);
@@ -2717,13 +3074,10 @@ mod tests {
             let mut fail_pct = 30;
             for day in 10..300i64 {
                 for u in 0..users.tickets.len() {
-                    if !users.tickets[u].is_empty() {
-                        continue;
-                    }
-                    let r = rng.below(10);
+                    let r = rng.below(14);
                     if r < 2 {
                         let amt = (1 + rng.below(3_000)) * USDC;
-                        h.subscribe(&mut users.tickets[u], amt, day * DAY);
+                        users.subscribe(&mut h, u, amt, day * DAY);
                     } else if r < 4 && users.held[u] > 0 {
                         let held = users.held[u];
                         let sh = if r == 2 {
@@ -2734,10 +3088,10 @@ mod tests {
                         } else {
                             1 + rng.below(held)
                         };
-                        users.held[u] -= sh;
-                        h.redeem(&mut users.tickets[u], sh, day * DAY);
+                        users.redeem(&mut h, u, sh, day * DAY);
                     }
                 }
+                users.random_cancels(&mut h, &mut rng, day * DAY);
                 // 昨天的价格附近：定价之前，前几天没做完的交易继续
                 let yesterday = MarketPrices {
                     signal: price,
@@ -2767,12 +3121,24 @@ mod tests {
                     30
                 };
                 if now > fix_at {
+                    // 定价时刻之后、定价之前：已经排队的不能撤销，新请求进入下一期
                     late += 1;
                     let t = fix_at + rng.below((now - fix_at) as u64) as i64;
-                    assert_eq!(
-                        request_subscription(&mut h.s, &mut Ticket::default(), USDC, t, &h.c),
-                        Err(FundError::QueueClosed)
-                    );
+                    let u = rng.below(users.tickets.len() as u64) as usize;
+                    for i in 0..users.tickets[u].len() {
+                        let tk = users.tickets[u][i];
+                        if unfixed(&tk, &h) && tk.epoch as i64 <= day {
+                            assert_eq!(
+                                h.cancel(&mut users.tickets[u][i], t),
+                                Err(FundError::TooLateToCancel)
+                            );
+                            late_cancels_rejected += 1;
+                        }
+                    }
+                    users.subscribe(&mut h, u, (1 + rng.below(1_000)) * USDC, t);
+                    assert!(users.tickets[u].iter().any(|tk| tk.epoch == day as u64 + 1));
+                    users.random_cancels(&mut h, &mut rng, t);
+                    users.assert_share_supply(&h);
                 }
                 if h.s.slice_count > 0 {
                     carried += 1;
@@ -2826,6 +3192,7 @@ mod tests {
                 users.assert_share_supply(&h);
             }
             users.drain(&mut h, 300, price);
+            cancels += users.cancels;
             tally.netted += h.records.iter().filter(|r| r.netted_btc > 0).count();
         }
         // 各种交易路径、晚定价、脱锚的两种情况、顺延和极小额赎回都应被覆盖到
@@ -2850,6 +3217,10 @@ mod tests {
         assert!(
             late > 0 && dust > 0 && carried > 0 && illiquid_days > 0,
             "{late} {dust} {carried} {illiquid_days}"
+        );
+        assert!(
+            cancels > 0 && late_cancels_rejected > 0,
+            "{cancels} {late_cancels_rejected}"
         );
     }
 

@@ -275,8 +275,8 @@ flowchart LR
 | Share mint | `["share_mint", fund]` |
 | USDC vault / BTC vault | `["usdc_vault", fund]` / `["btc_vault", fund]` |
 | Subscription escrow / Share escrow / Payout vault | `["subscription_escrow", fund]` / `["share_escrow", fund]` / `["payout_vault", fund]` |
-| Ticket (per user) | `["ticket", fund, user]` |
-| Epoch record | `["epoch", fund, epoch as u64 LE]` |
+| Ticket (per user per epoch) | `["ticket", fund, user, epoch as u64 LE]` |
+| Epoch record | `["epoch", fund, epoch as u64 LE]` (epoch = fixing day, unix / 86400) |
 | Mock oracle / Mock market | `["oracle", authority]` / `["market", authority]` |
 | Market vaults | `["market_usdc", market]` / `["market_btc", market]` |
 

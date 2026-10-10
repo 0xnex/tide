@@ -9,6 +9,11 @@
 //   第 4 天：Bob 赎回全部 -> 基金只有 USDC，赎回资产定价时就完成，份额清零
 //   第 5 天：Alice 再申购；BTC 高于均线，但 cbBTC 比 BTC 低 3%（脱锚）-> 不买入，申购款留在托管里
 //   第 6 天：恢复锚定 -> 为 Alice 买入 cbBTC，她领到份额
+//   第 7 天：排队从不关闭。定价时刻之后的请求进入下一期，每个用户每期一张排队记录；
+//            关闭这一期的定价时刻之前可以撤销、全额退回，之后被拒绝
+//
+// 每个请求属于关闭它的定价时刻那一期（期号是那天的日期序号）。第一天的申购在第 0 天提交，
+// 那天没有定价，顺延到第 1 天的定价：领取时用之后第一次定价的记录。
 import * as anchor from "@coral-xyz/anchor";
 import { BN, Program } from "@coral-xyz/anchor";
 import { Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
@@ -51,8 +56,16 @@ describe("tide", () => {
   const pda = (seeds: (Buffer | Uint8Array)[]) =>
     PublicKey.findProgramAddressSync(seeds, program.programId)[0];
   const fundPda = (name: string) => pda([Buffer.from(name), fund.toBuffer()]);
-  const epochPda = (epoch: BN) =>
-    pda([Buffer.from("epoch"), fund.toBuffer(), epoch.toArrayLike(Buffer, "le", 8)]);
+  const le = (n: number | BN) => new BN(n).toArrayLike(Buffer, "le", 8);
+  const epochPda = (epoch: number | BN) => pda([Buffer.from("epoch"), fund.toBuffer(), le(epoch)]);
+  const ticketPda = (user: PublicKey, epoch: number) =>
+    pda([Buffer.from("ticket"), fund.toBuffer(), user.toBuffer(), le(epoch)]);
+  /** 这一刻提交的请求属于哪一期：定价时刻之前是当天，之后是第二天 */
+  const requestEpoch = () => {
+    const day = Math.floor(now / DAY);
+    return now < day * DAY + FIX_OFFSET ? day : day + 1;
+  };
+  const lastTicket = new Map<string, number>(); // 每个用户最近一次请求的期号
 
   let today = 20_000; // 起始日期序号（unix / 86400）
   let now = 0; // 当前时钟（unix 秒）
@@ -138,13 +151,13 @@ describe("tide", () => {
   }
 
   async function fixIx(signer: Keypair = admin) {
-    const f = await program.account.fund.fetch(fund);
+    const epoch = Math.floor(now / DAY); // 定价记录的期号：当天的日期序号
     return program.methods
-      .fix()
+      .fix(new BN(epoch))
       .accountsPartial({
         cranker: signer.publicKey,
         fund,
-        epochRecord: epochPda(f.state.epoch),
+        epochRecord: epochPda(epoch),
         oracle,
         shareMint,
         usdcVault: fundPda("usdc_vault"),
@@ -208,16 +221,24 @@ describe("tide", () => {
     }
   }
 
-  async function claim(user: Keypair, userUsdc: PublicKey) {
-    const ticket = pda([Buffer.from("ticket"), fund.toBuffer(), user.publicKey.toBuffer()]);
-    const t = await program.account.ticket.fetch(ticket);
+  /** 关闭第 epoch 期的那次定价的记录：通常期号相同，定价被跳过时是之后第一次定价的；还没定价时传最新的 */
+  async function recordFor(epoch: number): Promise<PublicKey> {
+    for (let e = epoch; e <= today; e++) {
+      if (!(await context.banksClient.getAccount(epochPda(e)))) continue;
+      const r = await program.account.epochRecord.fetch(epochPda(e));
+      if (r.firstEpoch.toNumber() <= epoch) return epochPda(e);
+    }
+    return epochPda(today);
+  }
+
+  async function claim(user: Keypair, userUsdc: PublicKey, epoch = lastTicket.get(user.publicKey.toBase58())!) {
     await program.methods
       .claim()
       .accountsPartial({
         user: user.publicKey,
         fund,
-        ticket,
-        epochRecord: epochPda(t.epoch),
+        ticket: ticketPda(user.publicKey, epoch),
+        epochRecord: await recordFor(epoch),
         shareMint,
         usdcMint: usdcMint.publicKey,
         userShares: getAssociatedTokenAddressSync(shareMint, user.publicKey),
@@ -230,28 +251,53 @@ describe("tide", () => {
       .rpc();
   }
 
-  async function subscribe(user: Keypair, userUsdc: PublicKey, amount: number) {
+  /** 申购，返回这张排队记录的期号 */
+  async function subscribe(user: Keypair, userUsdc: PublicKey, amount: number): Promise<number> {
+    const epoch = requestEpoch();
     await program.methods
-      .requestSubscription(new BN(amount))
+      .requestSubscription(new BN(amount), new BN(epoch))
       .accountsPartial({
         user: user.publicKey,
         fund,
-        ticket: pda([Buffer.from("ticket"), fund.toBuffer(), user.publicKey.toBuffer()]),
+        ticket: ticketPda(user.publicKey, epoch),
         userUsdc,
         subscriptionEscrow: fundPda("subscription_escrow"),
       })
       .signers([user])
       .rpc();
+    lastTicket.set(user.publicKey.toBase58(), epoch);
+    return epoch;
   }
 
-  async function redeem(user: Keypair, shares: bigint) {
+  /** 赎回，返回这张排队记录的期号 */
+  async function redeem(user: Keypair, shares: bigint): Promise<number> {
+    const epoch = requestEpoch();
     await program.methods
-      .requestRedemption(new BN(shares.toString()))
+      .requestRedemption(new BN(shares.toString()), new BN(epoch))
       .accountsPartial({
         user: user.publicKey,
         fund,
-        ticket: pda([Buffer.from("ticket"), fund.toBuffer(), user.publicKey.toBuffer()]),
+        ticket: ticketPda(user.publicKey, epoch),
         userShares: getAssociatedTokenAddressSync(shareMint, user.publicKey),
+        shareEscrow: fundPda("share_escrow"),
+      })
+      .signers([user])
+      .rpc();
+    lastTicket.set(user.publicKey.toBase58(), epoch);
+    return epoch;
+  }
+
+  async function cancel(user: Keypair, userUsdc: PublicKey, epoch: number) {
+    await program.methods
+      .cancel()
+      .accountsPartial({
+        user: user.publicKey,
+        fund,
+        ticket: ticketPda(user.publicKey, epoch),
+        shareMint,
+        userShares: getAssociatedTokenAddressSync(shareMint, user.publicKey),
+        userUsdc,
+        subscriptionEscrow: fundPda("subscription_escrow"),
         shareEscrow: fundPda("share_escrow"),
       })
       .signers([user])
@@ -395,7 +441,7 @@ describe("tide", () => {
     expect([n, why]).to.deep.equal([1, "NothingToTrade"]);
     const f = await program.account.fund.fetch(fund);
     expect(f.state.sliceCount).to.equal(0);
-    const r = await program.account.epochRecord.fetch(epochPda(f0.state.epoch.subn(1)));
+    const r = await program.account.epochRecord.fetch(epochPda(today));
     expect(r.sliceSoldOut).to.equal(true);
 
     await claim(alice, aliceUsdc);
@@ -445,9 +491,8 @@ describe("tide", () => {
 
   it("第5天：cbBTC 脱锚，不买入，申购款留在托管里，定价照常完成", async () => {
     await subscribe(alice, aliceUsdc, 1_000 * USDC);
-    const f0 = await program.account.fund.fetch(fund);
     await fixDay(52_000, 50_440); // cbBTC 比 BTC 低 3%，超过 2% 阈值
-    const r = await program.account.epochRecord.fetch(epochPda(f0.state.epoch));
+    const r = await program.account.epochRecord.fetch(epochPda(today));
     expect(r.signalPrice.toString()).to.equal(usd(52_000).toString());
     expect(r.valuationPrice.toString()).to.equal(usd(50_440).toString());
     expect(r.targetBtc).to.equal(true); // 目标仍是 cbBTC
@@ -471,5 +516,49 @@ describe("tide", () => {
     await claim(alice, aliceUsdc);
     const after = await tokenBalance(getAssociatedTokenAddressSync(shareMint, alice.publicKey));
     expect(after - before).to.equal(BigInt(f.state.shareSupply.toString()));
+  });
+
+  it("第7天：排队从不关闭，定价时刻之前可以撤销，每期一张排队记录", async () => {
+    const escrow = fundPda("subscription_escrow");
+    const exists = async (addr: PublicKey) => (await context.banksClient.getAccount(addr)) !== null;
+
+    // 第 6 天定价之后提交：属于第 7 期，排队记录的地址带期号
+    const bobBefore = await tokenBalance(bobUsdc);
+    const e7 = await subscribe(bob, bobUsdc, 500 * USDC);
+    expect(e7).to.equal(today + 1);
+    expect((await program.account.ticket.fetch(ticketPda(bob.publicKey, e7))).epoch.toNumber()).to.equal(e7);
+    // 定价时刻之前撤销：全额退回，排队记录关闭
+    await cancel(bob, bobUsdc, e7);
+    expect(await tokenBalance(bobUsdc)).to.equal(bobBefore);
+    expect(await exists(ticketPda(bob.publicKey, e7))).to.equal(false);
+    await warpTo(now + 1);
+    await subscribe(bob, bobUsdc, 300 * USDC);
+
+    // 赎回同样可以撤销，份额全额退回
+    const aliceShares = getAssociatedTokenAddressSync(shareMint, alice.publicKey);
+    const sharesBefore = await tokenBalance(aliceShares);
+    await redeem(alice, 1_000n);
+    expect(await tokenBalance(aliceShares)).to.equal(sharesBefore - 1_000n);
+    await cancel(alice, aliceUsdc, e7);
+    expect(await tokenBalance(aliceShares)).to.equal(sharesBefore);
+
+    // 第 7 天 01:00 之后、定价之前：第 7 期不能再撤销；新的申购进入第 8 期，Bob 同时有两期
+    await warpTo((today + 1) * DAY + FIX_OFFSET + 10);
+    expect(await errorName(cancel(bob, bobUsdc, e7))).to.equal("TooLateToCancel");
+    const e8 = await subscribe(bob, bobUsdc, 200 * USDC);
+    expect(e8).to.equal(e7 + 1);
+    expect(await tokenBalance(escrow)).to.equal(BigInt(500 * USDC));
+
+    // 第 7 天的定价只处理第 7 期
+    await fixDay(54_000);
+    const r = await program.account.epochRecord.fetch(epochPda(e7));
+    expect([r.firstEpoch.toNumber(), r.subscriptionUsdc.toNumber()]).to.deep.equal([e7, 300 * USDC]);
+    const [, why] = await tradeUntilDone();
+    expect(why).to.equal("NothingToTrade");
+    await claim(bob, bobUsdc, e7);
+    expect(Number(await tokenBalance(getAssociatedTokenAddressSync(shareMint, bob.publicKey)))).to.be.greaterThan(0);
+    expect(await exists(ticketPda(bob.publicKey, e7))).to.equal(false);
+    expect(await errorName(claim(bob, bobUsdc, e8))).to.equal("EpochNotSettled");
+    expect(await tokenBalance(escrow)).to.equal(BigInt(200 * USDC));
   });
 });

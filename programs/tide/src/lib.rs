@@ -1,6 +1,8 @@
 //! BTC 50 日均线基金（Solana / Anchor，devnet 原型）
 //!
-//! - 任何人用 USDC 申购、用份额赎回；都先排队，01:00 之前提交的参加当天的结算
+//! - 任何人随时用 USDC 申购、用份额赎回，排队从不关闭。每个请求属于关闭它的定价时刻那一期
+//!   （期号是那天的日期序号：01:00 之前提交的属于当天，之后的属于第二天）；
+//!   每个用户每期一张排队记录。关闭这一期的定价时刻之前可以 cancel，全额退回
 //! - 结算分多步（ADR 0001）。定价时刻后 keeper_window_secs 秒内只有清算地址（config.keeper）
 //!   能驱动，之后任何人都可以，但其他人的交易用更严的滑点上限：
 //!     fix：每天 UTC 1 点之后调用一次，记录 1 点的定价价格 -> 算 50 日均线和目标 ->
@@ -9,7 +11,8 @@
 //!          min_trade_interval_secs；先卖赎回资产，再把基金调向目标，最后为申购买入
 //!          （目标为 USDC 时申购款不交易直接成交），按带来的资产发份额（ADR 0006）；
 //!          没有可交易的时候返回 NothingToTrade / TradeTooSoon / DepegBlocksBuy
-//!   信号和轧差只取决于 1 点发布的价格，和调用 fix 的时间无关；1 点到当天 fix 之间暂停申购赎回
+//!   信号和轧差只取决于 1 点发布的价格，和调用 fix 的时间无关；某天没有 fix 时，
+//!   这一期的请求顺延到下一次 fix，一次 fix 可以关闭好几期
 //! - 用户调用 claim 领取份额（可以分几次领取已成交的部分）；赎回人要等这一期的赎回资产卖完才能领取 USDC
 //!
 //! 原型限制（上主网前必须替换）：
@@ -80,7 +83,12 @@ pub mod tide {
     // 申购、赎回、领取
     // ------------------------------------------------------------------
 
-    pub fn request_subscription(ctx: Context<RequestSubscription>, amount: u64) -> Result<()> {
+    /// epoch 是这一刻开放的那一期（fund_logic::request_epoch），只用来推出排队记录的地址
+    pub fn request_subscription(
+        ctx: Context<RequestSubscription>,
+        amount: u64,
+        epoch: u64,
+    ) -> Result<()> {
         let fund = &mut ctx.accounts.fund;
         let ticket = &mut ctx.accounts.ticket;
         if ticket.owner == Pubkey::default() {
@@ -91,12 +99,10 @@ pub mod tide {
         let cfg = fund.config.to_logic();
         let mut st = fund.state.to_logic();
         let mut t = ticket.to_logic();
-        require!(
-            t.is_empty() || t.epoch == st.epoch,
-            FundErrorCode::ClaimFirst
-        );
         let now = Clock::get()?.unix_timestamp;
         logic::request_subscription(&mut st, &mut t, amount, now, &cfg).map_err(map_err)?;
+        // 排队记录的地址由 epoch 推出，必须正是 fund-logic 定下的那一期
+        require!(t.epoch == epoch, FundErrorCode::WrongEpoch);
 
         token::transfer(
             CpiContext::new(
@@ -114,7 +120,12 @@ pub mod tide {
         Ok(())
     }
 
-    pub fn request_redemption(ctx: Context<RequestRedemption>, shares: u64) -> Result<()> {
+    /// epoch 同 request_subscription
+    pub fn request_redemption(
+        ctx: Context<RequestRedemption>,
+        shares: u64,
+        epoch: u64,
+    ) -> Result<()> {
         let fund = &mut ctx.accounts.fund;
         let ticket = &mut ctx.accounts.ticket;
         if ticket.owner == Pubkey::default() {
@@ -125,12 +136,9 @@ pub mod tide {
         let cfg = fund.config.to_logic();
         let mut st = fund.state.to_logic();
         let mut t = ticket.to_logic();
-        require!(
-            t.is_empty() || t.epoch == st.epoch,
-            FundErrorCode::ClaimFirst
-        );
         let now = Clock::get()?.unix_timestamp;
         logic::request_redemption(&mut st, &mut t, shares, now, &cfg).map_err(map_err)?;
+        require!(t.epoch == epoch, FundErrorCode::WrongEpoch);
 
         token::transfer(
             CpiContext::new(
@@ -148,6 +156,45 @@ pub mod tide {
         Ok(())
     }
 
+    /// 关闭这一期的定价时刻之前撤销排队记录：申购款和赎回份额全额退回，记录关闭、退回租金
+    pub fn cancel(ctx: Context<Cancel>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let fund = &mut ctx.accounts.fund;
+        let cfg = fund.config.to_logic();
+        let mut st = fund.state.to_logic();
+        let mut t = ctx.accounts.ticket.to_logic();
+        let logic::CancelOutcome { usdc, shares } =
+            logic::cancel(&mut st, &mut t, now, &cfg).map_err(map_err)?;
+        fund.state = StateData::from_logic(&st);
+
+        let admin = fund.admin;
+        let seeds: &[&[u8]] = &[b"fund", admin.as_ref(), &[fund.bump]];
+        let signer = &[seeds];
+        let tp = ctx.accounts.token_program.to_account_info();
+        let fund_ai = ctx.accounts.fund.to_account_info();
+        fund_transfer(
+            &tp,
+            &fund_ai,
+            signer,
+            ctx.accounts.subscription_escrow.to_account_info(),
+            ctx.accounts.user_usdc.to_account_info(),
+            usdc,
+        )?;
+        fund_transfer(
+            &tp,
+            &fund_ai,
+            signer,
+            ctx.accounts.share_escrow.to_account_info(),
+            ctx.accounts.user_shares.to_account_info(),
+            shares,
+        )?;
+        ctx.accounts
+            .ticket
+            .close(ctx.accounts.user.to_account_info())
+    }
+
+    /// epoch_record 传关闭这张排队记录那一期的定价记录：通常期号相同；
+    /// 中间的定价被跳过时，是之后第一次定价的记录（first_epoch ≤ 排队记录的期号 ≤ epoch）。
     pub fn claim(ctx: Context<Claim>) -> Result<()> {
         let fund = &ctx.accounts.fund;
         let ticket = &mut ctx.accounts.ticket;
@@ -199,6 +246,12 @@ pub mod tide {
             user_usdc,
             refund_usdc,
         )?;
+        // 都领完了：关闭排队记录，退回租金（每期一张，不关闭会越积越多）
+        if t.is_empty() {
+            ctx.accounts
+                .ticket
+                .close(ctx.accounts.user.to_account_info())?;
+        }
         Ok(())
     }
 
@@ -206,8 +259,9 @@ pub mod tide {
     // 结算：定价步骤 + 一系列交易（任何人都可以调用）
     // ------------------------------------------------------------------
 
-    /// 定价步骤：每天定价时刻之后调用一次
-    pub fn fix(ctx: Context<Fix>) -> Result<()> {
+    /// 定价步骤：每天定价时刻之后调用一次。epoch 是当天的日期序号（unix 秒 / 86400），
+    /// 用来推出这次定价记录的地址
+    pub fn fix(ctx: Context<Fix>, epoch: u64) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let fund_cfg = ctx.accounts.fund.config;
         // 模拟预言机每个价格源只有一个价格：它必须在定价窗口内发布，并且不超过
@@ -220,6 +274,7 @@ pub mod tide {
         let caller = fund_cfg.caller(&ctx.accounts.cranker.key());
         let logic::FixOutcome { record, fee_usdc } =
             logic::fix(&mut st, now, &prices, caller, &cfg).map_err(map_err)?;
+        require!(record.epoch == epoch, FundErrorCode::WrongEpochRecord);
 
         let admin = ctx.accounts.fund.admin;
         let fund_bump = ctx.accounts.fund.bump;
@@ -289,7 +344,7 @@ pub mod tide {
         ctx.accounts.fund.state = StateData::from_logic(&st);
         emit!(Fixed {
             epoch: record.epoch,
-            day: record.day,
+            first_epoch: record.first_epoch,
             signal_price: record.signal_price,
             valuation_price: record.valuation_price,
             moving_average: record.moving_average,
@@ -593,13 +648,15 @@ pub struct StateData {
     pub share_supply: u64,
     pub queued_subscription_usdc: u64,
     pub queued_redemption_shares: u64,
+    pub next_epoch: u64,
+    pub next_subscription_usdc: u64,
+    pub next_redemption_shares: u64,
     pub prices: [u64; 64], // 必须等于 fund_logic::MAX_WINDOW（IDL 需要字面量长度）
     pub price_count: u8,
     pub price_head: u8,
     pub target_btc: bool,
     pub last_fix_day: i64,
     pub last_trade_time: i64,
-    pub epoch: u64,
     pub slices: [SliceData; 8], // 必须等于 fund_logic::MAX_SLICES
     pub slice_count: u8,
     pub pending: [PendingData; 8], // 必须等于 fund_logic::MAX_PENDING
@@ -614,13 +671,15 @@ impl StateData {
             share_supply: s.share_supply,
             queued_subscription_usdc: s.queued_subscription_usdc,
             queued_redemption_shares: s.queued_redemption_shares,
+            next_epoch: s.next_epoch,
+            next_subscription_usdc: s.next_subscription_usdc,
+            next_redemption_shares: s.next_redemption_shares,
             prices: s.prices,
             price_count: s.price_count,
             price_head: s.price_head,
             target_btc: s.target_btc,
             last_fix_day: s.last_fix_day,
             last_trade_time: s.last_trade_time,
-            epoch: s.epoch,
             slices: s.slices.map(|x| SliceData {
                 epoch: x.epoch,
                 btc: x.btc,
@@ -641,13 +700,15 @@ impl StateData {
             share_supply: self.share_supply,
             queued_subscription_usdc: self.queued_subscription_usdc,
             queued_redemption_shares: self.queued_redemption_shares,
+            next_epoch: self.next_epoch,
+            next_subscription_usdc: self.next_subscription_usdc,
+            next_redemption_shares: self.next_redemption_shares,
             prices: self.prices,
             price_count: self.price_count,
             price_head: self.price_head,
             target_btc: self.target_btc,
             last_fix_day: self.last_fix_day,
             last_trade_time: self.last_trade_time,
-            epoch: self.epoch,
             slices: self.slices.map(|x| logic::Slice {
                 epoch: x.epoch,
                 btc: x.btc,
@@ -711,7 +772,7 @@ impl Ticket {
 pub struct EpochRecord {
     pub fund: Pubkey,
     pub epoch: u64,
-    pub day: i64,
+    pub first_epoch: u64,
     pub signal_price: u64,
     pub valuation_price: u64,
     pub moving_average: u64,
@@ -738,7 +799,7 @@ pub struct EpochRecord {
 impl EpochRecord {
     fn set_from_logic(&mut self, r: &logic::EpochRecord) {
         self.epoch = r.epoch;
-        self.day = r.day;
+        self.first_epoch = r.first_epoch;
         self.signal_price = r.signal_price;
         self.valuation_price = r.valuation_price;
         self.moving_average = r.moving_average;
@@ -766,7 +827,7 @@ impl EpochRecord {
     fn to_logic(&self) -> logic::EpochRecord {
         logic::EpochRecord {
             epoch: self.epoch,
-            day: self.day,
+            first_epoch: self.first_epoch,
             signal_price: self.signal_price,
             valuation_price: self.valuation_price,
             moving_average: self.moving_average,
@@ -824,8 +885,8 @@ pub struct MockMarket {
 
 #[event]
 pub struct Fixed {
-    pub epoch: u64,
-    pub day: i64,
+    pub epoch: u64,       // 定价当天的日期序号
+    pub first_epoch: u64, // 这次定价关闭的最早一期（中间的定价被跳过时更早）
     pub signal_price: u64,
     pub valuation_price: u64,
     pub moving_average: u64,
@@ -918,6 +979,7 @@ pub struct AdminOnly<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(amount: u64, epoch: u64)]
 pub struct RequestSubscription<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
@@ -925,7 +987,7 @@ pub struct RequestSubscription<'info> {
     pub fund: Box<Account<'info, Fund>>,
     #[account(
         init_if_needed, payer = user, space = 8 + Ticket::INIT_SPACE,
-        seeds = [b"ticket", fund.key().as_ref(), user.key().as_ref()], bump
+        seeds = [b"ticket", fund.key().as_ref(), user.key().as_ref(), &epoch.to_le_bytes()], bump
     )]
     pub ticket: Box<Account<'info, Ticket>>,
     #[account(mut, token::mint = fund.usdc_mint, token::authority = user)]
@@ -937,6 +999,7 @@ pub struct RequestSubscription<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(shares: u64, epoch: u64)]
 pub struct RequestRedemption<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
@@ -944,7 +1007,7 @@ pub struct RequestRedemption<'info> {
     pub fund: Box<Account<'info, Fund>>,
     #[account(
         init_if_needed, payer = user, space = 8 + Ticket::INIT_SPACE,
-        seeds = [b"ticket", fund.key().as_ref(), user.key().as_ref()], bump
+        seeds = [b"ticket", fund.key().as_ref(), user.key().as_ref(), &epoch.to_le_bytes()], bump
     )]
     pub ticket: Box<Account<'info, Ticket>>,
     #[account(mut, token::mint = fund.share_mint, token::authority = user)]
@@ -956,19 +1019,51 @@ pub struct RequestRedemption<'info> {
 }
 
 #[derive(Accounts)]
+pub struct Cancel<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump)]
+    pub fund: Box<Account<'info, Fund>>,
+    #[account(
+        mut,
+        seeds = [b"ticket", fund.key().as_ref(), user.key().as_ref(), &ticket.epoch.to_le_bytes()],
+        bump = ticket.bump,
+        constraint = ticket.owner == user.key() @ FundErrorCode::NotOwner
+    )]
+    pub ticket: Box<Account<'info, Ticket>>,
+    #[account(address = fund.share_mint)]
+    pub share_mint: Box<Account<'info, Mint>>,
+    #[account(
+        init_if_needed, payer = user,
+        associated_token::mint = share_mint, associated_token::authority = user
+    )]
+    pub user_shares: Box<Account<'info, TokenAccount>>,
+    #[account(mut, token::mint = fund.usdc_mint, token::authority = user)]
+    pub user_usdc: Box<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [b"subscription_escrow", fund.key().as_ref()], bump)]
+    pub subscription_escrow: Box<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [b"share_escrow", fund.key().as_ref()], bump)]
+    pub share_escrow: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct Claim<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
     #[account(seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump)]
     pub fund: Box<Account<'info, Fund>>,
     #[account(
-        mut, seeds = [b"ticket", fund.key().as_ref(), user.key().as_ref()], bump = ticket.bump,
+        mut,
+        seeds = [b"ticket", fund.key().as_ref(), user.key().as_ref(), &ticket.epoch.to_le_bytes()],
+        bump = ticket.bump,
         constraint = ticket.owner == user.key() @ FundErrorCode::NotOwner
     )]
     pub ticket: Box<Account<'info, Ticket>>,
-    #[account(
-        mut, seeds = [b"epoch", fund.key().as_ref(), &ticket.epoch.to_le_bytes()], bump = epoch_record.bump
-    )]
+    /// 关闭这张排队记录那一期的定价记录；期号范围由 fund-logic 校验，这里校验它属于这个基金
+    #[account(mut, has_one = fund @ FundErrorCode::WrongEpochRecord)]
     pub epoch_record: Box<Account<'info, EpochRecord>>,
     #[account(address = fund.share_mint)]
     pub share_mint: Box<Account<'info, Mint>>,
@@ -993,6 +1088,7 @@ pub struct Claim<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(epoch: u64)]
 pub struct Fix<'info> {
     /// 清算窗口内只能是清算地址，之后任何人都可以；支付本期记录账户的租金
     #[account(mut)]
@@ -1000,9 +1096,11 @@ pub struct Fix<'info> {
     #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump,
               has_one = oracle, has_one = share_mint)]
     pub fund: Box<Account<'info, Fund>>,
+    /// 当天的定价记录。已经存在只可能是今天定价过了：这时由 fund-logic 回答 AlreadySettled，
+    /// 不会改写它（所以用 init_if_needed，而不是让创建账户失败）
     #[account(
-        init, payer = cranker, space = 8 + EpochRecord::INIT_SPACE,
-        seeds = [b"epoch", fund.key().as_ref(), &fund.state.epoch.to_le_bytes()], bump
+        init_if_needed, payer = cranker, space = 8 + EpochRecord::INIT_SPACE,
+        seeds = [b"epoch", fund.key().as_ref(), &epoch.to_le_bytes()], bump
     )]
     pub epoch_record: Box<Account<'info, EpochRecord>>,
     pub oracle: Box<Account<'info, MockOracle>>,
@@ -1127,8 +1225,6 @@ pub enum FundErrorCode {
     ZeroAmount,
     #[msg("历史价格数量超过均线窗口")]
     TooManyPrices,
-    #[msg("上一期还没领取，请先 claim")]
-    ClaimFirst,
     #[msg("基金已经开始运行，不能再写入历史价格")]
     AlreadyStarted,
     #[msg("代币精度不对：USDC 应为 6 位，BTC 应为 8 位")]
@@ -1137,8 +1233,6 @@ pub enum FundErrorCode {
     WrongMint,
     #[msg("不是这张排队记录的所有者")]
     NotOwner,
-    #[msg("已过今天的定价时刻、还没定价，暂停申购赎回")]
-    QueueClosed,
     #[msg("定价价格的发布时间不在定价窗口内")]
     PriceNotAtFixTime,
     #[msg("没有需要交易的东西")]
@@ -1157,6 +1251,12 @@ pub enum FundErrorCode {
     FixPending,
     #[msg("清算窗口内只有清算地址能驱动结算")]
     KeeperOnly,
+    #[msg("排队记录不是这一刻开放的那一期")]
+    WrongEpoch,
+    #[msg("已过关闭这一期的定价时刻，不能再撤销")]
+    TooLateToCancel,
+    #[msg("排队记录是空的，没有可撤销的")]
+    NothingToCancel,
 }
 
 fn map_err(e: logic::FundError) -> Error {
@@ -1173,7 +1273,6 @@ fn map_err(e: logic::FundError) -> Error {
         E::BelowMinSubscription => FundErrorCode::BelowMinSubscription,
         E::ZeroAmount => FundErrorCode::ZeroAmount,
         E::TooManyPrices => FundErrorCode::TooManyPrices,
-        E::QueueClosed => FundErrorCode::QueueClosed,
         E::PriceNotAtFixTime => FundErrorCode::PriceNotAtFixTime,
         E::NothingToTrade => FundErrorCode::NothingToTrade,
         E::TradeTooSoon => FundErrorCode::TradeTooSoon,
@@ -1183,6 +1282,9 @@ fn map_err(e: logic::FundError) -> Error {
         E::TooManySlices => FundErrorCode::TooManySlices,
         E::FixPending => FundErrorCode::FixPending,
         E::KeeperOnly => FundErrorCode::KeeperOnly,
+        E::WrongEpoch => FundErrorCode::WrongEpoch,
+        E::TooLateToCancel => FundErrorCode::TooLateToCancel,
+        E::NothingToCancel => FundErrorCode::NothingToCancel,
     };
     error!(code)
 }

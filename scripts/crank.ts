@@ -76,12 +76,14 @@ async function main() {
   }
   console.log(`已写入价格：${await postPrice()} USD`);
   try {
+    // 定价记录的期号是当天的日期序号（链上时钟和本机时钟在 1 点附近不会差出一天）
+    const epoch = Math.floor(Date.now() / 1000 / 86_400);
     const sig = await program.methods
-      .fix()
+      .fix(new BN(epoch))
       .accountsPartial({
         cranker: admin,
         fund,
-        epochRecord: epochPda(f.state.epoch),
+        epochRecord: epochPda(new BN(epoch)),
         oracle,
         shareMint,
         usdcVault: fundPda("usdc_vault"),
@@ -138,7 +140,7 @@ async function main() {
   const after = await program.account.fund.fetch(fund);
   console.log(
     `目标持仓：${after.state.targetBtc ? "cbBTC" : "USDC"}；未卖完的赎回资产 ${after.state.sliceCount} 期；` +
-      `第 ${after.state.epoch.toNumber()} 期开放申购赎回`,
+      `下一次定价处理的申购 ${after.state.queuedSubscriptionUsdc.toNumber() / 1e6} USDC`,
   );
 }
 

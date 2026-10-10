@@ -79,7 +79,7 @@ _Avoid_: Crank, operator, admin
 The 30 minutes after the fixing time (01:00–01:30 UTC) when only the keeper may drive settlement; after it, anyone may, but under a tighter slippage bound than the keeper.
 
 **Epoch** (期):
-All subscriptions and redemptions submitted between two consecutive fixing times; each is priced at the fixing time that closes its epoch, so the queue never closes.
+All subscriptions and redemptions submitted between two consecutive fixing times, numbered by the day of the fixing time that closes it; each is priced at that fixing time, so the queue never closes. If a fixing step is skipped, its epoch rolls into the next fixing, which then closes several epochs together. Each user has one ticket per epoch.
 _Avoid_: Day, round, batch
 
 ## Trading

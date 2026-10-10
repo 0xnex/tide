@@ -104,7 +104,7 @@ These are easy to break when editing:
 | Fund | `"fund", admin` |
 | Share mint | `"share_mint", fund` |
 | Vaults | `"usdc_vault" / "btc_vault" / "subscription_escrow" / "share_escrow" / "payout_vault", fund` |
-| Ticket | `"ticket", fund, user` |
+| Ticket | `"ticket", fund, user, epoch.to_le_bytes()` |
 | Epoch record | `"epoch", fund, epoch.to_le_bytes()` |
 | Mock oracle / market | `"oracle", authority` / `"market", authority` |
 | Market vaults | `"market_usdc" / "market_btc", market` |
