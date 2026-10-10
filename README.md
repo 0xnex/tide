@@ -4,7 +4,7 @@
 
 > **Devnet prototype. Do not use with real money.** The oracle and exchange are mocks. Mainnet needs a security audit and legal advice: pooling other people's money and charging a fee for managing it is regulated in many jurisdictions.
 
-> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code runs settlement as a fixing step plus capped trades, with redeemers paid their slice's actual proceeds. Subscriptions are still filled at a USD NAV from the fixing price, the signal still uses BTC/USD, and the withdrawal fee and governance are not built yet. Sections marked *(current code)* describe what runs today.
+> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code runs settlement as a fixing step plus capped trades. Redeemers are paid their slice's actual proceeds, and subscriptions become shares by the cbBTC they add. The signal still uses BTC/USD, and the withdrawal fee and governance are not built yet. Sections marked *(current code)* describe what runs today.
 
 ---
 
@@ -244,7 +244,7 @@ flowchart LR
 | `request_redemption(shares)` | holder | Queue a redemption |
 | `fix` | keeper in 01:00–01:30, then anyone | Fixing step, once a day after `settle_offset_secs` |
 | `trade` | keeper in 01:00–01:30, then anyone | One capped trade; others in the window get `KeeperOnly`; answers `NothingToTrade`, `TradeTooSoon`, `DepegBlocksBuy` or `FixPending` when there is none |
-| `claim` | subscriber / redeemer | Collect shares or USDC |
+| `claim` | subscriber / redeemer | Collect filled shares (repeatable) or redemption USDC |
 | `init_mock_oracle`, `set_mock_price`, `init_mock_market`, `set_mock_market_fee` | admin | Devnet only |
 
 ### Configuration
@@ -288,7 +288,6 @@ flowchart LR
 | cbBTC | 8 decimals |
 | Shares | 6 decimals; first share = 1 USDC |
 | Price | micro-USD per 1 BTC |
-| NAV | USDC base units per share base unit × 10¹² |
 
 ---
 

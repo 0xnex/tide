@@ -2,13 +2,13 @@
 // 单笔交易上限设为 1,000 USDC，每天的调仓要分成几笔、间隔 60 秒完成。
 //
 // 场景：
-//   第 1 天：Alice 申购 1000、Bob 申购 3000；价格高于均线 -> 分 4 笔买入 cbBTC
+//   第 1 天：Alice 申购 1000、Bob 申购 3000；价格高于均线 -> 分 4 笔为申购买入 cbBTC，中途先领一部分份额
 //   第 2 天：Alice 赎回全部份额；价格上涨 10% -> 分 2 笔卖出她那份 cbBTC，卖完才能领取；
 //            中途一笔成交低于 min_out，只回滚那一笔
 //   第 3 天：价格跌破均线 -> 分几笔全部换成 USDC；清算窗口内 Alice 不能交易，窗口之后可以
 //   第 4 天：Bob 赎回全部 -> 基金只有 USDC，赎回资产定价时就完成，份额清零
-//   第 5 天：Alice 再申购；BTC 高于均线，但 cbBTC 比 BTC 低 3%（脱锚）-> 不买入，定价照常完成
-//   第 6 天：恢复锚定 -> 买入 cbBTC
+//   第 5 天：Alice 再申购；BTC 高于均线，但 cbBTC 比 BTC 低 3%（脱锚）-> 不买入，申购款留在托管里
+//   第 6 天：恢复锚定 -> 为 Alice 买入 cbBTC，她领到份额
 import * as anchor from "@coral-xyz/anchor";
 import { BN, Program } from "@coral-xyz/anchor";
 import { Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
@@ -171,7 +171,9 @@ describe("tide", () => {
     // 保持预言机价格新鲜（同一时刻已经写入过就不再写，避免重复交易）
     if (pricedAt !== now) await setPrice(price, valuation);
     const f = await program.account.fund.fetch(fund);
-    const sliceRecord = f.state.sliceCount > 0 ? epochPda(f.state.slices[0].epoch) : null;
+    // 最早一期未卖完的赎回资产的记录；没有时用最早一期待成交申购的记录
+    const recordEpoch =
+      f.state.sliceCount > 0 ? f.state.slices[0].epoch : f.state.pendingCount > 0 ? f.state.pending[0].epoch : null;
     return errorName(
       program.methods
         .trade()
@@ -185,7 +187,10 @@ describe("tide", () => {
           usdcVault: fundPda("usdc_vault"),
           btcVault: fundPda("btc_vault"),
           payoutVault: fundPda("payout_vault"),
-          sliceRecord,
+          subscriptionEscrow: fundPda("subscription_escrow"),
+          shareEscrow: fundPda("share_escrow"),
+          shareMint,
+          epochRecord: recordEpoch === null ? null : epochPda(recordEpoch),
         })
         .signers(signer === admin ? [] : [signer])
         .rpc(),
@@ -219,6 +224,7 @@ describe("tide", () => {
         userUsdc,
         shareEscrow: fundPda("share_escrow"),
         payoutVault: fundPda("payout_vault"),
+        subscriptionEscrow: fundPda("subscription_escrow"),
       })
       .signers([user])
       .rpc();
@@ -320,30 +326,42 @@ describe("tide", () => {
       .rpc();
   });
 
-  it("第1天：申购后价格高于均线，分 4 笔买入 cbBTC，间隔不足时拒绝", async () => {
+  it("第1天：价格高于均线，分 4 笔为申购买入 cbBTC，份额分次领取，间隔不足时拒绝", async () => {
     await subscribe(alice, aliceUsdc, 1_000 * USDC);
     await subscribe(bob, bobUsdc, 3_000 * USDC);
     await fixDay(55_000);
 
     const f = await program.account.fund.fetch(fund);
     expect(f.state.targetBtc).to.equal(true);
-    expect(await tokenBalance(fundPda("usdc_vault"))).to.equal(BigInt(4_000 * USDC));
+    const escrow = fundPda("subscription_escrow");
+    expect(await tokenBalance(escrow)).to.equal(BigInt(4_000 * USDC)); // 待成交申购留在托管里
 
+    // 第一笔 1000 USDC：基金还没有份额，1 USDC 换 1 份；Alice 先领她那 1/4
     expect(await trade()).to.equal(null);
-    expect(await tokenBalance(fundPda("usdc_vault"))).to.equal(BigInt(3_000 * USDC)); // 每笔 1000 USDC
+    expect(await tokenBalance(escrow)).to.equal(BigInt(3_000 * USDC));
+    await claim(alice, aliceUsdc);
+    const aliceShares = getAssociatedTokenAddressSync(shareMint, alice.publicKey);
+    expect(await tokenBalance(aliceShares)).to.equal(BigInt(250 * USDC));
+    await warpTo(now); // 推进区块：同样的领取交易换一个区块哈希，否则会被当成重复交易
+    expect(await errorName(claim(alice, aliceUsdc))).to.equal("NothingToClaim");
+
     await warpTo(now + TRADE_INTERVAL - 1);
     expect(await trade()).to.equal("TradeTooSoon");
     const [n, why] = await tradeUntilDone();
     expect([n, why]).to.deep.equal([3, "NothingToTrade"]);
+    expect(await tokenBalance(escrow)).to.equal(0n);
     expect(await tokenBalance(fundPda("usdc_vault"))).to.equal(0n);
     expect(Number(await tokenBalance(fundPda("btc_vault")))).to.be.greaterThan(0);
 
+    // 全部成交：两人领完，总数精确等于发行的份额，比例约 1:3
     await claim(alice, aliceUsdc);
     await claim(bob, bobUsdc);
-    const aShares = await tokenBalance(getAssociatedTokenAddressSync(shareMint, alice.publicKey));
+    const aShares = await tokenBalance(aliceShares);
     const bShares = await tokenBalance(getAssociatedTokenAddressSync(shareMint, bob.publicKey));
-    expect(aShares).to.equal(BigInt(1_000 * USDC));
-    expect(bShares).to.equal(BigInt(3_000 * USDC));
+    const f1 = await program.account.fund.fetch(fund);
+    expect(aShares + bShares).to.equal(BigInt(f1.state.shareSupply.toString()));
+    expect(Number(bShares) / Number(aShares)).to.be.closeTo(3, 1e-6);
+    expect(await tokenBalance(fundPda("share_escrow"))).to.equal(0n);
   });
 
   it("同一天不能定价两次", async () => {
@@ -357,7 +375,8 @@ describe("tide", () => {
     await fixDay(60_500);
     const f0 = await program.account.fund.fetch(fund);
     expect(f0.state.sliceCount).to.equal(1);
-    expect(f0.state.shareSupply.toNumber()).to.equal(3_000 * USDC);
+    const bShares = await tokenBalance(getAssociatedTokenAddressSync(shareMint, bob.publicKey));
+    expect(BigInt(f0.state.shareSupply.toString())).to.equal(bShares);
 
     // 约 1,100 USDC 的 cbBTC，第一笔卖 1,000
     expect(await trade()).to.equal(null);
@@ -424,11 +443,9 @@ describe("tide", () => {
     expect(await trade()).to.equal("NothingToTrade");
   });
 
-  it("第5天：cbBTC 脱锚，不买入，定价照常完成", async () => {
+  it("第5天：cbBTC 脱锚，不买入，申购款留在托管里，定价照常完成", async () => {
     await subscribe(alice, aliceUsdc, 1_000 * USDC);
     const f0 = await program.account.fund.fetch(fund);
-    const usdcVault = fundPda("usdc_vault");
-    const vaultBefore = await tokenBalance(usdcVault); // 之前全部赎回可能留下取整尘埃
     await fixDay(52_000, 50_440); // cbBTC 比 BTC 低 3%，超过 2% 阈值
     const r = await program.account.epochRecord.fetch(epochPda(f0.state.epoch));
     expect(r.signalPrice.toString()).to.equal(usd(52_000).toString());
@@ -436,17 +453,23 @@ describe("tide", () => {
     expect(r.targetBtc).to.equal(true); // 目标仍是 cbBTC
     expect(await trade()).to.equal("DepegBlocksBuy");
     expect(await tokenBalance(fundPda("btc_vault"))).to.equal(0n);
-    expect(await tokenBalance(usdcVault)).to.equal(vaultBefore + BigInt(1_000 * USDC)); // 申购款原样留在 USDC
-    await claim(alice, aliceUsdc);
+    expect(await tokenBalance(fundPda("subscription_escrow"))).to.equal(BigInt(1_000 * USDC));
+    expect(await errorName(claim(alice, aliceUsdc))).to.equal("NothingToClaim");
   });
 
-  it("第6天：恢复锚定，买入 cbBTC", async () => {
+  it("第6天：恢复锚定，为 Alice 买入 cbBTC，她领到份额", async () => {
     await fixDay(53_000);
     const [n, why] = await tradeUntilDone();
     expect(n).to.be.greaterThan(0);
     expect(why).to.equal("NothingToTrade");
     const f = await program.account.fund.fetch(fund);
     expect(f.state.btc.toNumber()).to.be.greaterThan(0);
+    expect(f.state.pendingCount).to.equal(0);
     expect(await tokenBalance(fundPda("btc_vault"))).to.equal(BigInt(f.state.btc.toString()));
+    expect(await tokenBalance(fundPda("subscription_escrow"))).to.equal(0n);
+    const before = await tokenBalance(getAssociatedTokenAddressSync(shareMint, alice.publicKey));
+    await claim(alice, aliceUsdc);
+    const after = await tokenBalance(getAssociatedTokenAddressSync(shareMint, alice.publicKey));
+    expect(after - before).to.equal(BigInt(f.state.shareSupply.toString()));
   });
 });

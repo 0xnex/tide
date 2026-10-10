@@ -1,15 +1,16 @@
 //! BTC 50 日均线基金（Solana / Anchor，devnet 原型）
 //!
-//! - 任何人用 USDC 申购、用份额赎回；都先排队，在下一次定价时按定价净值成交
+//! - 任何人用 USDC 申购、用份额赎回；都先排队，01:00 之前提交的参加当天的结算
 //! - 结算分多步（ADR 0001）。定价时刻后 keeper_window_secs 秒内只有清算地址（config.keeper）
 //!   能驱动，之后任何人都可以，但其他人的交易用更严的滑点上限：
 //!     fix：每天 UTC 1 点之后调用一次，记录 1 点的定价价格 -> 算 50 日均线和目标 ->
-//!          按净值发行申购份额、销毁赎回份额并按比例划出赎回资产
+//!          销毁赎回份额并按比例划出实物赎回资产 -> 轧差，其余申购款成为待成交申购
 //!     trade：之后反复调用，每次一笔不超过 trade_cap_usdc 的交易，间隔至少
-//!          min_trade_interval_secs；先卖赎回资产，再把基金调向目标；
+//!          min_trade_interval_secs；先卖赎回资产，再把基金调向目标，最后为申购买入
+//!          （目标为 USDC 时申购款不交易直接成交），按带来的资产发份额（ADR 0006）；
 //!          没有可交易的时候返回 NothingToTrade / TradeTooSoon / DepegBlocksBuy
-//!   净值只取决于 1 点发布的价格，和调用 fix 的时间无关；1 点到当天 fix 之间暂停申购赎回
-//! - 用户在定价之后调用 claim 领取份额；赎回人要等这一期的赎回资产卖完才能领取 USDC
+//!   信号和轧差只取决于 1 点发布的价格，和调用 fix 的时间无关；1 点到当天 fix 之间暂停申购赎回
+//! - 用户调用 claim 领取份额（可以分几次领取已成交的部分）；赎回人要等这一期的赎回资产卖完才能领取 USDC
 //!
 //! 原型限制（上主网前必须替换）：
 //! - 价格来自 MockOracle（管理员手动设置两个价格：BTC/USD 信号价格、cbBTC/USD 估值价格），
@@ -28,6 +29,7 @@ declare_id!("3E8fFGuHJnrKDyPH7ZXdkffq4CKryaHovizg4yUH1jNs"); // anchor keys sync
 
 const _: () = assert!(logic::MAX_WINDOW == 64);
 const _: () = assert!(logic::MAX_SLICES == 8);
+const _: () = assert!(logic::MAX_PENDING == 8);
 
 #[program]
 pub mod tide {
@@ -152,7 +154,11 @@ pub mod tide {
         let epoch = &mut ctx.accounts.epoch_record;
         let mut t = ticket.to_logic();
         let mut r = epoch.to_logic();
-        let (shares, usdc) = logic::claim(&mut t, &mut r).map_err(map_err)?;
+        let logic::ClaimOutcome {
+            shares,
+            payout_usdc,
+            refund_usdc,
+        } = logic::claim(&mut t, &mut r).map_err(map_err)?;
         epoch.set_unclaimed(&r);
         ticket.set_from_logic(&t);
 
@@ -173,20 +179,26 @@ pub mod tide {
                 shares,
             )?;
         }
-        if usdc > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    Transfer {
-                        from: ctx.accounts.payout_vault.to_account_info(),
-                        to: ctx.accounts.user_usdc.to_account_info(),
-                        authority: ctx.accounts.fund.to_account_info(),
-                    },
-                    signer,
-                ),
-                usdc,
-            )?;
-        }
+        let tp = ctx.accounts.token_program.to_account_info();
+        let fund_ai = ctx.accounts.fund.to_account_info();
+        let user_usdc = ctx.accounts.user_usdc.to_account_info();
+        // 赎回款从待领取账户，申购退款从申购托管
+        fund_transfer(
+            &tp,
+            &fund_ai,
+            signer,
+            ctx.accounts.payout_vault.to_account_info(),
+            user_usdc.clone(),
+            payout_usdc,
+        )?;
+        fund_transfer(
+            &tp,
+            &fund_ai,
+            signer,
+            ctx.accounts.subscription_escrow.to_account_info(),
+            user_usdc,
+            refund_usdc,
+        )?;
         Ok(())
     }
 
@@ -206,7 +218,8 @@ pub mod tide {
         let cfg = fund_cfg.to_logic();
         let mut st = ctx.accounts.fund.state.to_logic();
         let caller = fund_cfg.caller(&ctx.accounts.cranker.key());
-        let record = logic::fix(&mut st, now, &prices, caller, &cfg).map_err(map_err)?;
+        let logic::FixOutcome { record, fee_usdc } =
+            logic::fix(&mut st, now, &prices, caller, &cfg).map_err(map_err)?;
 
         let admin = ctx.accounts.fund.admin;
         let fund_bump = ctx.accounts.fund.bump;
@@ -214,23 +227,30 @@ pub mod tide {
         let fund_signer = &[fund_seeds];
         let tp = ctx.accounts.token_program.to_account_info();
         let fund_ai = ctx.accounts.fund.to_account_info();
-
-        // 1) 申购款从托管账户转入主账户
-        if record.subscription_usdc > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    tp.clone(),
-                    Transfer {
-                        from: ctx.accounts.subscription_escrow.to_account_info(),
-                        to: ctx.accounts.usdc_vault.to_account_info(),
-                        authority: fund_ai.clone(),
-                    },
-                    fund_signer,
-                ),
-                record.subscription_usdc,
-            )?;
-        }
-        // 2) 销毁本期赎回的份额（用户申请赎回时已转入份额托管账户）
+        let escrow = ctx.accounts.subscription_escrow.to_account_info();
+        let vault = ctx.accounts.usdc_vault.to_account_info();
+        let payout = ctx.accounts.payout_vault.to_account_info();
+        // 1) 申购费从托管转入主账户；轧差的申购款转给赎回人；其余申购款留在托管里待成交
+        fund_transfer(
+            &tp,
+            &fund_ai,
+            fund_signer,
+            escrow.clone(),
+            vault.clone(),
+            fee_usdc,
+        )?;
+        fund_transfer(
+            &tp,
+            &fund_ai,
+            fund_signer,
+            escrow,
+            payout.clone(),
+            record.netted_usdc,
+        )?;
+        // 2) 赎回资产里的 USDC 转入待领取账户；cbBTC 留在 BTC 账户里，之后卖出
+        //    （轧差换给申购人的那部分 cbBTC 已经算进基金）
+        fund_transfer(&tp, &fund_ai, fund_signer, vault, payout, record.slice_usdc)?;
+        // 3) 销毁本期赎回的份额（用户申请赎回时已转入份额托管账户）
         if record.redemption_shares > 0 {
             token::burn(
                 CpiContext::new_with_signer(
@@ -245,7 +265,7 @@ pub mod tide {
                 record.redemption_shares,
             )?;
         }
-        // 3) 为本期申购发行新份额，放在份额托管账户，等用户领取
+        // 4) 为轧差的申购发行份额，放在份额托管账户，等用户领取
         if record.minted_shares > 0 {
             token::mint_to(
                 CpiContext::new_with_signer(
@@ -258,21 +278,6 @@ pub mod tide {
                     fund_signer,
                 ),
                 record.minted_shares,
-            )?;
-        }
-        // 4) 赎回资产里的 USDC 转入待领取账户；cbBTC 留在 BTC 账户里，由之后的交易卖出
-        if record.slice_usdc > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    tp.clone(),
-                    Transfer {
-                        from: ctx.accounts.usdc_vault.to_account_info(),
-                        to: ctx.accounts.payout_vault.to_account_info(),
-                        authority: fund_ai.clone(),
-                    },
-                    fund_signer,
-                ),
-                record.slice_usdc,
             )?;
         }
 
@@ -288,14 +293,14 @@ pub mod tide {
             signal_price: record.signal_price,
             valuation_price: record.valuation_price,
             moving_average: record.moving_average,
-            nav: record.nav,
             target_btc: record.target_btc,
         });
         Ok(())
     }
 
-    /// 一笔交易。卖出赎回资产时，slice_record 必须是 fund.state.slices[0] 那一期的记录；
-    /// 否则传 None。
+    /// 一笔交易（或一次不交易的申购成交）。epoch_record 传最早一期未卖完的赎回资产的记录
+    /// （fund.state.slices[0].epoch）；没有赎回资产时传最早一期待成交申购的记录
+    /// （fund.state.pending[0].epoch）；都没有时不传。基金调仓用不到它。
     pub fn trade(ctx: Context<Trade>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let fund_cfg = ctx.accounts.fund.config;
@@ -315,73 +320,111 @@ pub mod tide {
         let fund_signer = &[fund_seeds];
         let tp = ctx.accounts.token_program.to_account_info();
         let fund_ai = ctx.accounts.fund.to_account_info();
-
-        // 原型：模拟交易所按与 min_out 相同的最新估值价格成交并收手续费
-        let price = prices.valuation;
-        let market = &ctx.accounts.market;
-        let m_auth = market.authority;
-        let m_bump = market.bump;
-        let m_seeds: &[&[u8]] = &[b"market", m_auth.as_ref(), &[m_bump]];
-        let m_signer = &[m_seeds];
-        // 卖出赎回资产的所得直接进入待领取账户，不经过基金主账户
-        let slice_epoch = plan.bucket.slice_epoch();
-        let usdc_dest = match slice_epoch {
-            Some(_) => ctx.accounts.payout_vault.to_account_info(),
-            None => ctx.accounts.usdc_vault.to_account_info(),
+        // 买入用的 USDC：申购的从申购托管出，基金的从主账户出。
+        // 卖出所得：赎回资产的进待领取账户，基金的进主账户。
+        let usdc_source = match plan.bucket {
+            logic::TradeBucket::Subscription { .. } => {
+                ctx.accounts.subscription_escrow.to_account_info()
+            }
+            _ => ctx.accounts.usdc_vault.to_account_info(),
         };
-        let (fund_from, mkt_to, mkt_from, fund_to) = match plan.side {
-            logic::Side::BuyBtc => (
-                ctx.accounts.usdc_vault.to_account_info(),
-                ctx.accounts.market_usdc.to_account_info(),
-                ctx.accounts.market_btc.to_account_info(),
-                ctx.accounts.btc_vault.to_account_info(),
-            ),
-            logic::Side::SellBtc => (
-                ctx.accounts.btc_vault.to_account_info(),
-                ctx.accounts.market_btc.to_account_info(),
-                ctx.accounts.market_usdc.to_account_info(),
-                usdc_dest,
-            ),
+        let usdc_dest = match plan.bucket {
+            logic::TradeBucket::Slice { .. } => ctx.accounts.payout_vault.to_account_info(),
+            _ => ctx.accounts.usdc_vault.to_account_info(),
         };
-        let got = logic::market_fill(&plan, price, market.fee_bps).map_err(map_err)?;
-        token::transfer(
-            CpiContext::new_with_signer(
-                tp.clone(),
-                Transfer {
-                    from: fund_from,
-                    to: mkt_to,
-                    authority: fund_ai.clone(),
-                },
-                fund_signer,
-            ),
-            plan.amount_in,
-        )?;
-        token::transfer(
-            CpiContext::new_with_signer(
-                tp.clone(),
-                Transfer {
-                    from: mkt_from,
-                    to: fund_to,
-                    authority: market.to_account_info(),
-                },
-                m_signer,
-            ),
-            got,
-        )?;
+        let got = match plan.side {
+            // 目标为 USDC：申购款直接进入基金，不经过交易所
+            logic::Side::WithoutTrade => {
+                fund_transfer(
+                    &tp,
+                    &fund_ai,
+                    fund_signer,
+                    usdc_source,
+                    ctx.accounts.usdc_vault.to_account_info(),
+                    plan.amount_in,
+                )?;
+                0
+            }
+            side => {
+                // 原型：模拟交易所按与 min_out 相同的最新估值价格成交并收手续费
+                let market = &ctx.accounts.market;
+                let m_auth = market.authority;
+                let m_seeds: &[&[u8]] = &[b"market", m_auth.as_ref(), &[market.bump]];
+                let (fund_from, mkt_to, mkt_from, fund_to) = if side == logic::Side::BuyBtc {
+                    (
+                        usdc_source,
+                        ctx.accounts.market_usdc.to_account_info(),
+                        ctx.accounts.market_btc.to_account_info(),
+                        ctx.accounts.btc_vault.to_account_info(),
+                    )
+                } else {
+                    (
+                        ctx.accounts.btc_vault.to_account_info(),
+                        ctx.accounts.market_btc.to_account_info(),
+                        ctx.accounts.market_usdc.to_account_info(),
+                        usdc_dest,
+                    )
+                };
+                let got =
+                    logic::market_fill(&plan, prices.valuation, market.fee_bps).map_err(map_err)?;
+                fund_transfer(
+                    &tp,
+                    &fund_ai,
+                    fund_signer,
+                    fund_from,
+                    mkt_to,
+                    plan.amount_in,
+                )?;
+                token::transfer(
+                    CpiContext::new_with_signer(
+                        tp.clone(),
+                        Transfer {
+                            from: mkt_from,
+                            to: fund_to,
+                            authority: market.to_account_info(),
+                        },
+                        &[m_seeds],
+                    ),
+                    got,
+                )?;
+                got
+            }
+        };
 
         // 校验成交并记账（成交不足 min_out 会让整笔交易回滚）
-        let mut record = ctx.accounts.slice_record.as_ref().map(|acc| acc.to_logic());
-        logic::fill_trade(&mut st, &plan, got, now, record.as_mut()).map_err(map_err)?;
-        if let (Some(acc), Some(r)) = (ctx.accounts.slice_record.as_mut(), record) {
+        let mut record = ctx.accounts.epoch_record.as_ref().map(|acc| acc.to_logic());
+        let minted =
+            logic::fill_trade(&mut st, &plan, got, now, record.as_mut()).map_err(map_err)?;
+        if let (Some(acc), Some(r)) = (ctx.accounts.epoch_record.as_mut(), record) {
             acc.set_from_logic(&r);
+        }
+        // 申购成交发行的份额放在份额托管账户，等申购人领取
+        if minted > 0 {
+            token::mint_to(
+                CpiContext::new_with_signer(
+                    tp.clone(),
+                    MintTo {
+                        mint: ctx.accounts.share_mint.to_account_info(),
+                        to: ctx.accounts.share_escrow.to_account_info(),
+                        authority: fund_ai.clone(),
+                    },
+                    fund_signer,
+                ),
+                minted,
+            )?;
         }
         ctx.accounts.fund.state = StateData::from_logic(&st);
 
         emit!(Traded {
-            buy_btc: plan.side == logic::Side::BuyBtc,
+            side: match plan.side {
+                logic::Side::BuyBtc => TradeSide::BuyBtc,
+                logic::Side::SellBtc => TradeSide::SellBtc,
+                logic::Side::WithoutTrade => TradeSide::WithoutTrade,
+            },
             amount_in: plan.amount_in,
             amount_out: got,
-            slice_epoch,
+            record_epoch: plan.bucket.record_epoch(),
+            minted_shares: minted,
         });
         Ok(())
     }
@@ -428,6 +471,32 @@ pub mod tide {
         ctx.accounts.market.fee_bps = fee_bps;
         Ok(())
     }
+}
+
+/// 由基金 PDA 签名的代币转账；数量为 0 时跳过
+fn fund_transfer<'info>(
+    token_program: &AccountInfo<'info>,
+    fund: &AccountInfo<'info>,
+    signer: &[&[&[u8]]],
+    from: AccountInfo<'info>,
+    to: AccountInfo<'info>,
+    amount: u64,
+) -> Result<()> {
+    if amount == 0 {
+        return Ok(());
+    }
+    token::transfer(
+        CpiContext::new_with_signer(
+            token_program.clone(),
+            Transfer {
+                from,
+                to,
+                authority: fund.clone(),
+            },
+            signer,
+        ),
+        amount,
+    )
 }
 
 /// 读取模拟预言机的两个价格（信号、估值）及发布时间，检查非零且不超过 max_staleness_secs
@@ -511,6 +580,12 @@ pub struct SliceData {
     pub usdc: u64,
 }
 
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, Debug, Default)]
+pub struct PendingData {
+    pub epoch: u64,
+    pub usdc: u64,
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, Debug)]
 pub struct StateData {
     pub usdc: u64,
@@ -527,6 +602,8 @@ pub struct StateData {
     pub epoch: u64,
     pub slices: [SliceData; 8], // 必须等于 fund_logic::MAX_SLICES
     pub slice_count: u8,
+    pub pending: [PendingData; 8], // 必须等于 fund_logic::MAX_PENDING
+    pub pending_count: u8,
 }
 
 impl StateData {
@@ -550,6 +627,11 @@ impl StateData {
                 usdc: x.usdc,
             }),
             slice_count: s.slice_count,
+            pending: s.pending.map(|x| PendingData {
+                epoch: x.epoch,
+                usdc: x.usdc,
+            }),
+            pending_count: s.pending_count,
         }
     }
     fn to_logic(&self) -> logic::FundState {
@@ -572,6 +654,11 @@ impl StateData {
                 usdc: x.usdc,
             }),
             slice_count: self.slice_count,
+            pending: self.pending.map(|x| logic::Pending {
+                epoch: x.epoch,
+                usdc: x.usdc,
+            }),
+            pending_count: self.pending_count,
         }
     }
 }
@@ -598,6 +685,7 @@ pub struct Ticket {
     pub epoch: u64,
     pub subscription_usdc: u64,
     pub redemption_shares: u64,
+    pub shares_claimed: u64,
     pub bump: u8,
 }
 
@@ -607,12 +695,14 @@ impl Ticket {
             epoch: self.epoch,
             subscription_usdc: self.subscription_usdc,
             redemption_shares: self.redemption_shares,
+            shares_claimed: self.shares_claimed,
         }
     }
     fn set_from_logic(&mut self, t: &logic::Ticket) {
         self.epoch = t.epoch;
         self.subscription_usdc = t.subscription_usdc;
         self.redemption_shares = t.redemption_shares;
+        self.shares_claimed = t.shares_claimed;
     }
 }
 
@@ -625,9 +715,12 @@ pub struct EpochRecord {
     pub signal_price: u64,
     pub valuation_price: u64,
     pub moving_average: u64,
-    pub nav: u128,
     pub subscription_usdc: u64,
     pub minted_shares: u64,
+    pub subscription_filled: bool,
+    pub netted_usdc: u64,
+    pub netted_btc: u64,
+    pub refund_usdc: u64,
     pub redemption_shares: u64,
     pub slice_usdc: u64,
     pub slice_btc: u64,
@@ -638,6 +731,7 @@ pub struct EpochRecord {
     pub unclaimed_shares: u64,
     pub unclaimed_redemption_shares: u64,
     pub unclaimed_payout_usdc: u64,
+    pub unclaimed_refund_usdc: u64,
     pub bump: u8,
 }
 
@@ -648,9 +742,12 @@ impl EpochRecord {
         self.signal_price = r.signal_price;
         self.valuation_price = r.valuation_price;
         self.moving_average = r.moving_average;
-        self.nav = r.nav;
         self.subscription_usdc = r.subscription_usdc;
         self.minted_shares = r.minted_shares;
+        self.subscription_filled = r.subscription_filled;
+        self.netted_usdc = r.netted_usdc;
+        self.netted_btc = r.netted_btc;
+        self.refund_usdc = r.refund_usdc;
         self.redemption_shares = r.redemption_shares;
         self.slice_usdc = r.slice_usdc;
         self.slice_btc = r.slice_btc;
@@ -664,6 +761,7 @@ impl EpochRecord {
         self.unclaimed_shares = r.unclaimed_shares;
         self.unclaimed_redemption_shares = r.unclaimed_redemption_shares;
         self.unclaimed_payout_usdc = r.unclaimed_payout_usdc;
+        self.unclaimed_refund_usdc = r.unclaimed_refund_usdc;
     }
     fn to_logic(&self) -> logic::EpochRecord {
         logic::EpochRecord {
@@ -672,9 +770,12 @@ impl EpochRecord {
             signal_price: self.signal_price,
             valuation_price: self.valuation_price,
             moving_average: self.moving_average,
-            nav: self.nav,
             subscription_usdc: self.subscription_usdc,
             minted_shares: self.minted_shares,
+            subscription_filled: self.subscription_filled,
+            netted_usdc: self.netted_usdc,
+            netted_btc: self.netted_btc,
+            refund_usdc: self.refund_usdc,
             redemption_shares: self.redemption_shares,
             slice_usdc: self.slice_usdc,
             slice_btc: self.slice_btc,
@@ -685,6 +786,7 @@ impl EpochRecord {
             unclaimed_shares: self.unclaimed_shares,
             unclaimed_redemption_shares: self.unclaimed_redemption_shares,
             unclaimed_payout_usdc: self.unclaimed_payout_usdc,
+            unclaimed_refund_usdc: self.unclaimed_refund_usdc,
         }
     }
 }
@@ -727,16 +829,23 @@ pub struct Fixed {
     pub signal_price: u64,
     pub valuation_price: u64,
     pub moving_average: u64,
-    pub nav: u128,
     pub target_btc: bool,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug)]
+pub enum TradeSide {
+    BuyBtc,
+    SellBtc,
+    WithoutTrade, // 目标为 USDC 时申购款直接进入基金
 }
 
 #[event]
 pub struct Traded {
-    pub buy_btc: bool,
+    pub side: TradeSide,
     pub amount_in: u64,
     pub amount_out: u64,
-    pub slice_epoch: Option<u64>, // 卖出的是哪一期的赎回资产；基金调仓为 None
+    pub record_epoch: Option<u64>, // 服务哪一期的赎回资产或申购；基金调仓为 None
+    pub minted_shares: u64,        // 申购成交发行的份额
 }
 
 // ----------------------------------------------------------------------
@@ -876,6 +985,8 @@ pub struct Claim<'info> {
     pub share_escrow: Box<Account<'info, TokenAccount>>,
     #[account(mut, seeds = [b"payout_vault", fund.key().as_ref()], bump)]
     pub payout_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [b"subscription_escrow", fund.key().as_ref()], bump)]
+    pub subscription_escrow: Box<Account<'info, TokenAccount>>,
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
@@ -929,10 +1040,16 @@ pub struct Trade<'info> {
     pub btc_vault: Box<Account<'info, TokenAccount>>,
     #[account(mut, seeds = [b"payout_vault", fund.key().as_ref()], bump)]
     pub payout_vault: Box<Account<'info, TokenAccount>>,
-    /// 最早一期未卖完的赎回资产的记录（fund.state.slices[0].epoch）；没有赎回资产时不传。
+    #[account(mut, seeds = [b"subscription_escrow", fund.key().as_ref()], bump)]
+    pub subscription_escrow: Box<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [b"share_escrow", fund.key().as_ref()], bump)]
+    pub share_escrow: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = fund.share_mint)]
+    pub share_mint: Box<Account<'info, Mint>>,
+    /// 最早一期未卖完的赎回资产的记录，没有时传最早一期待成交申购的记录（见 trade）。
     /// 期号由 fund-logic 校验，这里校验它属于这个基金。
-    #[account(mut, has_one = fund @ FundErrorCode::WrongSliceRecord)]
-    pub slice_record: Option<Box<Account<'info, EpochRecord>>>,
+    #[account(mut, has_one = fund @ FundErrorCode::WrongEpochRecord)]
+    pub epoch_record: Option<Box<Account<'info, EpochRecord>>>,
     pub token_program: Program<'info, Token>,
 }
 
@@ -994,8 +1111,6 @@ pub enum FundErrorCode {
     BadPrice,
     #[msg("预言机价格过旧")]
     StalePrice,
-    #[msg("基金有份额但资产为零")]
-    FundWiped,
     #[msg("成交少于最低可接受数量")]
     SlippageExceeded,
     #[msg("配置无效")]
@@ -1034,8 +1149,8 @@ pub enum FundErrorCode {
     DepegBlocksBuy,
     #[msg("这一期的赎回资产还没卖完")]
     SliceNotSold,
-    #[msg("赎回资产的期记录不对")]
-    WrongSliceRecord,
+    #[msg("传入的期记录与这一步不符")]
+    WrongEpochRecord,
     #[msg("未卖完的赎回资产太多，先卖出再定价")]
     TooManySlices,
     #[msg("已过今天的定价时刻、还没定价，基金调仓等待定价")]
@@ -1050,7 +1165,6 @@ fn map_err(e: logic::FundError) -> Error {
         E::TooEarly => FundErrorCode::TooEarly,
         E::AlreadySettled => FundErrorCode::AlreadySettled,
         E::BadPrice => FundErrorCode::BadPrice,
-        E::FundWiped => FundErrorCode::FundWiped,
         E::SlippageExceeded => FundErrorCode::SlippageExceeded,
         E::InvalidConfig => FundErrorCode::InvalidConfig,
         E::Overflow => FundErrorCode::Overflow,
@@ -1065,7 +1179,7 @@ fn map_err(e: logic::FundError) -> Error {
         E::TradeTooSoon => FundErrorCode::TradeTooSoon,
         E::DepegBlocksBuy => FundErrorCode::DepegBlocksBuy,
         E::SliceNotSold => FundErrorCode::SliceNotSold,
-        E::WrongSliceRecord => FundErrorCode::WrongSliceRecord,
+        E::WrongEpochRecord => FundErrorCode::WrongEpochRecord,
         E::TooManySlices => FundErrorCode::TooManySlices,
         E::FixPending => FundErrorCode::FixPending,
         E::KeeperOnly => FundErrorCode::KeeperOnly,

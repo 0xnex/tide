@@ -100,7 +100,8 @@ async function main() {
   const intervalMs = f.config.minTradeIntervalSecs.toNumber() * 1000;
   for (;;) {
     const s = (await program.account.fund.fetch(fund)).state;
-    const sliceRecord = s.sliceCount > 0 ? epochPda(s.slices[0].epoch) : null;
+    // 最早一期未卖完的赎回资产的记录；没有时用最早一期待成交申购的记录
+    const recordEpoch = s.sliceCount > 0 ? s.slices[0].epoch : s.pendingCount > 0 ? s.pending[0].epoch : null;
     await postPrice();
     try {
       const sig = await program.methods
@@ -115,7 +116,10 @@ async function main() {
           usdcVault: fundPda("usdc_vault"),
           btcVault: fundPda("btc_vault"),
           payoutVault: fundPda("payout_vault"),
-          sliceRecord,
+          subscriptionEscrow: fundPda("subscription_escrow"),
+          shareEscrow: fundPda("share_escrow"),
+          shareMint,
+          epochRecord: recordEpoch === null ? null : epochPda(recordEpoch),
         })
         .rpc();
       console.log(`交易完成：${sig}`);
