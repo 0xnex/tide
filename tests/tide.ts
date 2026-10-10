@@ -10,6 +10,7 @@
 //   第 5 天：Alice 再申购；BTC 高于均线，但 cbBTC 比 BTC 低 3%（脱锚）-> 不买入，申购款留在托管里
 //   第 6 天：恢复锚定 -> 为 Alice 买入 cbBTC，她领到份额
 //   治理：配置修改等 48 小时时间锁；申购可以立即暂停，赎回不受影响；只有管理员能操作
+//   申购上限：算上待成交的申购，超过就拒绝；撤销待成交申购退回 USDC、腾出额度
 //   回填：某天没人定价，第二天任何人用那天 01:00 发布的价格回填均线，只能回填一次
 //   第 7 天：排队从不关闭。定价时刻之后的请求进入下一期，每个用户每期一张排队记录；
 //            关闭这一期的定价时刻之前可以撤销、全额退回，之后被拒绝
@@ -41,6 +42,7 @@ const FIX_OFFSET = 3_600; // UTC 01:00
 const TRADE_INTERVAL = 60;
 const KEEPER_WINDOW = 1_800; // 01:00–01:30 只有清算地址能驱动结算
 const PUBLIC_SLIPPAGE_BPS = 10; // 窗口之后其他人的滑点上限
+const SUBSCRIPTION_CAP = 5_000; // 申购上限（USDC），比默认的 100 万小，方便测试
 const MARKET_FEE_BPS = 18; // 模拟交易所的手续费：0.075% 手续费 + 约 0.1% 滑点
 const usd = (x: number) => new BN(Math.round(x * USDC)); // 价格单位：微美元
 
@@ -308,6 +310,24 @@ describe("tide", () => {
     return epoch;
   }
 
+  async function cancelPending(user: Keypair, userUsdc: PublicKey, epoch: number) {
+    await program.methods
+      .cancelPending()
+      .accountsPartial({
+        user: user.publicKey,
+        fund,
+        ticket: ticketPda(user.publicKey, epoch),
+        epochRecord: await recordFor(epoch),
+        shareMint,
+        userShares: getAssociatedTokenAddressSync(shareMint, user.publicKey),
+        userUsdc,
+        subscriptionEscrow: fundPda("subscription_escrow"),
+        shareEscrow: fundPda("share_escrow"),
+      })
+      .signers([user])
+      .rpc();
+  }
+
   async function cancel(user: Keypair, userUsdc: PublicKey, epoch: number) {
     await program.methods
       .cancel()
@@ -378,6 +398,7 @@ describe("tide", () => {
         keeperWindowSecs: new BN(KEEPER_WINDOW),
         publicSlippageBps: PUBLIC_SLIPPAGE_BPS,
         withdrawalFeeBps: 100,
+        subscriptionCapUsdc: new BN(SUBSCRIPTION_CAP * USDC),
         maxStalenessSecs: new BN(600),
         keeper: admin.publicKey, // 清算地址：这里就是管理员钱包
         feeAddress: manager.publicKey,
@@ -673,5 +694,62 @@ describe("tide", () => {
     // 前一天同样没人定价，但预言机现在的价格不是那天定价窗口内发布的，不能用来回填
     await setPrice(58_000);
     expect(await errorName(backfill(missed - 1, alice))).to.equal("PriceNotAtFixTime");
+  });
+
+  it("申购上限算上待成交的申购；撤销待成交申购退回没成交的 USDC、领走已成交的份额", async () => {
+    const escrow = fundPda("subscription_escrow");
+    const state = async () => (await program.account.fund.fetch(fund)).state;
+    // 还没买完的申购：排队的（含下一期）加上待成交的
+    const outstanding = async () => {
+      const st = await state();
+      const pending = st.pending.slice(0, st.pendingCount).reduce((x, p) => x + p.usdc.toNumber(), 0);
+      return st.queuedSubscriptionUsdc.toNumber() + st.nextSubscriptionUsdc.toNumber() + pending;
+    };
+
+    // Bob 申购 3000（之前没定价的几期也顺延进这次定价）；价格高于均线，每笔最多 1000 USDC：
+    // 交易到这一期买进第一笔为止
+    const bobBefore = await tokenBalance(bobUsdc);
+    const epoch = await subscribe(bob, bobUsdc, 3_000 * USDC);
+    await fixDay(56_000);
+    const recordAddr = await recordFor(epoch);
+    const record = () => program.account.epochRecord.fetch(recordAddr);
+    const unfilled = async () => {
+      const st = await state();
+      const r = await record();
+      return st.pending.slice(0, st.pendingCount).find((p) => p.epoch.eq(r.epoch))!.usdc.toNumber();
+    };
+    const start = await unfilled();
+    while ((await unfilled()) === start) {
+      await warpTo(now + TRADE_INTERVAL);
+      expect(await trade()).to.equal(null);
+    }
+
+    // 待成交的算进上限：Alice 多 1 USDC 就被拒绝
+    const room = SUBSCRIPTION_CAP * USDC - (await outstanding());
+    expect(await errorName(subscribe(alice, aliceUsdc, room + 1))).to.equal("SubscriptionCapExceeded");
+
+    // Bob 随时可以撤销待成交申购：按他占这一期申购额的比例，领走已成交的份额、退回没成交的 USDC
+    const r = await record();
+    const part = 3_000n * BigInt(USDC);
+    const basis = BigInt(r.subscriptionUsdc.toString());
+    const left = BigInt(await unfilled());
+    const shares = (BigInt(r.mintedShares.toString()) * part) / basis;
+    const refund = (left * part) / basis;
+    expect(Number(shares)).to.be.greaterThan(0);
+    const bobShares = getAssociatedTokenAddressSync(shareMint, bob.publicKey);
+    const sharesBefore = await tokenBalance(bobShares);
+    const escrowBefore = await tokenBalance(escrow);
+    await cancelPending(bob, bobUsdc, epoch);
+    expect(await tokenBalance(bobUsdc)).to.equal(bobBefore - part + refund);
+    expect(await tokenBalance(escrow)).to.equal(escrowBefore - refund);
+    expect(await tokenBalance(bobShares)).to.equal(sharesBefore + shares);
+    expect(await context.banksClient.getAccount(ticketPda(bob.publicKey, epoch))).to.equal(null);
+    const after = await record();
+    expect(BigInt(after.cancelledSubscriptionUsdc.toString())).to.equal(part);
+
+    // 腾出额度之后 Alice 的申购可以进来
+    await warpTo(now + 1);
+    await subscribe(alice, aliceUsdc, room + 1);
+    expect(await outstanding()).to.be.at.most(SUBSCRIPTION_CAP * USDC);
   });
 });

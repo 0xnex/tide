@@ -6,7 +6,7 @@ Guidance for AI coding agents (and human contributors) working on this repositor
 
 `tide` is a Solana (Anchor) program for a pooled BTC fund. Users queue USDC subscriptions and share redemptions; at 01:00 UTC each day the fixing price is recorded and compared with the 50-day moving average. Settlement then sets aside the redemption slice, nets subscriptions against it, and rebalances the fund toward all-cbBTC (above the average) or all-USDC (below) through capped trades. Shares follow actual execution, never a USD valuation. Users then `claim` their shares or USDC. It is a **devnet prototype**: oracle and exchange are mocks.
 
-**Design in transition.** The target design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/` (decisions; 0005–0007 replace parts of 0002–0004). The invariants below describe that target design. Settlement already runs as a `fix` step plus capped `trade` steps, redeemers are paid what their redemption slice sells for, and subscriptions become shares by the asset they add. The 48-hour config timelock, the subscription pause, the moving-average backfill and the withdrawal fee are built. Until the rest of the migration lands, the signal still uses BTC/USD. Treat any difference between that code and these invariants as migration work to do, not as a rule to restore.
+**Design in transition.** The target design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/` (decisions; 0005–0007 replace parts of 0002–0004). The invariants below describe that target design. Settlement already runs as a `fix` step plus capped `trade` steps, redeemers are paid what their redemption slice sells for, and subscriptions become shares by the asset they add. The 48-hour config timelock, the subscription pause, the moving-average backfill, the withdrawal fee, the subscription cap and pending cancels are built. Until the rest of the migration lands, the signal still uses BTC/USD. Treat any difference between that code and these invariants as migration work to do, not as a rule to restore.
 
 ## Replies
 
@@ -81,7 +81,7 @@ These are easy to break when editing:
 - `StateData.prices` is `[u64; 64]` and `StateData.price_days` is `[i64; 64]`, both as **literals** (the IDL needs it). They must equal `fund_logic::MAX_WINDOW`; a compile-time assertion enforces this.
 - `StateData.slices` is `[SliceData; 8]` and `StateData.pending` is `[PendingData; 8]`, literals mirroring `fund_logic::Slice` and `fund_logic::Pending`; they must equal `MAX_SLICES` and `MAX_PENDING` (compile-time assertions).
 - `Ticket` (program) mirrors `fund_logic::Ticket`, including `shares_claimed`.
-- `EpochRecord` (program) mirrors `fund_logic::EpochRecord`, including the four `unclaimed_*` fields. Update `set_from_logic`, `set_unclaimed`, and `to_logic`.
+- `EpochRecord` (program) mirrors `fund_logic::EpochRecord`, including the five `unclaimed_*` fields and the two `cancelled_*` fields. Update `set_from_logic`, `set_unclaimed`, and `to_logic`.
 - Every `fund_logic::FundError` variant needs a matching `FundErrorCode` and an arm in `map_err`. The match is exhaustive, so the compiler will remind you.
 - `ConfigData` has three extra fields checked in the program, not in `fund-logic`: `max_staleness_secs`, `keeper` (mapped to `fund_logic::Caller`) and `fee_address` (where `collect_fees` sends the withdrawal fee).
 

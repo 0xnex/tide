@@ -2,7 +2,9 @@
 //!
 //! - 任何人随时用 USDC 申购、用份额赎回，排队从不关闭。每个请求属于关闭它的定价时刻那一期
 //!   （期号是那天的日期序号：01:00 之前提交的属于当天，之后的属于第二天）；
-//!   每个用户每期一张排队记录。关闭这一期的定价时刻之前可以 cancel，全额退回
+//!   每个用户每期一张排队记录。关闭这一期的定价时刻之前可以 cancel，全额退回；
+//!   定价之后还没成交完的申购随时可以 cancel_pending：退回没成交的 USDC，领走已成交的份额。
+//!   还没买完的申购（排队的加待成交的）最多 subscription_cap_usdc，赎回不设上限
 //! - 结算分多步（ADR 0001）。定价时刻后 keeper_window_secs 秒内只有清算地址（config.keeper）
 //!   能驱动，之后任何人都可以，但其他人的交易用更严的滑点上限：
 //!     fix：每天 UTC 1 点之后调用一次，记录 1 点的定价价格 -> 算 50 日均线和目标 ->
@@ -243,6 +245,50 @@ pub mod tide {
         ctx.accounts
             .ticket
             .close(ctx.accounts.user.to_account_info())
+    }
+
+    /// 撤销已定价、还没成交完的申购，任何时候都可以：没成交的 USDC 从申购托管退回，
+    /// 已成交、还没领取的份额从份额托管转给用户。epoch_record 同 claim
+    pub fn cancel_pending(ctx: Context<CancelPending>) -> Result<()> {
+        let fund = &mut ctx.accounts.fund;
+        let mut st = fund.state.to_logic();
+        let mut t = ctx.accounts.ticket.to_logic();
+        let mut r = ctx.accounts.epoch_record.to_logic();
+        let logic::PendingCancel {
+            shares,
+            refund_usdc,
+        } = logic::cancel_pending(&mut st, &mut t, &mut r).map_err(map_err)?;
+        fund.state = StateData::from_logic(&st);
+        ctx.accounts.epoch_record.set_from_logic(&r);
+        ctx.accounts.ticket.set_from_logic(&t);
+
+        let admin = ctx.accounts.fund.admin;
+        let seeds: &[&[u8]] = &[b"fund", admin.as_ref(), &[ctx.accounts.fund.bump]];
+        let signer = &[seeds];
+        let tp = ctx.accounts.token_program.to_account_info();
+        let fund_ai = ctx.accounts.fund.to_account_info();
+        fund_transfer(
+            &tp,
+            &fund_ai,
+            signer,
+            ctx.accounts.share_escrow.to_account_info(),
+            ctx.accounts.user_shares.to_account_info(),
+            shares,
+        )?;
+        fund_transfer(
+            &tp,
+            &fund_ai,
+            signer,
+            ctx.accounts.subscription_escrow.to_account_info(),
+            ctx.accounts.user_usdc.to_account_info(),
+            refund_usdc,
+        )?;
+        if t.is_empty() {
+            ctx.accounts
+                .ticket
+                .close(ctx.accounts.user.to_account_info())?;
+        }
+        Ok(())
     }
 
     /// epoch_record 传关闭这张排队记录那一期的定价记录：通常期号相同；
@@ -706,6 +752,7 @@ pub struct ConfigData {
     pub keeper_window_secs: i64,
     pub public_slippage_bps: u16,
     pub withdrawal_fee_bps: u16,
+    pub subscription_cap_usdc: u64,
     pub max_staleness_secs: i64, // 预言机价格最多允许多旧
     pub keeper: Pubkey,          // 清算地址：清算窗口内唯一能驱动结算的签名人
     pub fee_address: Pubkey, // 收费地址（管理人）：collect_fees 把取款费付到它的 USDC 关联代币账户
@@ -725,6 +772,7 @@ impl ConfigData {
             keeper_window_secs: self.keeper_window_secs,
             public_slippage_bps: self.public_slippage_bps,
             withdrawal_fee_bps: self.withdrawal_fee_bps,
+            subscription_cap_usdc: self.subscription_cap_usdc,
         }
     }
 
@@ -915,6 +963,8 @@ pub struct EpochRecord {
     pub unclaimed_redemption_shares: u64,
     pub unclaimed_payout_usdc: u64,
     pub unclaimed_refund_usdc: u64,
+    pub cancelled_subscription_usdc: u64,
+    pub cancelled_shares: u64,
     pub bump: u8,
 }
 
@@ -937,6 +987,8 @@ impl EpochRecord {
         self.payout_usdc = r.payout_usdc;
         self.slice_sold_out = r.slice_sold_out;
         self.target_btc = r.target_btc;
+        self.cancelled_subscription_usdc = r.cancelled_subscription_usdc;
+        self.cancelled_shares = r.cancelled_shares;
         self.set_unclaimed(r);
     }
     fn set_unclaimed(&mut self, r: &logic::EpochRecord) {
@@ -970,6 +1022,8 @@ impl EpochRecord {
             unclaimed_redemption_shares: self.unclaimed_redemption_shares,
             unclaimed_payout_usdc: self.unclaimed_payout_usdc,
             unclaimed_refund_usdc: self.unclaimed_refund_usdc,
+            cancelled_subscription_usdc: self.cancelled_subscription_usdc,
+            cancelled_shares: self.cancelled_shares,
         }
     }
 }
@@ -1177,6 +1231,40 @@ pub struct Cancel<'info> {
         constraint = ticket.owner == user.key() @ FundErrorCode::NotOwner
     )]
     pub ticket: Box<Account<'info, Ticket>>,
+    #[account(address = fund.share_mint)]
+    pub share_mint: Box<Account<'info, Mint>>,
+    #[account(
+        init_if_needed, payer = user,
+        associated_token::mint = share_mint, associated_token::authority = user
+    )]
+    pub user_shares: Box<Account<'info, TokenAccount>>,
+    #[account(mut, token::mint = fund.usdc_mint, token::authority = user)]
+    pub user_usdc: Box<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [b"subscription_escrow", fund.key().as_ref()], bump)]
+    pub subscription_escrow: Box<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [b"share_escrow", fund.key().as_ref()], bump)]
+    pub share_escrow: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CancelPending<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump)]
+    pub fund: Box<Account<'info, Fund>>,
+    #[account(
+        mut,
+        seeds = [b"ticket", fund.key().as_ref(), user.key().as_ref(), &ticket.epoch.to_le_bytes()],
+        bump = ticket.bump,
+        constraint = ticket.owner == user.key() @ FundErrorCode::NotOwner
+    )]
+    pub ticket: Box<Account<'info, Ticket>>,
+    /// 关闭这张排队记录那一期的定价记录；期号范围由 fund-logic 校验
+    #[account(mut, has_one = fund @ FundErrorCode::WrongEpochRecord)]
+    pub epoch_record: Box<Account<'info, EpochRecord>>,
     #[account(address = fund.share_mint)]
     pub share_mint: Box<Account<'info, Mint>>,
     #[account(
@@ -1446,6 +1534,8 @@ pub enum FundErrorCode {
     PriceAlreadyRecorded,
     #[msg("只能回填过去、最近 64 天内的一天")]
     BackfillOutOfRange,
+    #[msg("超过申购上限（算上待成交的申购）")]
+    SubscriptionCapExceeded,
 }
 
 fn map_err(e: logic::FundError) -> Error {
@@ -1479,6 +1569,7 @@ fn map_err(e: logic::FundError) -> Error {
         E::ConfigFieldFixed => FundErrorCode::ConfigFieldFixed,
         E::PriceAlreadyRecorded => FundErrorCode::PriceAlreadyRecorded,
         E::BackfillOutOfRange => FundErrorCode::BackfillOutOfRange,
+        E::SubscriptionCapExceeded => FundErrorCode::SubscriptionCapExceeded,
     };
     error!(code)
 }

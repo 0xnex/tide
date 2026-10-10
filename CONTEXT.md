@@ -39,7 +39,7 @@ The part of a subscription's USDC not yet filled; it earns no shares and stays t
 _Avoid_: Unfilled deposit, carry-over
 
 **Subscription cap** (申购上限):
-The maximum total USDC of subscriptions in one epoch (1M USDC), including pending subscriptions carried in; a request that would exceed it is rejected. Redemptions have no cap.
+The maximum USDC of subscriptions not yet bought (1M USDC): this epoch's queued subscriptions plus pending subscriptions carried in (and, between a fixing time and its fixing step, requests already queued for the next epoch). A request that would exceed it is rejected. Redemptions have no cap.
 
 **Cancellation** (撤销):
 Withdrawing a subscription or redemption before the fixing time that closes its epoch; after that, only a pending subscription can still be cancelled.

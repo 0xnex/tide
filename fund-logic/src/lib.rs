@@ -68,23 +68,24 @@ pub enum FundError {
     BelowMinSubscription,
     ZeroAmount,
     TooManyPrices,
-    PriceNotAtFixTime,    // 定价价格的发布时间不在定价窗口内
-    NothingToTrade,       // 没有需要交易的东西
-    TradeTooSoon,         // 距离上一笔交易不到 min_trade_interval_secs
-    DepegBlocksBuy,       // 需要买入 cbBTC，但 cbBTC 脱锚
-    SliceNotSold,         // 这一期的赎回资产还没卖完
-    WrongEpochRecord,     // 传入的期记录与交易计划不符
-    TooManySlices,        // 未卖完的赎回资产已有 MAX_SLICES 期
-    FixPending,           // 已过今天的定价时刻、还没定价，基金调仓等待定价
-    KeeperOnly,           // 清算窗口内只有清算地址能驱动结算
-    WrongEpoch,           // 排队记录不是这一刻开放的那一期
-    TooLateToCancel,      // 已过关闭这一期的定价时刻，不能再撤销
-    NothingToCancel,      // 排队记录是空的
-    SubscriptionsPaused,  // 管理员暂停了申购（赎回永远不能暂停）
-    TimelockNotElapsed,   // 配置提议还没过时间锁
-    ConfigFieldFixed,     // 定价时刻和均线窗口只能在创建时设定
-    PriceAlreadyRecorded, // 这一天已经有信号价格
-    BackfillOutOfRange,   // 只能回填过去、还在存储范围内（最近 MAX_WINDOW 天）的一天
+    PriceNotAtFixTime,       // 定价价格的发布时间不在定价窗口内
+    NothingToTrade,          // 没有需要交易的东西
+    TradeTooSoon,            // 距离上一笔交易不到 min_trade_interval_secs
+    DepegBlocksBuy,          // 需要买入 cbBTC，但 cbBTC 脱锚
+    SliceNotSold,            // 这一期的赎回资产还没卖完
+    WrongEpochRecord,        // 传入的期记录与交易计划不符
+    TooManySlices,           // 未卖完的赎回资产已有 MAX_SLICES 期
+    FixPending,              // 已过今天的定价时刻、还没定价，基金调仓等待定价
+    KeeperOnly,              // 清算窗口内只有清算地址能驱动结算
+    WrongEpoch,              // 排队记录不是这一刻开放的那一期
+    TooLateToCancel,         // 已过关闭这一期的定价时刻，不能再撤销
+    NothingToCancel,         // 排队记录是空的
+    SubscriptionsPaused,     // 管理员暂停了申购（赎回永远不能暂停）
+    TimelockNotElapsed,      // 配置提议还没过时间锁
+    SubscriptionCapExceeded, // 排队和待成交的申购加上这一笔会超过申购上限
+    ConfigFieldFixed,        // 定价时刻和均线窗口只能在创建时设定
+    PriceAlreadyRecorded,    // 这一天已经有信号价格
+    BackfillOutOfRange,      // 只能回填过去、还在存储范围内（最近 MAX_WINDOW 天）的一天
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +101,7 @@ pub struct Config {
     pub keeper_window_secs: i64,      // 定价时刻之后多少秒内只有清算地址能驱动结算
     pub public_slippage_bps: u16,     // 窗口之后其他人交易的滑点上限，比 max_slippage_bps 更严
     pub withdrawal_fee_bps: u16,      // 取款费率（领取赎回款时欠管理人），最多 1%
+    pub subscription_cap_usdc: u64,   // 申购上限：还没买完的申购（排队的加待成交的）最多这么多
 }
 
 impl Config {
@@ -117,6 +119,7 @@ impl Config {
             keeper_window_secs: 1_800,
             public_slippage_bps: 10,
             withdrawal_fee_bps: 100,
+            subscription_cap_usdc: 1_000_000_000_000, // 1,000,000 USDC
         }
     }
 
@@ -144,7 +147,9 @@ impl Config {
         {
             return Err(FundError::InvalidConfig);
         }
-        if self.withdrawal_fee_bps > MAX_WITHDRAWAL_FEE_BPS {
+        if self.withdrawal_fee_bps > MAX_WITHDRAWAL_FEE_BPS
+            || self.subscription_cap_usdc < self.min_subscription
+        {
             return Err(FundError::InvalidConfig);
         }
         Ok(())
@@ -230,6 +235,26 @@ impl FundState {
     pub fn oldest_pending(&self) -> Option<&Pending> {
         self.pending[..self.pending_count as usize].first()
     }
+
+    /// 还没买完的申购款：排队的（含下一期）加上各期待成交的
+    /// （u128 求和：最多 MAX_PENDING + 2 个 u64，不会溢出）
+    fn outstanding_subscription_usdc(&self) -> Result<u64, FundError> {
+        let pending: u128 = self.pending[..self.pending_count as usize]
+            .iter()
+            .map(|p| p.usdc as u128)
+            .sum();
+        to_u64(
+            pending + self.queued_subscription_usdc as u128 + self.next_subscription_usdc as u128,
+        )
+    }
+
+    /// 第 i 期待成交申购移出队列（全部成交或者所有人都撤销了），后面的往前挪
+    fn remove_pending(&mut self, i: usize) {
+        let n = self.pending_count as usize;
+        self.pending.copy_within(i + 1..n, i);
+        self.pending[n - 1] = Pending::default();
+        self.pending_count -= 1;
+    }
 }
 
 impl Default for FundState {
@@ -267,6 +292,10 @@ pub struct EpochRecord {
     pub unclaimed_redemption_shares: u64,
     pub unclaimed_payout_usdc: u64,
     pub unclaimed_refund_usdc: u64,
+    // 撤销了待成交申购的人：他们的申购额，和撤销时一次领走的已成交份额。
+    // 留下的人按 (minted_shares − cancelled_shares) × 本人申购额 ÷ (subscription_usdc − cancelled_subscription_usdc) 领取
+    pub cancelled_subscription_usdc: u64,
+    pub cancelled_shares: u64,
 }
 
 impl EpochRecord {
@@ -659,6 +688,11 @@ pub fn request_subscription(
     if s.subscriptions_paused {
         return Err(FundError::SubscriptionsPaused);
     }
+    // 上限算上之前几期留下的待成交申购：每天要买的 cbBTC 有上限。赎回不设上限。
+    let after = (s.outstanding_subscription_usdc()? as u128) + amount as u128;
+    if after > cfg.subscription_cap_usdc as u128 {
+        return Err(FundError::SubscriptionCapExceeded);
+    }
     enqueue(s, t, amount, 0, now_unix, cfg)
 }
 
@@ -778,6 +812,102 @@ pub fn claim(
     Ok(out)
 }
 
+/// 留下的申购人共有的 (已发行份额, 申购额)：去掉撤销了待成交申购的人
+fn remaining_subscription_pool(r: &EpochRecord) -> Result<(u64, u64), FundError> {
+    Ok((
+        r.minted_shares
+            .checked_sub(r.cancelled_shares)
+            .ok_or(FundError::Overflow)?,
+        r.subscription_usdc
+            .checked_sub(r.cancelled_subscription_usdc)
+            .ok_or(FundError::Overflow)?,
+    ))
+}
+
+/// 撤销待成交申购的结果：外层从份额托管转出 shares，从申购托管退回 refund_usdc。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingCancel {
+    pub shares: u64,      // 已成交、还没领取的份额
+    pub refund_usdc: u64, // 没成交的申购款
+}
+
+/// 撤销已定价、还没成交完的申购，任何时候都可以（比如长时间脱锚买不了 cbBTC）。
+/// 这个人离开这一期的申购：已成交的份额按比例一次领走，没成交的 USDC 按比例退回，
+/// 都向下取整；最后一个撤销的人拿走剩下的全部，不留尘埃。
+/// 留下的人每份申购额对应的份额和待成交 USDC 不减少（取整都对他们有利），之后的成交只归他们。
+/// 待成交的 USDC 已经扣过申购费：申购费在定价时进了基金，撤销不退。
+/// 同一张排队记录里的赎回不受影响。还没定价的排队记录用 cancel。
+pub fn cancel_pending(
+    s: &mut FundState,
+    t: &mut Ticket,
+    r: &mut EpochRecord,
+) -> Result<PendingCancel, FundError> {
+    if !r.covers(t.epoch) {
+        return Err(FundError::EpochNotSettled);
+    }
+    if t.subscription_usdc == 0 || r.subscription_filled {
+        return Err(FundError::NothingToCancel);
+    }
+    let n = s.pending_count as usize;
+    let i = s.pending[..n]
+        .iter()
+        .position(|p| p.epoch == r.epoch)
+        .ok_or(FundError::WrongEpochRecord)?;
+    let part = t.subscription_usdc;
+    let (minted, basis) = remaining_subscription_pool(r)?;
+    let unfilled = s.pending[i].usdc;
+    let last = part == basis;
+    let (entitled, refund_usdc) = if last {
+        (minted, unfilled)
+    } else {
+        (
+            pro_rata(minted, part, basis)?,
+            pro_rata(unfilled, part, basis)?,
+        )
+    };
+    let shares = entitled
+        .checked_sub(t.shares_claimed)
+        .ok_or(FundError::Overflow)?;
+
+    let mut rec = *r;
+    rec.cancelled_subscription_usdc = rec
+        .cancelled_subscription_usdc
+        .checked_add(part)
+        .ok_or(FundError::Overflow)?;
+    rec.cancelled_shares = rec
+        .cancelled_shares
+        .checked_add(entitled)
+        .ok_or(FundError::Overflow)?;
+    rec.unclaimed_shares = rec
+        .unclaimed_shares
+        .checked_sub(shares)
+        .ok_or(FundError::Overflow)?;
+    rec.unclaimed_subscription_usdc = rec
+        .unclaimed_subscription_usdc
+        .checked_sub(part)
+        .ok_or(FundError::Overflow)?;
+    if last {
+        // 没有人留下：这一期的申购结束，待成交的这一期移出队列
+        rec.subscription_filled = true;
+        s.remove_pending(i);
+    } else {
+        // 留下的人还有 unfilled − refund > 0（refund ≤ unfilled × part ÷ basis < unfilled）
+        s.pending[i].usdc = unfilled
+            .checked_sub(refund_usdc)
+            .ok_or(FundError::Overflow)?;
+    }
+    *r = rec;
+    t.subscription_usdc = 0;
+    t.shares_claimed = 0;
+    if t.is_empty() {
+        *t = Ticket::default();
+    }
+    Ok(PendingCancel {
+        shares,
+        refund_usdc,
+    })
+}
+
 /// 欠管理人的取款费全部结清：返回要从待领取账户付到收费地址的 USDC
 pub fn collect_fees(s: &mut FundState) -> u64 {
     std::mem::take(&mut s.fees_owed)
@@ -802,7 +932,8 @@ fn claim_parts(
     } else if sub_final && part == r.unclaimed_subscription_usdc {
         r.unclaimed_shares // 最后一位
     } else {
-        pro_rata(r.minted_shares, part, r.subscription_usdc)?
+        let (minted, basis) = remaining_subscription_pool(r)?;
+        pro_rata(minted, part, basis)?
             .checked_sub(t.shares_claimed)
             .ok_or(FundError::Overflow)?
     };
@@ -1033,6 +1164,8 @@ pub fn fix(
         unclaimed_redemption_shares: redemption_shares,
         unclaimed_payout_usdc: payout,
         unclaimed_refund_usdc: refund_usdc,
+        cancelled_subscription_usdc: 0,
+        cancelled_shares: 0,
     };
     n.last_fix_day = day;
     // 定价时刻之后提交的请求（下一期）由下一次定价处理
@@ -1304,10 +1437,7 @@ pub fn fill_trade(
                 s.pending[0].usdc = usdc_left;
             } else {
                 r.subscription_filled = true;
-                let n = s.pending_count as usize;
-                s.pending.copy_within(1..n, 0);
-                s.pending[n - 1] = Pending::default();
-                s.pending_count = (n - 1) as u8; // 有最早的一期，n ≥ 1
+                s.remove_pending(0); // 有最早的一期
             }
         }
     }
@@ -1487,6 +1617,17 @@ mod tests {
         fn claim(&mut self, t: &mut Ticket) -> Result<(u64, u64), FundError> {
             self.claim_split(t)
                 .map(|o| (o.shares, o.redeemer_usdc + o.fee_usdc + o.refund_usdc))
+        }
+
+        /// 撤销已定价、还没成交完的申购：退回没成交的 USDC，领走已成交的份额
+        fn cancel_pending(&mut self, t: &mut Ticket) -> Result<PendingCancel, FundError> {
+            let mut s = self.s.clone();
+            let r = self.covering(t.epoch).ok_or(FundError::EpochNotSettled)?;
+            let out = cancel_pending(&mut s, t, r)?;
+            self.s = s;
+            self.usdc_tokens -= out.refund_usdc;
+            self.assert_ledger();
+            Ok(out)
         }
 
         /// 结清取款费：从待领取账户付到收费地址
@@ -2149,6 +2290,173 @@ mod tests {
     }
 
     #[test]
+    fn subscriptions_are_capped_per_epoch_including_pending() {
+        let mut h = Harness::seeded(50_000 * USDC);
+        assert_eq!(h.c.subscription_cap_usdc, 1_000_000 * USDC);
+        let (mut ta, mut tb, mut holder) =
+            (Ticket::default(), Ticket::default(), Ticket::default());
+        h.subscribe(&mut holder, 1_000 * USDC, 9 * DAY);
+        h.settle_day(9, 51_000 * USDC, 0);
+        h.claim(&mut holder).unwrap();
+
+        // 一期最多 100 万 USDC：正好到上限可以，再多 1 USDC 被拒绝，状态不变
+        h.subscribe(&mut ta, 600_000 * USDC, 10 * DAY);
+        h.subscribe(&mut tb, 400_000 * USDC, 10 * DAY);
+        let before = h.s.clone();
+        let capped = Err(FundError::SubscriptionCapExceeded);
+        let mut tc = Ticket::default();
+        assert_eq!(
+            request_subscription(&mut h.s, &mut tc, USDC, 10 * DAY, &h.c),
+            capped
+        );
+        assert_eq!((h.s.clone(), tc), (before, Ticket::default()));
+        // 赎回不设上限
+        h.redeem(&mut holder, 100 * USDC, 10 * DAY);
+
+        // 脱锚，一笔都没买：这 100 万成为待成交申购，算进下一期的上限
+        let depeg = |day: i64| at_fix2(day, 51_000 * USDC, 49_000 * USDC);
+        h.fix_with(10 * DAY + ONE_AM, &depeg(10)).unwrap();
+        assert_eq!(
+            request_subscription(&mut h.s, &mut tc, USDC, 10 * DAY + 2 * ONE_AM, &h.c),
+            capped
+        );
+        // 撤销待成交申购之后腾出额度
+        assert_eq!(
+            h.cancel_pending(&mut tb).unwrap().refund_usdc,
+            400_000 * USDC
+        );
+        h.subscribe(&mut tc, 400_000 * USDC, 10 * DAY + 2 * ONE_AM);
+        assert_eq!(
+            request_subscription(&mut h.s, &mut tc, USDC, 10 * DAY + 2 * ONE_AM, &h.c),
+            capped
+        );
+    }
+
+    #[test]
+    fn the_cap_also_counts_requests_waiting_for_the_next_epoch() {
+        // 定价时刻之后、当天定价之前提交的属于下一期，但和这一期一起算上限
+        let mut h = Harness::seeded(50_000 * USDC);
+        h.c.subscription_cap_usdc = 1_000 * USDC;
+        h.subscribe(&mut Ticket::default(), 700 * USDC, 10 * DAY);
+        let late = 10 * DAY + 2 * ONE_AM;
+        let mut tb = Ticket::default();
+        h.subscribe(&mut tb, 300 * USDC, late);
+        assert_eq!(tb.epoch, 11);
+        assert_eq!(
+            request_subscription(&mut h.s, &mut Ticket::default(), USDC, late, &h.c),
+            Err(FundError::SubscriptionCapExceeded)
+        );
+        // 当天定价、全部成交（目标 USDC，不交易）之后，额度只剩第 11 期的 300
+        h.settle_day(10, 50_000 * USDC, 0);
+        h.subscribe(&mut Ticket::default(), 700 * USDC, late + 60);
+    }
+
+    #[test]
+    fn a_pending_cancel_refunds_the_unfilled_usdc_after_the_subscription_fee() {
+        let mut h = Harness::seeded(50_000 * USDC);
+        h.c.subscription_fee_bps = 100;
+        let mut ta = Ticket::default();
+        h.subscribe(&mut ta, 1_000 * USDC, 10 * DAY);
+        // 脱锚：一笔都买不了。申购费 10 USDC 在定价时进了基金，待成交 990
+        h.fix_with(
+            10 * DAY + ONE_AM,
+            &at_fix2(10, 51_000 * USDC, 49_000 * USDC),
+        )
+        .unwrap();
+        assert_eq!(h.s.usdc, 10 * USDC);
+        let out = h.cancel_pending(&mut ta).unwrap();
+        assert_eq!((out.shares, out.refund_usdc), (0, 990 * USDC));
+        assert_eq!(h.s.pending_count, 0);
+    }
+
+    #[test]
+    fn cancelling_a_pending_subscription_refunds_the_unfilled_part_and_keeps_filled_shares() {
+        let mut h = Harness::seeded(50_000 * USDC);
+        h.c.trade_cap_usdc = 1_000 * USDC;
+        let (mut ta, mut tb) = (Ticket::default(), Ticket::default());
+        h.subscribe(&mut ta, 1_500 * USDC, 10 * DAY);
+        h.subscribe(&mut tb, 500 * USDC, 10 * DAY);
+        h.fix_day(10, 51_000 * USDC);
+        let t0 = 10 * DAY + ONE_AM;
+        // 第一笔买 1000 USDC，发 1000 份；还有 1000 USDC 没成交
+        h.trade_at(t0, same(51_000 * USDC), 0).unwrap();
+        // A 领过一部分之后撤销：已成交的 3/4 份额全部给他，没成交的 1000 USDC 退回他那 3/4
+        assert_eq!(h.claim(&mut ta).unwrap(), (750 * USDC, 0));
+        let out = h.cancel_pending(&mut ta).unwrap();
+        assert_eq!(
+            out,
+            PendingCancel {
+                shares: 0,
+                refund_usdc: 750 * USDC
+            }
+        );
+        assert!(ta.is_empty());
+        assert_eq!(h.s.oldest_pending().map(|p| p.usdc), Some(250 * USDC));
+
+        // 之后买到的只归 B：他领到自己那 250 份加上剩下 250 USDC 买到的全部份额
+        let (plans, why, _) = h.trade_until_done(t0 + 60, same(50_000 * USDC), 0);
+        assert_eq!((plans.len(), why), (1, FundError::NothingToTrade));
+        let r = h.rec(10);
+        assert!(r.subscription_filled);
+        let (b, _) = h.claim(&mut tb).unwrap();
+        assert_eq!(b, r.minted_shares - 750 * USDC);
+        assert!(b > 500 * USDC);
+        assert_eq!(
+            (
+                h.rec(10).unclaimed_shares,
+                h.rec(10).unclaimed_subscription_usdc
+            ),
+            (0, 0)
+        );
+        assert_eq!(h.s.share_supply, 750 * USDC + b);
+    }
+
+    #[test]
+    fn the_last_pending_subscriber_to_cancel_takes_everything_left() {
+        let mut h = Harness::seeded(50_000 * USDC);
+        h.c.trade_cap_usdc = 1_000 * USDC;
+        let (mut ta, mut tb) = (Ticket::default(), Ticket::default());
+        h.subscribe(&mut ta, 1_001 * USDC, 10 * DAY);
+        h.subscribe(&mut tb, 2_002 * USDC + 1, 10 * DAY);
+        h.fix_day(10, 51_000 * USDC);
+        h.trade_at(10 * DAY + ONE_AM, same(51_000 * USDC), 0)
+            .unwrap();
+        // 两人都撤销：第二个是最后一位，拿走剩下的全部份额和 USDC，没有尘埃
+        let a = h.cancel_pending(&mut ta).unwrap();
+        let b = h.cancel_pending(&mut tb).unwrap();
+        let r = h.rec(10);
+        assert_eq!(a.shares + b.shares, r.minted_shares);
+        assert_eq!(
+            a.refund_usdc + b.refund_usdc,
+            3_003 * USDC + 1 - 1_000 * USDC
+        );
+        assert!(r.subscription_filled);
+        assert_eq!((r.unclaimed_shares, r.unclaimed_subscription_usdc), (0, 0));
+        assert_eq!(h.s.pending_count, 0);
+        assert_eq!(
+            h.trade_at(10 * DAY + ONE_AM + 60, same(51_000 * USDC), 0),
+            Err(FundError::NothingToTrade)
+        );
+    }
+
+    #[test]
+    fn only_a_pending_subscription_can_be_cancelled_after_its_fixing() {
+        let mut h = Harness::seeded(50_000 * USDC);
+        let (mut ta, mut tb) = (Ticket::default(), Ticket::default());
+        h.subscribe(&mut ta, 1_000 * USDC, 10 * DAY);
+        // 还没定价：用 cancel，不是 cancel_pending
+        assert_eq!(h.cancel_pending(&mut ta), Err(FundError::EpochNotSettled));
+        h.settle_day(10, 51_000 * USDC, 0);
+        // 已经全部成交：没有可撤销的，直接领取
+        assert_eq!(h.cancel_pending(&mut ta), Err(FundError::NothingToCancel));
+        h.claim(&mut ta).unwrap();
+        // 只有赎回的排队记录也没有可撤销的申购
+        h.redeem(&mut tb, 100 * USDC, 11 * DAY);
+        h.fix_day(11, 51_000 * USDC);
+        assert_eq!(h.cancel_pending(&mut tb), Err(FundError::NothingToCancel));
+    }
+
+    #[test]
     fn pausing_blocks_new_subscriptions_only() {
         let mut h = Harness::seeded(50_000 * USDC);
         let mut ta = Ticket::default();
@@ -2239,6 +2547,11 @@ mod tests {
                 withdrawal_fee_bps: 101,
                 ..cfg()
             },
+            // 申购上限不能低于最低申购金额
+            Config {
+                subscription_cap_usdc: USDC - 1,
+                ..cfg()
+            },
         ];
         for c in bad {
             assert_eq!(c.validate(), Err(FundError::InvalidConfig), "{c:?}");
@@ -2249,6 +2562,7 @@ mod tests {
         assert_eq!(cfg().keeper_window_secs, 1_800);
         assert_eq!(cfg().public_slippage_bps, 10);
         assert_eq!(cfg().withdrawal_fee_bps, 100);
+        assert_eq!(cfg().subscription_cap_usdc, 1_000_000 * USDC);
     }
 
     #[test]
@@ -3257,6 +3571,8 @@ mod tests {
         cancels: u32,
         cancels_rejected: u32,
         paused_rejections: u32,
+        pending_cancels: u32,
+        cap_rejections: u32,
     }
 
     /// 排队记录还没被定价处理
@@ -3273,6 +3589,8 @@ mod tests {
                 cancels: 0,
                 cancels_rejected: 0,
                 paused_rejections: 0,
+                pending_cancels: 0,
+                cap_rejections: 0,
             }
         }
 
@@ -3289,8 +3607,8 @@ mod tests {
             }
         }
 
-        /// 申购；暂停期间必须被拒绝、什么都不改
-        fn subscribe(&mut self, h: &mut Harness, u: usize, amount: u64, now: i64) {
+        /// 申购，返回是否接受；暂停期间或超过申购上限时必须被拒绝、什么都不改
+        fn subscribe(&mut self, h: &mut Harness, u: usize, amount: u64, now: i64) -> bool {
             if h.s.subscriptions_paused {
                 let before = h.s.clone();
                 let mut t = Ticket::default();
@@ -3298,10 +3616,21 @@ mod tests {
                 assert_eq!(got, Err(FundError::SubscriptionsPaused));
                 assert_eq!(h.s, before);
                 self.paused_rejections += 1;
-                return;
+                return false;
+            }
+            // 超过申购上限（算上待成交的）必须被拒绝、什么都不改
+            let outstanding = h.s.outstanding_subscription_usdc().unwrap();
+            if outstanding + amount > h.c.subscription_cap_usdc {
+                let before = h.s.clone();
+                let got = request_subscription(&mut h.s, &mut Ticket::default(), amount, now, &h.c);
+                assert_eq!(got, Err(FundError::SubscriptionCapExceeded));
+                assert_eq!(h.s, before);
+                self.cap_rejections += 1;
+                return false;
             }
             let i = self.ticket_at(h, u, now);
             h.subscribe(&mut self.tickets[u][i], amount, now);
+            true
         }
 
         fn redeem(&mut self, h: &mut Harness, u: usize, shares: u64, now: i64) {
@@ -3335,6 +3664,28 @@ mod tests {
                         }
                         Err(e) => panic!("cancel: {e:?}"),
                     }
+                }
+                self.tickets[u].retain(|t| !t.is_empty());
+            }
+        }
+
+        /// 随机撤销已定价、还没成交完的申购：已成交的份额回到用户手里，算进这一期领取的份额
+        fn random_pending_cancels(&mut self, h: &mut Harness, rng: &mut Rng) {
+            self.claimed.resize(h.records.len(), (0, 0));
+            for u in 0..self.tickets.len() {
+                for i in 0..self.tickets[u].len() {
+                    let t = self.tickets[u][i];
+                    if t.subscription_usdc == 0 || unfixed(&t, h) || rng.below(10) != 0 {
+                        continue;
+                    }
+                    let k = h.records.iter().position(|r| r.covers(t.epoch)).unwrap();
+                    if h.records[k].subscription_filled {
+                        continue;
+                    }
+                    let out = h.cancel_pending(&mut self.tickets[u][i]).unwrap();
+                    self.held[u] += out.shares;
+                    self.claimed[k].0 += out.shares;
+                    self.pending_cancels += 1;
                 }
                 self.tickets[u].retain(|t| !t.is_empty());
             }
@@ -3429,6 +3780,7 @@ mod tests {
     ///  - 没有手续费和滑点时，资产总值 = 所有用户的价值之和（误差只来自向下取整）
     #[test]
     fn random_simulation_invariants() {
+        let mut pending_cancels = 0;
         for seed in 1..=20u64 {
             let mut rng = Rng(seed);
             let mut h = Harness::seeded(50_000 * USDC);
@@ -3465,6 +3817,8 @@ mod tests {
                     Ok(_) | Err(FundError::TooManySlices) => {}
                     Err(e) => panic!("fix: {e:?}"),
                 }
+                // 定价之后、成交之前，有人撤销刚成为待成交的申购
+                users.random_pending_cancels(&mut h, &mut rng);
                 let p = MarketPrices {
                     signal: price,
                     valuation,
@@ -3480,6 +3834,7 @@ mod tests {
                     &mut tally,
                 );
                 users.claim_ready(&mut h);
+                users.random_pending_cancels(&mut h, &mut rng);
                 users.assert_share_supply(&h);
                 random_requests(&mut users, &mut h, &mut rng, fix_at + DAY - 2 * ONE_AM);
             }
@@ -3498,6 +3853,7 @@ mod tests {
             assert!(tally.keeper_only > 0 && tally.public_plans > 0, "{tally:?}");
             assert!(users.cancels > 0, "seed {seed}: 没有撤销");
             assert!(h.fees > 0, "seed {seed}: 没有收到取款费");
+            pending_cancels += users.pending_cancels;
             // 价值守恒：基金总资产 ≈ 用户份额价值之和（误差为取整尘埃），按估值价格计
             let assets = fund_value(&h.s, valuation);
             let supply = h.s.share_supply as u128;
@@ -3513,6 +3869,7 @@ mod tests {
                 assets - user_value
             );
         }
+        assert!(pending_cancels > 0, "没有撤销待成交申购");
     }
 
     /// 随机模拟：交易所收 0.25%（接近 0.3% 滑点上限），随机晚定价、随机脱锚、
@@ -3525,10 +3882,13 @@ mod tests {
         let (mut public_fixes, mut public_fixes_rejected) = (0, 0);
         let (mut late_cancels_rejected, mut cancels, mut paused_rejections) = (0, 0, 0);
         let (mut skipped_fixes, mut backfills) = (0, 0);
+        let (mut pending_cancels, mut cap_rejections) = (0, 0);
         for seed in 1..=20u64 {
             let mut rng = Rng(seed * 7919);
             let mut h = Harness::seeded(50_000 * USDC);
             h.c.trade_cap_usdc = 1_000 * USDC;
+            // 申购上限设得小一些（用户每笔最多 3,000），有时会被拒绝
+            h.c.subscription_cap_usdc = 6_000 * USDC;
             let mut users = Users::new(6);
             let mut price = 50_000 * USDC;
             let mut valuation = price;
@@ -3616,11 +3976,9 @@ mod tests {
                             late_cancels_rejected += 1;
                         }
                     }
-                    users.subscribe(&mut h, u, (1 + rng.below(1_000)) * USDC, t);
-                    assert!(
-                        h.s.subscriptions_paused
-                            || users.tickets[u].iter().any(|tk| tk.epoch == day as u64 + 1)
-                    );
+                    if users.subscribe(&mut h, u, (1 + rng.below(1_000)) * USDC, t) {
+                        assert!(users.tickets[u].iter().any(|tk| tk.epoch == day as u64 + 1));
+                    }
                     users.random_cancels(&mut h, &mut rng, t);
                     users.assert_share_supply(&h);
                 }
@@ -3679,11 +4037,14 @@ mod tests {
                     &mut tally,
                 );
                 users.claim_ready(&mut h);
+                users.random_pending_cancels(&mut h, &mut rng);
                 users.assert_share_supply(&h);
             }
             h.s.subscriptions_paused = false;
             users.drain(&mut h, 300, price);
             cancels += users.cancels;
+            pending_cancels += users.pending_cancels;
+            cap_rejections += users.cap_rejections;
             paused_rejections += users.paused_rejections;
             tally.netted += h.records.iter().filter(|r| r.netted_btc > 0).count();
         }
@@ -3717,6 +4078,10 @@ mod tests {
         assert!(
             skipped_fixes > 0 && backfills > 0,
             "{skipped_fixes} {backfills}"
+        );
+        assert!(
+            pending_cancels > 0 && cap_rejections > 0,
+            "{pending_cancels} {cap_rejections}"
         );
     }
 
