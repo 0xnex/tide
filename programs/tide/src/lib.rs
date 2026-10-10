@@ -13,7 +13,9 @@
 //!          没有可交易的时候返回 NothingToTrade / TradeTooSoon / DepegBlocksBuy
 //!   信号和轧差只取决于 1 点发布的价格，和调用 fix 的时间无关；某天没有 fix 时，
 //!   这一期的请求顺延到下一次 fix，一次 fix 可以关闭好几期
-//! - 用户调用 claim 领取份额（可以分几次领取已成交的部分）；赎回人要等这一期的赎回资产卖完才能领取 USDC
+//! - 用户调用 claim 领取份额（可以分几次领取已成交的部分）；赎回人要等这一期的赎回资产卖完才能领取 USDC，
+//!   其中 1% 取款费欠给管理人，由任何人调用 collect_fees 付到创建时设定的收费地址
+//!   （config.fee_address，只能通过时间锁修改）
 //!
 //! - 均线按日历日计算：某天没有定价时，任何人可以用那天定价窗口内发布的价格 backfill_price
 //! - 治理：管理员（应为外部多签，比如 Squads）提议一份完整的新配置，48 小时之后才能生效；
@@ -246,16 +248,20 @@ pub mod tide {
     /// epoch_record 传关闭这张排队记录那一期的定价记录：通常期号相同；
     /// 中间的定价被跳过时，是之后第一次定价的记录（first_epoch ≤ 排队记录的期号 ≤ epoch）。
     pub fn claim(ctx: Context<Claim>) -> Result<()> {
-        let fund = &ctx.accounts.fund;
+        let fund = &mut ctx.accounts.fund;
         let ticket = &mut ctx.accounts.ticket;
         let epoch = &mut ctx.accounts.epoch_record;
+        let mut st = fund.state.to_logic();
         let mut t = ticket.to_logic();
         let mut r = epoch.to_logic();
+        // 取款费只记账（fees_owed），留在待领取账户里，由 collect_fees 付出
         let logic::ClaimOutcome {
             shares,
-            payout_usdc,
+            redeemer_usdc,
             refund_usdc,
-        } = logic::claim(&mut t, &mut r).map_err(map_err)?;
+            ..
+        } = logic::claim(&mut st, &mut t, &mut r, &fund.config.to_logic()).map_err(map_err)?;
+        fund.state = StateData::from_logic(&st);
         epoch.set_unclaimed(&r);
         ticket.set_from_logic(&t);
 
@@ -286,7 +292,7 @@ pub mod tide {
             signer,
             ctx.accounts.payout_vault.to_account_info(),
             user_usdc.clone(),
-            payout_usdc,
+            redeemer_usdc,
         )?;
         fund_transfer(
             &tp,
@@ -534,6 +540,27 @@ pub mod tide {
         Ok(())
     }
 
+    /// 把欠管理人的取款费从待领取账户付到收费地址的 USDC 关联代币账户（不存在时由调用人创建）。
+    /// 任何人都可以调用：钱只能去配置里固定的收费地址
+    pub fn collect_fees(ctx: Context<CollectFees>) -> Result<()> {
+        let fund = &mut ctx.accounts.fund;
+        let mut st = fund.state.to_logic();
+        let fee = logic::collect_fees(&mut st);
+        fund.state = StateData::from_logic(&st);
+        let admin = fund.admin;
+        let seeds: &[&[u8]] = &[b"fund", admin.as_ref(), &[fund.bump]];
+        fund_transfer(
+            &ctx.accounts.token_program.to_account_info(),
+            &ctx.accounts.fund.to_account_info(),
+            &[seeds],
+            ctx.accounts.payout_vault.to_account_info(),
+            ctx.accounts.fee_usdc.to_account_info(),
+            fee,
+        )?;
+        emit!(FeesCollected { usdc: fee });
+        Ok(())
+    }
+
     /// 回填没有定价的那一天（day，日期序号）的信号价格，任何人都可以调用。
     /// 预言机的信号价格必须发布在那一天的定价窗口内，所以不检查是否过旧
     /// （换成 Pyth 后传那一天的历史价格更新）。
@@ -600,11 +627,11 @@ pub mod tide {
     }
 }
 
-/// fund-logic 看不到的配置项：预言机价格最多多旧、清算地址
+/// fund-logic 看不到的配置项：预言机价格最多多旧、清算地址、收费地址
 fn check_program_config(config: &ConfigData) -> Result<()> {
     require!(config.max_staleness_secs > 0, FundErrorCode::InvalidConfig);
     require!(
-        config.keeper != Pubkey::default(),
+        config.keeper != Pubkey::default() && config.fee_address != Pubkey::default(),
         FundErrorCode::InvalidConfig
     );
     Ok(())
@@ -672,7 +699,6 @@ pub struct ConfigData {
     pub settle_offset_secs: i64,
     pub max_slippage_bps: u16,
     pub subscription_fee_bps: u16,
-    pub redemption_fee_bps: u16,
     pub min_subscription: u64,
     pub depeg_threshold_bps: u16,
     pub trade_cap_usdc: u64,
@@ -682,6 +708,7 @@ pub struct ConfigData {
     pub withdrawal_fee_bps: u16,
     pub max_staleness_secs: i64, // 预言机价格最多允许多旧
     pub keeper: Pubkey,          // 清算地址：清算窗口内唯一能驱动结算的签名人
+    pub fee_address: Pubkey, // 收费地址（管理人）：collect_fees 把取款费付到它的 USDC 关联代币账户
 }
 
 impl ConfigData {
@@ -691,7 +718,6 @@ impl ConfigData {
             settle_offset_secs: self.settle_offset_secs,
             max_slippage_bps: self.max_slippage_bps,
             subscription_fee_bps: self.subscription_fee_bps,
-            redemption_fee_bps: self.redemption_fee_bps,
             min_subscription: self.min_subscription,
             depeg_threshold_bps: self.depeg_threshold_bps,
             trade_cap_usdc: self.trade_cap_usdc,
@@ -745,6 +771,7 @@ pub struct StateData {
     pub pending: [PendingData; 8], // 必须等于 fund_logic::MAX_PENDING
     pub pending_count: u8,
     pub subscriptions_paused: bool,
+    pub fees_owed: u64,
 }
 
 impl StateData {
@@ -775,6 +802,7 @@ impl StateData {
             }),
             pending_count: s.pending_count,
             subscriptions_paused: s.subscriptions_paused,
+            fees_owed: s.fees_owed,
         }
     }
     fn to_logic(&self) -> logic::FundState {
@@ -804,6 +832,7 @@ impl StateData {
             }),
             pending_count: self.pending_count,
             subscriptions_paused: self.subscriptions_paused,
+            fees_owed: self.fees_owed,
         }
     }
 }
@@ -987,6 +1016,11 @@ pub struct Fixed {
 }
 
 #[event]
+pub struct FeesCollected {
+    pub usdc: u64,
+}
+
+#[event]
 pub struct PriceBackfilled {
     pub day: i64,
     pub signal_price: u64,
@@ -1165,7 +1199,7 @@ pub struct Cancel<'info> {
 pub struct Claim<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
-    #[account(seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump)]
+    #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump)]
     pub fund: Box<Account<'info, Fund>>,
     #[account(
         mut,
@@ -1261,6 +1295,29 @@ pub struct Trade<'info> {
     #[account(mut, has_one = fund @ FundErrorCode::WrongEpochRecord)]
     pub epoch_record: Option<Box<Account<'info, EpochRecord>>>,
     pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct CollectFees<'info> {
+    #[account(mut)]
+    pub caller: Signer<'info>,
+    #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump)]
+    pub fund: Box<Account<'info, Fund>>,
+    #[account(address = fund.usdc_mint)]
+    pub usdc_mint: Box<Account<'info, Mint>>,
+    /// CHECK: 只用作关联代币账户的 authority，地址由配置固定
+    #[account(address = fund.config.fee_address)]
+    pub fee_address: UncheckedAccount<'info>,
+    #[account(
+        init_if_needed, payer = caller,
+        associated_token::mint = usdc_mint, associated_token::authority = fee_address
+    )]
+    pub fee_usdc: Box<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [b"payout_vault", fund.key().as_ref()], bump)]
+    pub payout_vault: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]

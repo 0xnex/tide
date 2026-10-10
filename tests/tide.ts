@@ -3,7 +3,7 @@
 //
 // 场景：
 //   第 1 天：Alice 申购 1000、Bob 申购 3000；价格高于均线 -> 分 4 笔为申购买入 cbBTC，中途先领一部分份额
-//   第 2 天：Alice 赎回全部份额；价格上涨 10% -> 分 2 笔卖出她那份 cbBTC，卖完才能领取；
+//   第 2 天：Alice 赎回全部份额；价格上涨 10% -> 分 2 笔卖出她那份 cbBTC，卖完才能领取，1% 取款费付给收费地址；
 //            中途一笔成交低于 min_out，只回滚那一笔
 //   第 3 天：价格跌破均线 -> 分几笔全部换成 USDC；清算窗口内 Alice 不能交易，窗口之后可以
 //   第 4 天：Bob 赎回全部 -> 基金只有 USDC，赎回资产定价时就完成，份额清零
@@ -51,6 +51,7 @@ describe("tide", () => {
   let admin: Keypair;
   const alice = Keypair.generate();
   const bob = Keypair.generate();
+  const manager = Keypair.generate(); // 收费地址：取款费付到它的 USDC 关联代币账户
   const usdcMint = Keypair.generate();
   const btcMint = Keypair.generate();
 
@@ -253,6 +254,24 @@ describe("tide", () => {
       .rpc();
   }
 
+  const managerUsdc = () => getAssociatedTokenAddressSync(usdcMint.publicKey, manager.publicKey);
+
+  /** 任何人都可以结清欠管理人的取款费 */
+  async function collectFees(signer: Keypair) {
+    await program.methods
+      .collectFees()
+      .accountsPartial({
+        caller: signer.publicKey,
+        fund,
+        usdcMint: usdcMint.publicKey,
+        feeAddress: manager.publicKey,
+        feeUsdc: managerUsdc(),
+        payoutVault: fundPda("payout_vault"),
+      })
+      .signers([signer])
+      .rpc();
+  }
+
   /** 申购，返回这张排队记录的期号 */
   async function subscribe(user: Keypair, userUsdc: PublicKey, amount: number): Promise<number> {
     const epoch = requestEpoch();
@@ -352,7 +371,6 @@ describe("tide", () => {
         settleOffsetSecs: new BN(FIX_OFFSET),
         maxSlippageBps: 30,
         subscriptionFeeBps: 0,
-        redemptionFeeBps: 0,
         minSubscription: new BN(USDC),
         depegThresholdBps: 200,
         tradeCapUsdc: new BN(1_000 * USDC),
@@ -362,6 +380,7 @@ describe("tide", () => {
         withdrawalFeeBps: 100,
         maxStalenessSecs: new BN(600),
         keeper: admin.publicKey, // 清算地址：这里就是管理员钱包
+        feeAddress: manager.publicKey,
       })
       .accountsPartial({ admin: admin.publicKey, fund, usdcMint: usdcMint.publicKey, btcMint: btcMint.publicKey, shareMint, oracle, market })
       .rpc();
@@ -447,11 +466,20 @@ describe("tide", () => {
     const r = await program.account.epochRecord.fetch(epochPda(today));
     expect(r.sliceSoldOut).to.equal(true);
 
+    // 领取时 1% 取款费欠给管理人，其余给 Alice；之后任何人（这里是 Bob）把取款费结清到收费地址，
+    // 收费地址的 USDC 账户由他创建
     await claim(alice, aliceUsdc);
-    const got = Number((await tokenBalance(aliceUsdc)) - before) / USDC;
-    expect(got).to.equal(r.payoutUsdc.toNumber() / USDC);
-    // 1000 × 1.1，扣掉买入和卖出各 0.18% 的成交成本，约 1096
-    expect(got).to.be.within(1_090, 1_100);
+    const got = (await tokenBalance(aliceUsdc)) - before;
+    const payout = BigInt(r.payoutUsdc.toString());
+    const owed = BigInt((await program.account.fund.fetch(fund)).state.feesOwed.toString());
+    expect(owed).to.equal(payout / 100n);
+    expect(got + owed).to.equal(payout);
+    expect(await tokenBalance(fundPda("payout_vault"))).to.equal(owed);
+    await collectFees(bob);
+    expect(await tokenBalance(managerUsdc())).to.equal(owed);
+    expect((await program.account.fund.fetch(fund)).state.feesOwed.toNumber()).to.equal(0);
+    // 1000 × 1.1，扣掉买入和卖出各 0.18% 的成交成本约 1096，再扣 1% 取款费
+    expect(Number(got) / USDC).to.be.within(1_080, 1_090);
     expect(await tokenBalance(fundPda("payout_vault"))).to.equal(0n);
   });
 
@@ -488,7 +516,9 @@ describe("tide", () => {
     const f = await program.account.fund.fetch(fund);
     expect(f.state.shareSupply.toNumber()).to.equal(0);
     expect(await tokenBalance(fundPda("share_escrow"))).to.equal(0n);
-    expect(await tokenBalance(fundPda("payout_vault"))).to.equal(0n);
+    // 待领取账户里只剩欠管理人的取款费
+    expect(await tokenBalance(fundPda("payout_vault"))).to.equal(BigInt(f.state.feesOwed.toString()));
+    expect(f.state.feesOwed.toNumber()).to.be.greaterThan(0);
     expect(await trade()).to.equal("NothingToTrade");
   });
 

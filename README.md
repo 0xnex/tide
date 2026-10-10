@@ -4,7 +4,7 @@
 
 > **Devnet prototype. Do not use with real money.** The oracle and exchange are mocks. Mainnet needs a security audit and legal advice: pooling other people's money and charging a fee for managing it is regulated in many jurisdictions.
 
-> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code runs settlement as a fixing step plus capped trades. Redeemers are paid their slice's actual proceeds, and subscriptions become shares by the cbBTC they add. The config timelock and subscription pause are built. The signal still uses BTC/USD, and the withdrawal fee is not charged yet (its capped rate field exists). Sections marked *(current code)* describe what runs today.
+> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code runs settlement as a fixing step plus capped trades. Redeemers are paid their slice's actual proceeds, and subscriptions become shares by the cbBTC they add. The config timelock, subscription pause, moving-average backfill and 1% withdrawal fee are built. The signal still uses BTC/USD. Sections marked *(current code)* describe what runs today.
 
 ---
 
@@ -146,7 +146,7 @@ The signal and netting use prices published in `[01:00, 01:01)` UTC. A missed da
 
 ```mermaid
 flowchart LR
-  C["redeemer claims USDC"] --> F["1% → fee address<br/>(fixed at initialize)"]
+  C["redeemer claims USDC"] --> F["1% owed to the manager<br/>collect_fees → fee address"]
   C --> U["99% → redeemer"]
 ```
 
@@ -246,6 +246,7 @@ flowchart LR
 | `fix(epoch)` | keeper in 01:00–01:30, then anyone | Fixing step, once a day after `settle_offset_secs`; `epoch` is today's day number |
 | `trade` | keeper in 01:00–01:30, then anyone | One capped trade; others in the window get `KeeperOnly`; answers `NothingToTrade`, `TradeTooSoon`, `DepegBlocksBuy` or `FixPending` when there is none |
 | `claim` | subscriber / redeemer | Collect filled shares (repeatable) or redemption USDC; pass the record of the fixing that closed the ticket's epoch |
+| `collect_fees` | anyone | Pay the withdrawal fees owed to the manager to the fee address; claims never depend on that account |
 | `backfill_price(day)` | anyone | Record a missed day's signal price, published in that day's fixing window |
 | `propose_config(config)`, `apply_config` | admin | Config change, applied 48 h after the proposal |
 | `pause_subscriptions`, `resume_subscriptions` | admin | Immediate; redemptions are never paused |
@@ -258,7 +259,7 @@ flowchart LR
 | `window` | 50 | Moving-average days (max 64) | current |
 | `settle_offset_secs` | 3600 | Fixing time after 00:00 UTC | current |
 | `max_slippage_bps` | 30 | Keeper slippage bound | current |
-| `subscription_fee_bps` / `redemption_fee_bps` | 0 | Subscription / redemption fee, kept in fund | current |
+| `subscription_fee_bps` | 0 | Subscription fee, kept in fund | current |
 | `min_subscription` | 1 USDC | Minimum subscription | current |
 | `max_staleness_secs` | 600 | Max oracle price age | current |
 | `depeg_threshold_bps` | 200 | cbBTC vs BTC gap that stops buys | current |
@@ -267,11 +268,11 @@ flowchart LR
 | `public_slippage_bps` | 10 | Non-keeper callers after the window (≤ `max_slippage_bps`) | current |
 | `keeper_window_secs` | 1800 | Keeper-only time after the fixing time | current |
 | Subscription cap | 1,000,000 USDC | Per epoch, incl. pending | planned |
-| `withdrawal_fee_bps` | 100 (max 100) | Of each redemption claim, to the manager; replaces `redemption_fee_bps`. Field and cap exist; charging is planned | planned |
+| `withdrawal_fee_bps` | 100 (max 100) | Of each redemption claim, rounded down, owed to the manager; share claims and refunds pay none | current |
 | `keeper` | set at creation | Keeper address; change via 48 h timelock | current |
 | Config timelock | 48 h, fixed in code | `propose_config` a whole config, `apply_config` after 48 h; a new proposal restarts the clock. `window` and `settle_offset_secs` are set at creation and cannot change | current |
 | Subscription pause | off | `pause_subscriptions` / `resume_subscriptions`, immediate, admin only; redemptions can never be paused | current |
-| Fee address | set at creation | Change via 48 h timelock | planned |
+| `fee_address` | set at creation | Manager's wallet; `collect_fees` pays the owed fees to its USDC associated token account. Change via 48 h timelock | current |
 
 ### Accounts (PDAs)
 

@@ -93,14 +93,13 @@ pub struct Config {
     pub settle_offset_secs: i64,      // 定价时刻：每天 UTC 0 点之后多少秒，默认 3600（1 点）
     pub max_slippage_bps: u16,        // 交易相对估值价格的最大滑点
     pub subscription_fee_bps: u16,    // 申购费，留在基金里
-    pub redemption_fee_bps: u16,      // 赎回费，同上
     pub min_subscription: u64,        // 最低申购金额（USDC 原始单位）
     pub depeg_threshold_bps: u16,     // cbBTC/USD 与 BTC/USD 相差超过这个幅度就不买入 cbBTC
     pub trade_cap_usdc: u64,          // 单笔交易上限（按估值价格折算的 USDC 名义金额）
     pub min_trade_interval_secs: i64, // 两笔交易之间至少间隔多少秒
     pub keeper_window_secs: i64,      // 定价时刻之后多少秒内只有清算地址能驱动结算
     pub public_slippage_bps: u16,     // 窗口之后其他人交易的滑点上限，比 max_slippage_bps 更严
-    pub withdrawal_fee_bps: u16,      // 取款费率（领取赎回款时付给管理人），最多 1%；尚未收取
+    pub withdrawal_fee_bps: u16,      // 取款费率（领取赎回款时欠管理人），最多 1%
 }
 
 impl Config {
@@ -111,7 +110,6 @@ impl Config {
             // 0.075% 手续费 + 约 0.1% 滑点，再留出预言机与成交价的价差
             max_slippage_bps: 30,
             subscription_fee_bps: 0,
-            redemption_fee_bps: 0,
             min_subscription: 1_000_000, // 1 USDC
             depeg_threshold_bps: 200,
             trade_cap_usdc: 200_000_000_000, // 200,000 USDC
@@ -131,7 +129,6 @@ impl Config {
         }
         if self.max_slippage_bps as u128 >= BPS
             || self.subscription_fee_bps as u128 >= BPS
-            || self.redemption_fee_bps as u128 >= BPS
             || self.depeg_threshold_bps == 0
             || self.depeg_threshold_bps as u128 >= BPS
         {
@@ -194,6 +191,9 @@ pub struct FundState {
     pub pending: [Pending; MAX_PENDING], // 待成交申购，最早的在前
     pub pending_count: u8,
     pub subscriptions_paused: bool, // 管理员可以立即暂停、恢复申购；赎回永远不能暂停
+    // 欠管理人的取款费：留在待领取账户里，由 collect_fees 付到收费地址。
+    // 领取时不直接付，这样收费地址的代币账户出什么问题（关闭、换主人、被冻结）都挡不住赎回人领取。
+    pub fees_owed: u64,
 }
 
 impl FundState {
@@ -217,6 +217,7 @@ impl FundState {
             pending: [Pending::default(); MAX_PENDING],
             pending_count: 0,
             subscriptions_paused: false,
+            fees_owed: 0,
         }
     }
 
@@ -746,8 +747,9 @@ fn take_pro_rata(part: u64, pool_basis: &mut u64, pool_amount: &mut u64) -> Resu
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimOutcome {
     pub shares: u64,
-    pub payout_usdc: u64, // 赎回资产卖出所得
-    pub refund_usdc: u64, // 申购退款
+    pub redeemer_usdc: u64, // 赎回人实收：他那份赎回资产卖出所得减去取款费
+    pub fee_usdc: u64,      // 取款费：记入 FundState.fees_owed，之后付给收费地址
+    pub refund_usdc: u64,   // 申购退款（不收取款费）
 }
 
 /// 定价之后领取。
@@ -755,9 +757,37 @@ pub struct ClaimOutcome {
 ///   全部成交后最后一次领取，最后一位拿到本期剩下的全部份额。
 /// - 申购退款（待成交申购已满时）在最后一次领取时按申购额比例返还，最后一位拿余数。
 /// - 赎回要等这一期的赎回资产全部卖完，按份额比例分实际卖出的 USDC，最后一位拿余数。
-/// 领取之和精确等于本期总额，不留尘埃。两部分都领完后记录清空。
-/// 没有新的可领取内容时返回 SliceNotSold（赎回资产还没卖完）或 NothingToClaim。
-pub fn claim(t: &mut Ticket, r: &mut EpochRecord) -> Result<ClaimOutcome, FundError> {
+///   其中 withdrawal_fee_bps 作为取款费欠给管理人（ADR 0007，记入 s.fees_owed），其余给赎回人；
+///   份额和申购退款不收。费率按领取时的配置（只能通过时间锁修改，最多 1%）。
+/// 领取之和（赎回人实收 + 取款费）精确等于本期总额，不留尘埃。两部分都领完后记录清空。
+/// 没有新的可领取内容时返回 SliceNotSold（赎回资产还没卖完）或 NothingToClaim。出错时什么都不改。
+pub fn claim(
+    s: &mut FundState,
+    t: &mut Ticket,
+    r: &mut EpochRecord,
+    cfg: &Config,
+) -> Result<ClaimOutcome, FundError> {
+    let (mut t2, mut r2) = (*t, *r);
+    let out = claim_parts(&mut t2, &mut r2, cfg)?;
+    s.fees_owed = s
+        .fees_owed
+        .checked_add(out.fee_usdc)
+        .ok_or(FundError::Overflow)?;
+    *t = t2;
+    *r = r2;
+    Ok(out)
+}
+
+/// 欠管理人的取款费全部结清：返回要从待领取账户付到收费地址的 USDC
+pub fn collect_fees(s: &mut FundState) -> u64 {
+    std::mem::take(&mut s.fees_owed)
+}
+
+fn claim_parts(
+    t: &mut Ticket,
+    r: &mut EpochRecord,
+    cfg: &Config,
+) -> Result<ClaimOutcome, FundError> {
     if t.is_empty() {
         return Err(FundError::NothingToClaim);
     }
@@ -803,7 +833,7 @@ pub fn claim(t: &mut Ticket, r: &mut EpochRecord) -> Result<ClaimOutcome, FundEr
     } else {
         0
     };
-    let payout_usdc = if redeem_final {
+    let gross_usdc = if redeem_final {
         let usdc = take_pro_rata(
             t.redemption_shares,
             &mut r.unclaimed_redemption_shares,
@@ -814,12 +844,19 @@ pub fn claim(t: &mut Ticket, r: &mut EpochRecord) -> Result<ClaimOutcome, FundEr
     } else {
         0
     };
+    // 取款费从这个人那一份里扣，按规定向下取整。它不是基金资产，取整只在赎回人和管理人之间，
+    // 留下的持有人不受影响
+    let fee_usdc = pro_rata(gross_usdc, cfg.withdrawal_fee_bps as u64, BPS as u64)?;
+    let redeemer_usdc = gross_usdc
+        .checked_sub(fee_usdc)
+        .ok_or(FundError::Overflow)?;
     if t.subscription_usdc == 0 && t.redemption_shares == 0 {
         *t = Ticket::default();
     }
     Ok(ClaimOutcome {
         shares,
-        payout_usdc,
+        redeemer_usdc,
+        fee_usdc,
         refund_usdc,
     })
 }
@@ -890,10 +927,9 @@ pub fn fix(
     let (slice_usdc, slice_btc) = if redemption_shares == 0 {
         (0, 0)
     } else {
-        let fee = cfg.redemption_fee_bps; // 赎回费留在基金里
         (
-            apply_bps_down(pro_rata(n.usdc, redemption_shares, n.share_supply)?, fee)?,
-            apply_bps_down(pro_rata(n.btc, redemption_shares, n.share_supply)?, fee)?,
+            pro_rata(n.usdc, redemption_shares, n.share_supply)?,
+            pro_rata(n.btc, redemption_shares, n.share_supply)?,
         )
     };
     n.usdc = n.usdc.checked_sub(slice_usdc).ok_or(FundError::Overflow)?;
@@ -1326,6 +1362,7 @@ mod tests {
         c: Config,
         usdc_tokens: u64,
         btc_tokens: u64,
+        fees: u64, // 付给管理人的取款费
     }
 
     impl Harness {
@@ -1336,6 +1373,7 @@ mod tests {
                 c: cfg(),
                 usdc_tokens: 0,
                 btc_tokens: 0,
+                fees: 0,
             }
         }
 
@@ -1430,6 +1468,7 @@ mod tests {
                     + slices.iter().map(|x| x.usdc).sum::<u64>()
                     + payouts
                     + refunds_unsold
+                    + self.s.fees_owed
             );
             assert_eq!(
                 self.btc_tokens,
@@ -1443,12 +1482,39 @@ mod tests {
                 .unwrap()
         }
 
+        /// 领取，返回 (份额, USDC)。USDC 是领取人那一份的总额：赎回款含取款费，加上申购退款。
+        /// 取款费单独累计在 fees 里，并检查它正好是赎回款的 withdrawal_fee_bps（向下取整）。
         fn claim(&mut self, t: &mut Ticket) -> Result<(u64, u64), FundError> {
+            self.claim_split(t)
+                .map(|o| (o.shares, o.redeemer_usdc + o.fee_usdc + o.refund_usdc))
+        }
+
+        /// 结清取款费：从待领取账户付到收费地址
+        fn collect_fees(&mut self) -> u64 {
+            let fee = collect_fees(&mut self.s);
+            self.usdc_tokens -= fee;
+            self.assert_ledger();
+            fee
+        }
+
+        /// 领取，返回完整结果（赎回人实收、取款费、退款分开）
+        fn claim_split(&mut self, t: &mut Ticket) -> Result<ClaimOutcome, FundError> {
+            let c = self.c;
+            let mut s = self.s.clone();
             let r = self.covering(t.epoch).ok_or(FundError::EpochNotSettled)?;
-            let out = claim(t, r)?;
-            let usdc = out.payout_usdc + out.refund_usdc;
-            self.usdc_tokens -= usdc;
-            Ok((out.shares, usdc))
+            let out = claim(&mut s, t, r, &c)?;
+            let gross = out.redeemer_usdc + out.fee_usdc;
+            assert_eq!(
+                out.fee_usdc as u128,
+                gross as u128 * c.withdrawal_fee_bps as u128 / BPS
+            );
+            assert_eq!(s.fees_owed, self.s.fees_owed + out.fee_usdc);
+            self.s = s;
+            self.fees += out.fee_usdc;
+            // 取款费留在待领取账户里，等 collect_fees
+            self.usdc_tokens -= out.redeemer_usdc + out.refund_usdc;
+            self.assert_ledger();
+            Ok(out)
         }
 
         /// 成交一笔计划好的交易；卖出赎回资产或为申购买入时传入那一期的记录
@@ -1621,13 +1687,100 @@ mod tests {
         assert_eq!(r.minted_shares, 990 * USDC);
         assert_eq!(h.s.usdc, 1_000 * USDC);
 
-        // 赎回费同样留在基金里：赎回一半份额，拿到的少于一半资产
-        h.c.redemption_fee_bps = 100;
+        // 赎回资产按份额比例划出，不再扣赎回费：赎回一半份额，拿到一半资产
         h.claim(&mut ta).unwrap();
         h.redeem(&mut ta, 495 * USDC, 11 * DAY);
         let r = h.fix_day(11, 50_000 * USDC);
-        assert_eq!(r.slice_usdc, 495 * USDC);
-        assert_eq!(h.s.usdc, 505 * USDC);
+        assert_eq!(r.slice_usdc, 500 * USDC);
+        assert_eq!(h.s.usdc, 500 * USDC);
+    }
+
+    #[test]
+    fn redeemers_pay_the_withdrawal_fee_on_gains_and_losses() {
+        // A 在 51,000 买入；第 11 天涨到 60,000 时赎回一半，第 12 天跌到 45,000 时赎回剩下的
+        let mut h = Harness::seeded(50_000 * USDC);
+        let mut ta = Ticket::default();
+        h.subscribe(&mut ta, 1_000 * USDC, 10 * DAY);
+        h.settle_day(10, 51_000 * USDC, 0); // 1,960,784 sat
+        let (a, _) = h.claim(&mut ta).unwrap();
+
+        h.redeem(&mut ta, a / 2, 11 * DAY);
+        h.settle_day(11, 60_000 * USDC, 0);
+        // 980,392 sat × 60,000 = 588.2352 USDC；1% 取款费 5.882352，向下取整
+        let out = h.claim_split(&mut ta).unwrap();
+        assert_eq!((out.redeemer_usdc, out.fee_usdc), (582_352_848, 5_882_352));
+
+        h.redeem(&mut ta, a - a / 2, 12 * DAY);
+        let r = h.settle_day(12, 45_000 * USDC, 0);
+        // 亏损也收：980,392 sat × 45,000 = 441.1764 USDC
+        assert_eq!(r.payout_usdc, 441_176_400);
+        let out = h.claim_split(&mut ta).unwrap();
+        assert_eq!((out.redeemer_usdc, out.fee_usdc), (436_764_636, 4_411_764));
+        assert_eq!(h.fees, 5_882_352 + 4_411_764);
+        // 取款费攒在基金名下，结清时一次付给收费地址
+        assert_eq!(h.s.fees_owed, h.fees);
+        assert_eq!(h.collect_fees(), 5_882_352 + 4_411_764);
+        assert_eq!((h.s.fees_owed, h.collect_fees()), (0, 0));
+    }
+
+    #[test]
+    fn share_claims_and_refunds_pay_no_withdrawal_fee() {
+        let mut h = Harness::seeded(50_000 * USDC);
+        let mut ta = Ticket::default();
+        h.subscribe(&mut ta, 1_000 * USDC, 10 * DAY);
+        h.settle_day(10, 51_000 * USDC, 0);
+        let out = h.claim_split(&mut ta).unwrap();
+        assert_eq!((out.shares, out.fee_usdc), (1_000 * USDC, 0));
+
+        // 待成交申购满了之后的申购全额退款，也不收取款费
+        let depeg = |day: i64| at_fix2(day, 51_000 * USDC, 49_000 * USDC);
+        for day in 11..11 + MAX_PENDING as i64 {
+            h.subscribe(&mut Ticket::default(), 100 * USDC, day * DAY);
+            h.fix_with(day * DAY + ONE_AM, &depeg(day)).unwrap();
+        }
+        let day = 11 + MAX_PENDING as i64;
+        let mut late = Ticket::default();
+        h.subscribe(&mut late, 100 * USDC, day * DAY);
+        h.fix_with(day * DAY + ONE_AM, &depeg(day)).unwrap();
+        let out = h.claim_split(&mut late).unwrap();
+        assert_eq!((out.refund_usdc, out.fee_usdc), (100 * USDC, 0));
+        assert_eq!(h.fees, 0);
+    }
+
+    #[test]
+    fn redeemer_payouts_plus_fees_equal_the_epoch_payout_exactly() {
+        // 三个人的赎回份额除不尽：取款费各自向下取整，最后一位拿余数，加起来一分不差
+        let mut h = Harness::seeded(50_000 * USDC);
+        let mut t = [Ticket::default(); 3];
+        for (i, amt) in [1_001, 2_003, 3_007].into_iter().enumerate() {
+            h.subscribe(&mut t[i], amt * USDC + 7, 10 * DAY);
+        }
+        h.settle_day(10, 51_000 * USDC, 0);
+        let held: Vec<u64> = (0..3).map(|i| h.claim(&mut t[i]).unwrap().0).collect();
+        for i in 0..3 {
+            h.redeem(&mut t[i], held[i] / 3 + 1, 11 * DAY);
+        }
+        let r = h.settle_day(11, 53_333 * USDC, 25);
+        let outs: Vec<ClaimOutcome> = (0..3).map(|i| h.claim_split(&mut t[i]).unwrap()).collect();
+        let users: u64 = outs.iter().map(|o| o.redeemer_usdc).sum();
+        let fees: u64 = outs.iter().map(|o| o.fee_usdc).sum();
+        assert_eq!(users + fees, r.payout_usdc);
+        assert!(fees > 0 && fees <= r.payout_usdc / 100);
+        assert_eq!(h.rec(11).unclaimed_payout_usdc, 0);
+    }
+
+    #[test]
+    fn no_withdrawal_fee_when_the_rate_is_zero() {
+        let mut h = Harness::new();
+        h.c.withdrawal_fee_bps = 0;
+        let mut ta = Ticket::default();
+        h.subscribe(&mut ta, 1_000 * USDC, 10 * DAY);
+        h.settle_day(10, 50_000 * USDC, 0);
+        h.claim(&mut ta).unwrap();
+        h.redeem(&mut ta, 400 * USDC, 11 * DAY);
+        h.fix_day(11, 50_000 * USDC);
+        let out = h.claim_split(&mut ta).unwrap();
+        assert_eq!((out.redeemer_usdc, out.fee_usdc), (400 * USDC, 0));
     }
 
     #[test]
@@ -1641,7 +1794,7 @@ mod tests {
             let mut wrong = r;
             (wrong.first_epoch, wrong.epoch) = (first, last);
             assert_eq!(
-                claim(&mut t.clone(), &mut wrong),
+                claim(&mut h.s.clone(), &mut t.clone(), &mut wrong, &h.c),
                 Err(FundError::EpochNotSettled)
             );
         }
@@ -3243,6 +3396,9 @@ mod tests {
                 assert_eq!(why, FundError::NothingToTrade);
                 self.claim_ready(h);
             }
+            // 欠管理人的取款费结清之后，基金名下的 USDC 只剩基金资产
+            h.collect_fees();
+            assert_eq!(h.s.fees_owed, 0);
             assert_eq!(h.s.slice_count, 0, "赎回资产都应卖完");
             assert_eq!(h.s.pending_count, 0, "申购都应成交");
             assert!(
@@ -3341,6 +3497,7 @@ mod tests {
             assert!(tally.failed_fills > 0 && tally.too_soon > 0, "{tally:?}");
             assert!(tally.keeper_only > 0 && tally.public_plans > 0, "{tally:?}");
             assert!(users.cancels > 0, "seed {seed}: 没有撤销");
+            assert!(h.fees > 0, "seed {seed}: 没有收到取款费");
             // 价值守恒：基金总资产 ≈ 用户份额价值之和（误差为取整尘埃），按估值价格计
             let assets = fund_value(&h.s, valuation);
             let supply = h.s.share_supply as u128;
@@ -3388,6 +3545,10 @@ mod tests {
                         );
                         backfills += 1;
                     }
+                }
+                // 有时有人结清欠管理人的取款费
+                if rng.below(10) == 0 {
+                    h.collect_fees();
                 }
                 // 管理员随机暂停、恢复申购：赎回、定价、交易和领取照常
                 if rng.below(15) == 0 {
