@@ -8,6 +8,10 @@ Guidance for AI coding agents (and human contributors) working on this repositor
 
 **Design in transition.** The target design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/0001`–`0004` (decisions). The invariants below describe that target design. Settlement already runs as a `fix` step plus capped `trade` steps, and redeemers are paid what their redemption slice sells for. Until the rest of the migration lands, subscriptions are still filled at the fixing NAV, and there is no keeper window, performance fee or timelock yet. Treat any difference between that code and these invariants as migration work to do, not as a rule to restore.
 
+## Replies
+
+Write every reply in plain language: short sentences, one idea each. Lead with the answer, then the detail. Explain a code name (an error, a field) in everyday words the first time it appears.
+
 ## Architecture
 
 ```
