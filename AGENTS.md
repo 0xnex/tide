@@ -78,7 +78,7 @@ flowchart LR
 These are easy to break when editing:
 
 - `StateData` (program) mirrors `fund_logic::FundState` field-for-field. Update `from_logic` / `to_logic` together.
-- `StateData.prices` is `[u64; 64]` as a **literal** (the IDL needs it). It must equal `fund_logic::MAX_WINDOW`; a compile-time assertion enforces this.
+- `StateData.prices` is `[u64; 64]` and `StateData.price_days` is `[i64; 64]`, both as **literals** (the IDL needs it). They must equal `fund_logic::MAX_WINDOW`; a compile-time assertion enforces this.
 - `StateData.slices` is `[SliceData; 8]` and `StateData.pending` is `[PendingData; 8]`, literals mirroring `fund_logic::Slice` and `fund_logic::Pending`; they must equal `MAX_SLICES` and `MAX_PENDING` (compile-time assertions).
 - `Ticket` (program) mirrors `fund_logic::Ticket`, including `shares_claimed`.
 - `EpochRecord` (program) mirrors `fund_logic::EpochRecord`, including the four `unclaimed_*` fields. Update `set_from_logic`, `set_unclaimed`, and `to_logic`.

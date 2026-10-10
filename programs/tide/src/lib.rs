@@ -15,6 +15,7 @@
 //!   这一期的请求顺延到下一次 fix，一次 fix 可以关闭好几期
 //! - 用户调用 claim 领取份额（可以分几次领取已成交的部分）；赎回人要等这一期的赎回资产卖完才能领取 USDC
 //!
+//! - 均线按日历日计算：某天没有定价时，任何人可以用那天定价窗口内发布的价格 backfill_price
 //! - 治理：管理员（应为外部多签，比如 Squads）提议一份完整的新配置，48 小时之后才能生效；
 //!   唯一立即生效的操作是暂停、恢复申购。赎回永远不能暂停，管理员也不能动基金资产
 //!
@@ -68,13 +69,15 @@ pub mod tide {
         Ok(())
     }
 
-    /// 首次定价前，管理员写入最近 49 天的历史价格，让均线从第一天就能计算
+    /// 首次定价前，管理员写入最近几天的历史价格（到昨天为止，最早的在前），
+    /// 让均线从第一天就能计算
     pub fn seed_prices(ctx: Context<AdminOnly>, prices: Vec<u64>) -> Result<()> {
         let fund = &mut ctx.accounts.fund;
         require!(fund.state.last_fix_day < 0, FundErrorCode::AlreadyStarted);
         let cfg = fund.config.to_logic();
         let mut st = fund.state.to_logic();
-        logic::seed_prices(&mut st, &prices, &cfg).map_err(map_err)?;
+        let yesterday = logic::day_of(Clock::get()?.unix_timestamp) - 1;
+        logic::seed_prices(&mut st, &prices, yesterday, &cfg).map_err(map_err)?;
         fund.state = StateData::from_logic(&st);
         Ok(())
     }
@@ -531,6 +534,28 @@ pub mod tide {
         Ok(())
     }
 
+    /// 回填没有定价的那一天（day，日期序号）的信号价格，任何人都可以调用。
+    /// 预言机的信号价格必须发布在那一天的定价窗口内，所以不检查是否过旧
+    /// （换成 Pyth 后传那一天的历史价格更新）。
+    pub fn backfill_price(ctx: Context<BackfillPrice>, day: i64) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let oracle = &ctx.accounts.oracle;
+        let signal = logic::PricePoint {
+            price: oracle.signal_price,
+            publish_time: oracle.signal_publish_time,
+        };
+        let fund = &mut ctx.accounts.fund;
+        let cfg = fund.config.to_logic();
+        let mut st = fund.state.to_logic();
+        logic::backfill_price(&mut st, day, &signal, now, &cfg).map_err(map_err)?;
+        fund.state = StateData::from_logic(&st);
+        emit!(PriceBackfilled {
+            day,
+            signal_price: signal.price,
+        });
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // 原型专用：模拟预言机和模拟交易所（主网版本删除）
     // ------------------------------------------------------------------
@@ -711,8 +736,7 @@ pub struct StateData {
     pub next_subscription_usdc: u64,
     pub next_redemption_shares: u64,
     pub prices: [u64; 64], // 必须等于 fund_logic::MAX_WINDOW（IDL 需要字面量长度）
-    pub price_count: u8,
-    pub price_head: u8,
+    pub price_days: [i64; 64],
     pub target_btc: bool,
     pub last_fix_day: i64,
     pub last_trade_time: i64,
@@ -735,8 +759,7 @@ impl StateData {
             next_subscription_usdc: s.next_subscription_usdc,
             next_redemption_shares: s.next_redemption_shares,
             prices: s.prices,
-            price_count: s.price_count,
-            price_head: s.price_head,
+            price_days: s.price_days,
             target_btc: s.target_btc,
             last_fix_day: s.last_fix_day,
             last_trade_time: s.last_trade_time,
@@ -765,8 +788,7 @@ impl StateData {
             next_subscription_usdc: self.next_subscription_usdc,
             next_redemption_shares: self.next_redemption_shares,
             prices: self.prices,
-            price_count: self.price_count,
-            price_head: self.price_head,
+            price_days: self.price_days,
             target_btc: self.target_btc,
             last_fix_day: self.last_fix_day,
             last_trade_time: self.last_trade_time,
@@ -962,6 +984,12 @@ pub struct Fixed {
     pub valuation_price: u64,
     pub moving_average: u64,
     pub target_btc: bool,
+}
+
+#[event]
+pub struct PriceBackfilled {
+    pub day: i64,
+    pub signal_price: u64,
 }
 
 #[event]
@@ -1236,6 +1264,14 @@ pub struct Trade<'info> {
 }
 
 #[derive(Accounts)]
+pub struct BackfillPrice<'info> {
+    pub caller: Signer<'info>,
+    #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump, has_one = oracle)]
+    pub fund: Box<Account<'info, Fund>>,
+    pub oracle: Box<Account<'info, MockOracle>>,
+}
+
+#[derive(Accounts)]
 pub struct InitMockOracle<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
@@ -1349,6 +1385,10 @@ pub enum FundErrorCode {
     NoPendingConfig,
     #[msg("定价时刻和均线窗口只能在创建时设定")]
     ConfigFieldFixed,
+    #[msg("这一天已经有信号价格")]
+    PriceAlreadyRecorded,
+    #[msg("只能回填过去、最近 64 天内的一天")]
+    BackfillOutOfRange,
 }
 
 fn map_err(e: logic::FundError) -> Error {
@@ -1380,6 +1420,8 @@ fn map_err(e: logic::FundError) -> Error {
         E::SubscriptionsPaused => FundErrorCode::SubscriptionsPaused,
         E::TimelockNotElapsed => FundErrorCode::TimelockNotElapsed,
         E::ConfigFieldFixed => FundErrorCode::ConfigFieldFixed,
+        E::PriceAlreadyRecorded => FundErrorCode::PriceAlreadyRecorded,
+        E::BackfillOutOfRange => FundErrorCode::BackfillOutOfRange,
     };
     error!(code)
 }

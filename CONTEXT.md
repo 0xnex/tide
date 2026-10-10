@@ -105,7 +105,7 @@ _Avoid_: Daily limit, max adjustment
 The price used for the moving average and the hold-cbBTC-or-USDC signal: Pyth cbBTC/USD when that feed exists, otherwise BTC/USD.
 
 **Moving average** (均线):
-The average signal price over the last 50 fixing times, one per calendar day; a day with no settlement is backfilled with that day's published fixing price.
+The average signal price over the last 50 fixing times, one per calendar day; a day with no settlement is backfilled with that day's published fixing price. A day never backfilled is skipped and an earlier day counts instead; prices are kept for 64 days, so with fewer than 50 prices in that span the target is USDC.
 
 **Valuation price** (估值价格):
 The Pyth cbBTC/USD price used for netting and to bound each trade's fill; the fund itself is never valued in USD.

@@ -239,12 +239,16 @@ flowchart LR
 |---|---|---|
 | `initialize(config)` | admin | Create fund account and share mint |
 | `init_vaults` | admin | Create the five fund-owned token accounts |
-| `seed_prices(prices)` | admin | Pre-load historical prices, before the first settlement only |
-| `request_subscription(amount)` | anyone | Queue a subscription |
-| `request_redemption(shares)` | holder | Queue a redemption |
-| `fix` | keeper in 01:00–01:30, then anyone | Fixing step, once a day after `settle_offset_secs` |
+| `seed_prices(prices)` | admin | Pre-load the signal prices of the days ending yesterday, before the first settlement only |
+| `request_subscription(amount, epoch)` | anyone | Queue a subscription; `epoch` is the day of the next fixing time, used for the ticket address |
+| `request_redemption(shares, epoch)` | holder | Queue a redemption; `epoch` as above |
+| `cancel` | ticket owner | Withdraw a queued ticket in full, until the fixing time that closes its epoch |
+| `fix(epoch)` | keeper in 01:00–01:30, then anyone | Fixing step, once a day after `settle_offset_secs`; `epoch` is today's day number |
 | `trade` | keeper in 01:00–01:30, then anyone | One capped trade; others in the window get `KeeperOnly`; answers `NothingToTrade`, `TradeTooSoon`, `DepegBlocksBuy` or `FixPending` when there is none |
-| `claim` | subscriber / redeemer | Collect filled shares (repeatable) or redemption USDC |
+| `claim` | subscriber / redeemer | Collect filled shares (repeatable) or redemption USDC; pass the record of the fixing that closed the ticket's epoch |
+| `backfill_price(day)` | anyone | Record a missed day's signal price, published in that day's fixing window |
+| `propose_config(config)`, `apply_config` | admin | Config change, applied 48 h after the proposal |
+| `pause_subscriptions`, `resume_subscriptions` | admin | Immediate; redemptions are never paused |
 | `init_mock_oracle`, `set_mock_price`, `init_mock_market`, `set_mock_market_fee` | admin | Devnet only |
 
 ### Configuration
@@ -320,7 +324,7 @@ flowchart LR
 
 ### Known limitations
 
-- *(current code)* A day without `fix` leaves a gap; the average covers the last 50 *observed* prices.
+- A day without `fix` leaves a gap until someone backfills it. A day never backfilled is skipped, and the average uses an earlier day instead. Prices are stored for 64 days, so if fewer than 50 of the last 64 days have a price, the fund holds USDC.
 - cbBTC carries custodian risk. The depeg rule stops new buys but cannot recover lost value.
 - Redemptions pay out only after the slice is fully sold, which can take more than a day in thin liquidity or a depeg.
 

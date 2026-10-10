@@ -10,6 +10,7 @@
 //   第 5 天：Alice 再申购；BTC 高于均线，但 cbBTC 比 BTC 低 3%（脱锚）-> 不买入，申购款留在托管里
 //   第 6 天：恢复锚定 -> 为 Alice 买入 cbBTC，她领到份额
 //   治理：配置修改等 48 小时时间锁；申购可以立即暂停，赎回不受影响；只有管理员能操作
+//   回填：某天没人定价，第二天任何人用那天 01:00 发布的价格回填均线，只能回填一次
 //   第 7 天：排队从不关闭。定价时刻之后的请求进入下一期，每个用户每期一张排队记录；
 //            关闭这一期的定价时刻之前可以撤销、全额退回，之后被拒绝
 //
@@ -610,5 +611,37 @@ describe("tide", () => {
     await redeem(alice, 1_000n);
     await program.methods.resumeSubscriptions().accountsPartial(asAdmin).rpc();
     await subscribe(alice, aliceUsdc, 100 * USDC);
+  });
+
+  it("回填：没人定价的一天，第二天用那天定价窗口内的价格回填", async () => {
+    // 第二天 01:00:30 写入价格，但没有人定价（上一个测试把时钟往前跳过，按时钟算日期）
+    today = Math.floor(now / DAY) + 1;
+    const missed = today;
+    await warpTo(missed * DAY + FIX_OFFSET + 30);
+    await setPrice(58_000);
+    const backfill = (day: number, signer: Keypair) =>
+      program.methods
+        .backfillPrice(new BN(day))
+        .accountsPartial({ caller: signer.publicKey, fund, oracle })
+        .signers([signer])
+        .rpc();
+    // 当天不能回填（应该由定价记录）
+    expect(await errorName(backfill(missed, alice))).to.equal("BackfillOutOfRange");
+
+    // 第二天 00:10，预言机还是那一天 01:00:30 的价格：任何人都可以回填
+    await warpTo((missed + 1) * DAY + 600);
+    await backfill(missed, alice);
+    const f = await program.account.fund.fetch(fund);
+    const slot = missed % 64;
+    expect([f.state.priceDays[slot].toNumber(), f.state.prices[slot].toString()]).to.deep.equal([
+      missed,
+      usd(58_000).toString(),
+    ]);
+    await warpTo(now + 1);
+    expect(await errorName(backfill(missed, bob))).to.equal("PriceAlreadyRecorded");
+
+    // 前一天同样没人定价，但预言机现在的价格不是那天定价窗口内发布的，不能用来回填
+    await setPrice(58_000);
+    expect(await errorName(backfill(missed - 1, alice))).to.equal("PriceNotAtFixTime");
   });
 });

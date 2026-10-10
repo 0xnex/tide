@@ -27,8 +27,10 @@
 //!   这段时间的请求不能按它成交，也不能撤销已经排队的请求。
 //! - 两个价格（ADR 0003）：信号价格（BTC/USD）用于均线和信号，因为策略跟踪的是 BTC；
 //!   估值价格（cbBTC/USD）用于轧差和交易的 min_out，因为基金实际持有的是 cbBTC。
-//! - 定价时记录当天的信号价格，如果高于最近 window 个信号价格的平均值，目标是持有 cbBTC；
-//!   否则全部持有 USDC。价格不足 window 个时持有 USDC。
+//! - 定价时记录当天的信号价格，如果高于最近 window 个日历日信号价格的平均值，目标是持有 cbBTC；
+//!   否则全部持有 USDC。价格按日期存在 MAX_WINDOW 个格子里：没有定价的一天可以由任何人
+//!   用那天定价窗口内发布的价格回填；没回填的跳过，用更早的一天补足。
+//!   最近 MAX_WINDOW 天里价格不足 window 个时持有 USDC。
 //! - 每笔交易前检查两个最新价格：相差超过 depeg_threshold_bps（脱锚）时不买入 cbBTC；
 //!   卖出和定价照常进行，持续脱锚也不会让基金卡住。
 //! - 资产用内部记账，不读取代币账户余额，别人直接转账进来不会影响份额计算
@@ -66,21 +68,23 @@ pub enum FundError {
     BelowMinSubscription,
     ZeroAmount,
     TooManyPrices,
-    PriceNotAtFixTime,   // 定价价格的发布时间不在定价窗口内
-    NothingToTrade,      // 没有需要交易的东西
-    TradeTooSoon,        // 距离上一笔交易不到 min_trade_interval_secs
-    DepegBlocksBuy,      // 需要买入 cbBTC，但 cbBTC 脱锚
-    SliceNotSold,        // 这一期的赎回资产还没卖完
-    WrongEpochRecord,    // 传入的期记录与交易计划不符
-    TooManySlices,       // 未卖完的赎回资产已有 MAX_SLICES 期
-    FixPending,          // 已过今天的定价时刻、还没定价，基金调仓等待定价
-    KeeperOnly,          // 清算窗口内只有清算地址能驱动结算
-    WrongEpoch,          // 排队记录不是这一刻开放的那一期
-    TooLateToCancel,     // 已过关闭这一期的定价时刻，不能再撤销
-    NothingToCancel,     // 排队记录是空的
-    SubscriptionsPaused, // 管理员暂停了申购（赎回永远不能暂停）
-    TimelockNotElapsed,  // 配置提议还没过时间锁
-    ConfigFieldFixed,    // 定价时刻和均线窗口只能在创建时设定
+    PriceNotAtFixTime,    // 定价价格的发布时间不在定价窗口内
+    NothingToTrade,       // 没有需要交易的东西
+    TradeTooSoon,         // 距离上一笔交易不到 min_trade_interval_secs
+    DepegBlocksBuy,       // 需要买入 cbBTC，但 cbBTC 脱锚
+    SliceNotSold,         // 这一期的赎回资产还没卖完
+    WrongEpochRecord,     // 传入的期记录与交易计划不符
+    TooManySlices,        // 未卖完的赎回资产已有 MAX_SLICES 期
+    FixPending,           // 已过今天的定价时刻、还没定价，基金调仓等待定价
+    KeeperOnly,           // 清算窗口内只有清算地址能驱动结算
+    WrongEpoch,           // 排队记录不是这一刻开放的那一期
+    TooLateToCancel,      // 已过关闭这一期的定价时刻，不能再撤销
+    NothingToCancel,      // 排队记录是空的
+    SubscriptionsPaused,  // 管理员暂停了申购（赎回永远不能暂停）
+    TimelockNotElapsed,   // 配置提议还没过时间锁
+    ConfigFieldFixed,     // 定价时刻和均线窗口只能在创建时设定
+    PriceAlreadyRecorded, // 这一天已经有信号价格
+    BackfillOutOfRange,   // 只能回填过去、还在存储范围内（最近 MAX_WINDOW 天）的一天
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,12 +182,13 @@ pub struct FundState {
     pub next_epoch: u64,
     pub next_subscription_usdc: u64,
     pub next_redemption_shares: u64,
-    pub prices: [u64; MAX_WINDOW],   // 每日信号价格环形缓冲
-    pub price_count: u8,             // 已记录的价格数量（最多 window）
-    pub price_head: u8,              // 下一个写入位置
-    pub target_btc: bool,            // 最近一次定价的目标：true 持有 cbBTC，false 持有 USDC
-    pub last_fix_day: i64,           // 最近一次定价的日期序号（unix 秒 / 86400），-1 表示从未定价
-    pub last_trade_time: i64,        // 最近一笔交易的时间（unix 秒）
+    // 每日信号价格：第 day 天存在 day mod MAX_WINDOW 号格子里，price_days 记它是哪一天。
+    // 价格为 0 表示空格子。
+    pub prices: [u64; MAX_WINDOW],
+    pub price_days: [i64; MAX_WINDOW],
+    pub target_btc: bool, // 最近一次定价的目标：true 持有 cbBTC，false 持有 USDC
+    pub last_fix_day: i64, // 最近一次定价的日期序号（unix 秒 / 86400），-1 表示从未定价
+    pub last_trade_time: i64, // 最近一笔交易的时间（unix 秒）
     pub slices: [Slice; MAX_SLICES], // 未卖完的赎回资产，最早的在前
     pub slice_count: u8,
     pub pending: [Pending; MAX_PENDING], // 待成交申购，最早的在前
@@ -203,8 +208,7 @@ impl FundState {
             next_subscription_usdc: 0,
             next_redemption_shares: 0,
             prices: [0; MAX_WINDOW],
-            price_count: 0,
-            price_head: 0,
+            price_days: [0; MAX_WINDOW],
             target_btc: false,
             last_fix_day: -1,
             last_trade_time: 0,
@@ -357,40 +361,89 @@ fn fund_rebalanced(s: &FundState, price: u64) -> Result<bool, FundError> {
     }
 }
 
-/// 当前价格窗口的简单平均。价格不足 window 个时返回 None。
-pub fn moving_average(s: &FundState, window: u8) -> Option<u64> {
-    if s.price_count < window || window == 0 {
-        return None;
-    }
-    let w = window as usize;
-    let mut sum: u128 = 0;
-    for k in 0..w {
-        let idx = (s.price_head as usize + MAX_WINDOW - 1 - k) % MAX_WINDOW;
-        sum += s.prices[idx] as u128;
-    }
-    Some((sum / w as u128) as u64)
+fn price_slot(day: i64) -> usize {
+    day.rem_euclid(MAX_WINDOW as i64) as usize
 }
 
-pub fn push_price(s: &mut FundState, price: u64, window: u8) {
-    s.prices[s.price_head as usize] = price;
-    s.price_head = ((s.price_head as usize + 1) % MAX_WINDOW) as u8;
-    if s.price_count < window {
-        s.price_count += 1;
+/// 第 day 天的信号价格（没有记录或者格子已被更晚的一天占用时为 None）
+fn price_on(s: &FundState, day: i64) -> Option<u64> {
+    let i = price_slot(day);
+    (s.prices[i] > 0 && s.price_days[i] == day).then_some(s.prices[i])
+}
+
+/// 记录第 day 天的信号价格，覆盖这个格子里 MAX_WINDOW 天之前的那一天
+pub fn record_price(s: &mut FundState, day: i64, price: u64) {
+    let i = price_slot(day);
+    s.prices[i] = price;
+    s.price_days[i] = day;
+}
+
+/// 第 day 天的均线：从这一天往前，取最近 window 个有价格的日历日求简单平均。
+/// 没有价格的一天跳过；最多往回看 MAX_WINDOW 天（存储只有这么多），不足 window 个时返回 None。
+pub fn moving_average(s: &FundState, day: i64, window: u8) -> Option<u64> {
+    if window == 0 {
+        return None;
     }
+    let (mut sum, mut n): (u128, u8) = (0, 0);
+    for d in (0..MAX_WINDOW as i64).map(|k| day.saturating_sub(k)) {
+        if let Some(p) = price_on(s, d) {
+            sum += p as u128;
+            n += 1;
+            if n == window {
+                return Some((sum / window as u128) as u64);
+            }
+        }
+    }
+    None
 }
 
 /// 管理员在首次定价前写入历史价格，让均线从第一天就能计算。
+/// prices 是到 last_day 为止（含）连续几天的价格，最早的在前。
 /// 只能在从未定价过时调用（由外层检查）。
-pub fn seed_prices(s: &mut FundState, prices: &[u64], cfg: &Config) -> Result<(), FundError> {
+pub fn seed_prices(
+    s: &mut FundState,
+    prices: &[u64],
+    last_day: i64,
+    cfg: &Config,
+) -> Result<(), FundError> {
     if prices.len() > cfg.window as usize {
         return Err(FundError::TooManyPrices);
     }
-    for &p in prices {
-        if p == 0 {
-            return Err(FundError::BadPrice);
-        }
-        push_price(s, p, cfg.window);
+    if prices.contains(&0) {
+        return Err(FundError::BadPrice);
     }
+    // 不超过 window ≤ MAX_WINDOW 个，不会溢出
+    let first_day = last_day - prices.len() as i64 + 1;
+    for (k, &p) in prices.iter().enumerate() {
+        record_price(s, first_day + k as i64, p);
+    }
+    Ok(())
+}
+
+/// 回填没有定价的一天的信号价格，任何人都可以调用。
+/// 只接受过去的一天、还在存储范围内（最近 MAX_WINDOW 天）、还没有价格，
+/// 而且价格发布在那一天的定价窗口内：回填的人只能在那几十秒里发布的价格中挑，
+/// 和那天按时定价拿到的价格一样（谁先回填用谁的；换成 Pyth 后这几十秒里的价差可以忽略）。
+/// 只影响之后定价时的均线，已经定价的结果不变。
+pub fn backfill_price(
+    s: &mut FundState,
+    day: i64,
+    signal: &PricePoint,
+    now_unix: i64,
+    cfg: &Config,
+) -> Result<(), FundError> {
+    let today = day_of(now_unix);
+    if day >= today || day <= today.saturating_sub(MAX_WINDOW as i64) {
+        return Err(FundError::BackfillOutOfRange);
+    }
+    if price_on(s, day).is_some() {
+        return Err(FundError::PriceAlreadyRecorded);
+    }
+    if signal.price == 0 {
+        return Err(FundError::BadPrice);
+    }
+    check_fix_window(signal.publish_time, fix_time(day, cfg))?;
+    record_price(s, day, signal.price);
     Ok(())
 }
 
@@ -402,6 +455,15 @@ pub fn is_depegged(signal: u64, valuation: u64, threshold_bps: u16) -> bool {
 
 pub fn day_of(unix: i64) -> i64 {
     unix.div_euclid(SECONDS_PER_DAY)
+}
+
+/// 价格的发布时间是否在定价窗口 [fix_at, fix_at + FIX_WINDOW_SECS) 内：
+/// 定价和回填都只认这几十秒里发布的价格，调用人不能挑一天里对自己最有利的时刻
+fn check_fix_window(publish_time: i64, fix_at: i64) -> Result<(), FundError> {
+    if publish_time < fix_at || publish_time >= fix_at.saturating_add(FIX_WINDOW_SECS) {
+        return Err(FundError::PriceNotAtFixTime);
+    }
+    Ok(())
 }
 
 /// 当天的定价时刻（unix 秒）
@@ -805,7 +867,8 @@ pub fn fix(
         return Err(FundError::TooEarly);
     }
     for t in [prices.signal.publish_time, prices.valuation.publish_time] {
-        if t < fix_at || t >= fix_at.saturating_add(FIX_WINDOW_SECS) || t > now_unix {
+        check_fix_window(t, fix_at)?;
+        if t > now_unix {
             return Err(FundError::PriceNotAtFixTime);
         }
     }
@@ -818,8 +881,8 @@ pub fn fix(
 
     // 2. 信号价格进均线，决定目标
     let signal = prices.signal.price;
-    push_price(&mut n, signal, cfg.window);
-    let ma = moving_average(&n, cfg.window);
+    record_price(&mut n, day, signal);
+    let ma = moving_average(&n, day, cfg.window);
     n.target_btc = matches!(ma, Some(m) if signal > m);
 
     // 3. 赎回资产：按份额比例划出实物，不需要价格
@@ -1278,7 +1341,8 @@ mod tests {
 
         fn seeded(price: u64) -> Self {
             let mut h = Self::new();
-            seed_prices(&mut h.s, &vec![price; 49], &h.c).unwrap();
+            // 第 -40 到第 8 天
+            seed_prices(&mut h.s, &vec![price; 49], 8, &h.c).unwrap();
             h
         }
 
@@ -1596,15 +1660,102 @@ mod tests {
     }
 
     #[test]
-    fn moving_average_uses_last_window_prices() {
-        let c = Config { window: 3, ..cfg() };
+    fn moving_average_uses_the_latest_window_days() {
         let mut s = FundState::new();
-        for p in [10, 20, 30, 40] {
-            push_price(&mut s, p, c.window);
+        for (day, p) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
+            record_price(&mut s, day, p);
         }
-        assert_eq!(moving_average(&s, 3), Some(30)); // (20+30+40)/3
-        let s2 = FundState::new();
-        assert_eq!(moving_average(&s2, 3), None);
+        assert_eq!(moving_average(&s, 4, 3), Some(30)); // (20+30+40)/3
+        assert_eq!(moving_average(&s, 3, 3), Some(20)); // 只看这一天及之前
+        assert_eq!(moving_average(&FundState::new(), 4, 3), None);
+
+        // 没有价格的一天跳过，用更早的一天补足 window 个
+        let mut s = FundState::new();
+        for (day, p) in [(1, 10), (2, 20), (4, 40)] {
+            record_price(&mut s, day, p);
+        }
+        // (10+20+40)/3
+        assert_eq!(moving_average(&s, 4, 3), Some(23));
+        // 最多往回看 MAX_WINDOW 天：更早的价格已经不在存储里
+        assert_eq!(moving_average(&s, 4 + MAX_WINDOW as i64, 3), None);
+        assert_eq!(moving_average(&s, 4 + MAX_WINDOW as i64 - 1, 1), Some(40));
+        // 一个格子只存一天：64 天之后同一个格子被新的一天覆盖
+        record_price(&mut s, 4 + MAX_WINDOW as i64, 99);
+        assert_eq!(moving_average(&s, 4 + MAX_WINDOW as i64, 1), Some(99));
+        assert_eq!(moving_average(&s, 4, 1), Some(20));
+    }
+
+    #[test]
+    fn a_gap_then_backfill_restores_the_50_day_average() {
+        // 种子价格是第 -40 到第 8 天的 49 个 50,000；第 9 天定价，第 10 天没人定价
+        let mut h = Harness::seeded(50_000 * USDC);
+        h.fix_day(9, 50_000 * USDC);
+        let fix11 = 11 * DAY + ONE_AM;
+        let p11 = at_fix(11, 52_000 * USDC);
+
+        // 不回填：第 10 天跳过，均线用更早的一天补足 50 个
+        let r = fix(&mut h.s.clone(), fix11, &p11, Caller::Keeper, &h.c).unwrap();
+        assert_eq!(r.record.moving_average, (49 * 50_000 + 52_000) * USDC / 50);
+
+        // 任何人用第 10 天定价窗口内发布的价格回填，均线恢复成最近 50 个日历日
+        let p10 = PricePoint {
+            price: 60_000 * USDC,
+            publish_time: 10 * DAY + ONE_AM + 5,
+        };
+        backfill_price(&mut h.s, 10, &p10, 11 * DAY, &h.c).unwrap();
+        let r = h.fix_with(fix11, &p11).unwrap();
+        assert_eq!(
+            r.moving_average,
+            (48 * 50_000 + 60_000 + 52_000) * USDC / 50
+        );
+    }
+
+    #[test]
+    fn backfill_only_fills_a_missing_day_with_its_fixing_window_price() {
+        let mut h = Harness::seeded(50_000 * USDC);
+        h.fix_day(9, 50_000 * USDC);
+        let now = 12 * DAY + 5 * ONE_AM;
+        let at = |day: i64, t: i64| PricePoint {
+            price: 60_000 * USDC,
+            publish_time: day * DAY + ONE_AM + t,
+        };
+        let s0 = h.s.clone();
+        let run = |day: i64, p: PricePoint| backfill_price(&mut s0.clone(), day, &p, now, &h.c);
+        // 已经有价格的一天（定价过的、种子价格）不能改
+        assert_eq!(run(9, at(9, 0)), Err(FundError::PriceAlreadyRecorded));
+        assert_eq!(run(8, at(8, 0)), Err(FundError::PriceAlreadyRecorded));
+        // 只能回填过去的一天，而且还在存储范围内（最近 MAX_WINDOW 天）
+        assert_eq!(run(12, at(12, 0)), Err(FundError::BackfillOutOfRange));
+        assert_eq!(run(13, at(13, 0)), Err(FundError::BackfillOutOfRange));
+        let oldest = 12 - MAX_WINDOW as i64 + 1;
+        assert_eq!(
+            run(oldest - 1, at(oldest - 1, 0)),
+            Err(FundError::BackfillOutOfRange)
+        );
+        // 发布时间必须在那一天的定价窗口内
+        let bad = Err(FundError::PriceNotAtFixTime);
+        assert_eq!(run(10, at(10, -1)), bad);
+        assert_eq!(run(10, at(10, FIX_WINDOW_SECS)), bad);
+        assert_eq!(run(10, at(11, 0)), bad);
+        assert_eq!(
+            run(
+                10,
+                PricePoint {
+                    price: 0,
+                    publish_time: 10 * DAY + ONE_AM
+                }
+            ),
+            Err(FundError::BadPrice)
+        );
+        // 失败时状态不变；成功只写这一天，之后不能再改
+        assert_eq!(h.s, s0);
+        backfill_price(&mut h.s, 10, &at(10, FIX_WINDOW_SECS - 1), now, &h.c).unwrap();
+        assert_eq!(
+            backfill_price(&mut h.s, 10, &at(10, 0), now, &h.c),
+            Err(FundError::PriceAlreadyRecorded)
+        );
+        backfill_price(&mut h.s, oldest, &at(oldest, 0), now, &h.c).unwrap();
+        assert_eq!(moving_average(&h.s, 10, 1), Some(60_000 * USDC));
     }
 
     #[test]
@@ -3216,6 +3367,7 @@ mod tests {
         let (mut late, mut dust, mut carried, mut illiquid_days) = (0, 0, 0, 0);
         let (mut public_fixes, mut public_fixes_rejected) = (0, 0);
         let (mut late_cancels_rejected, mut cancels, mut paused_rejections) = (0, 0, 0);
+        let (mut skipped_fixes, mut backfills) = (0, 0);
         for seed in 1..=20u64 {
             let mut rng = Rng(seed * 7919);
             let mut h = Harness::seeded(50_000 * USDC);
@@ -3224,7 +3376,19 @@ mod tests {
             let mut price = 50_000 * USDC;
             let mut valuation = price;
             let mut fail_pct = 30;
+            let mut skipped: Option<(i64, PricePoint)> = None;
             for day in 10..300i64 {
+                // 昨天没人定价：一半的时候有人用昨天定价窗口内的价格回填，只能回填一次
+                if let Some((d, signal)) = skipped.take() {
+                    if rng.below(2) == 0 {
+                        backfill_price(&mut h.s, d, &signal, day * DAY, &h.c).unwrap();
+                        assert_eq!(
+                            backfill_price(&mut h.s, d, &signal, day * DAY, &h.c),
+                            Err(FundError::PriceAlreadyRecorded)
+                        );
+                        backfills += 1;
+                    }
+                }
                 // 管理员随机暂停、恢复申购：赎回、定价、交易和领取照常
                 if rng.below(15) == 0 {
                     h.s.subscriptions_paused = !h.s.subscriptions_paused;
@@ -3314,24 +3478,30 @@ mod tests {
                         publish_time: publish(&mut rng),
                     },
                 };
-                // 随机调用人：清算窗口内其他人被拒绝，由清算地址定价
-                let in_window = now < fix_at + h.c.keeper_window_secs;
-                let caller = if rng.below(3) == 0 {
-                    Caller::Public
+                // 有时整天没人定价：这一期顺延，第二天可能有人回填这天的信号价格
+                if rng.below(25) == 0 {
+                    skipped = Some((day, p.signal));
+                    skipped_fixes += 1;
                 } else {
-                    Caller::Keeper
-                };
-                let caller = if caller == Caller::Public && in_window {
-                    assert_eq!(h.fix_as(now, &p, caller), Err(FundError::KeeperOnly));
-                    public_fixes_rejected += 1;
-                    Caller::Keeper
-                } else {
-                    caller
-                };
-                match h.fix_as(now, &p, caller) {
-                    Ok(_) if caller == Caller::Public => public_fixes += 1,
-                    Ok(_) | Err(FundError::TooManySlices) => {}
-                    Err(e) => panic!("fix: {e:?}"),
+                    // 随机调用人：清算窗口内其他人被拒绝，由清算地址定价
+                    let in_window = now < fix_at + h.c.keeper_window_secs;
+                    let caller = if rng.below(3) == 0 {
+                        Caller::Public
+                    } else {
+                        Caller::Keeper
+                    };
+                    let caller = if caller == Caller::Public && in_window {
+                        assert_eq!(h.fix_as(now, &p, caller), Err(FundError::KeeperOnly));
+                        public_fixes_rejected += 1;
+                        Caller::Keeper
+                    } else {
+                        caller
+                    };
+                    match h.fix_as(now, &p, caller) {
+                        Ok(_) if caller == Caller::Public => public_fixes += 1,
+                        Ok(_) | Err(FundError::TooManySlices) => {}
+                        Err(e) => panic!("fix: {e:?}"),
+                    }
                 }
                 let m = MarketPrices {
                     signal: price,
@@ -3382,6 +3552,10 @@ mod tests {
         assert!(
             cancels > 0 && late_cancels_rejected > 0 && paused_rejections > 0,
             "{cancels} {late_cancels_rejected} {paused_rejections}"
+        );
+        assert!(
+            skipped_fixes > 0 && backfills > 0,
+            "{skipped_fixes} {backfills}"
         );
     }
 
