@@ -4330,6 +4330,21 @@ mod tests {
         );
     }
 
+    /// 不变量 8：记账只用整数。fund-logic 和程序里测试以外的代码都不能出现浮点数
+    #[test]
+    fn money_code_uses_integers_only() {
+        let sources = [
+            ("fund-logic", include_str!("lib.rs")),
+            ("program", include_str!("../../programs/tide/src/lib.rs")),
+        ];
+        for (name, src) in sources {
+            let code = src.split("#[cfg(test)]").next().unwrap();
+            for float in ["f32", "f64"] {
+                assert!(!code.contains(float), "{name} 用了 {float}");
+            }
+        }
+    }
+
     #[test]
     fn depeg_threshold_is_relative_to_the_signal_price() {
         let bps = cfg().depeg_threshold_bps;

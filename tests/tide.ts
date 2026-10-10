@@ -1,20 +1,23 @@
 // 端到端测试：在 bankrun 里跑真实的程序，并通过修改时钟模拟多天结算。
 // 单笔交易上限设为 1,000 USDC，每天的调仓要分成几笔、间隔 60 秒完成。
 //
-// 场景：
-//   第 1 天：Alice 申购 1000、Bob 申购 3000；价格高于均线 -> 分 4 笔为申购买入 cbBTC，中途先领一部分份额
-//   第 2 天：Alice 赎回全部份额；价格上涨 10% -> 分 2 笔卖出她那份 cbBTC，卖完才能领取，1% 取款费付给收费地址；
-//            中途一笔成交低于 min_out，只回滚那一笔
-//   第 3 天：价格跌破均线 -> 分几笔全部换成 USDC；清算窗口内 Alice 不能交易，窗口之后可以
+// 场景（按顺序在同一个基金上跑，时钟一路往后走）：
+//   第 1 天：Alice 申购 1000、Bob 申购 3000；价格高于均线 -> 分 4 笔为申购买入 cbBTC，中途先领一部分份额；
+//            同一天不能定价两次
+//   第 2 天：Alice 赎回全部份额；价格上涨 10% -> 分 2 笔卖出她那份 cbBTC，卖完才能领取；
+//            中途一笔成交低于 min_out，只回滚那一笔；1% 取款费由任何人结清到收费地址
+//   第 3 天：价格跌破均线 -> 分几笔全部换成 USDC；清算窗口内 Alice 不能交易，窗口之后可以（滑点上限更严）
 //   第 4 天：Bob 赎回全部 -> 基金只有 USDC，赎回资产定价时就完成，份额清零
-//   第 5 天：Alice 再申购；BTC 高于均线，但 cbBTC 比 BTC 低 3%（脱锚）-> 不买入，申购款留在托管里
+//   第 5 天：Alice 再申购；cbBTC 比 BTC 低 3%（脱锚）-> 不买入，申购款留在托管里
 //   第 6 天：恢复锚定 -> 为 Alice 买入 cbBTC，她领到份额
-//   治理：配置修改等 48 小时时间锁；申购可以立即暂停，赎回不受影响；只有管理员能操作
-//   申购上限：算上待成交的申购，超过就拒绝；撤销待成交申购退回 USDC、腾出额度
-//   价格源：前面用 cbBTC/USD 作信号（脱锚时不买入）；治理之后换成 BTC/USD，没有 cbBTC/USD 也照常定价
-//   回填：某天没人定价，第二天任何人用那天 01:00 发布的价格回填均线，只能回填一次
 //   第 7 天：排队从不关闭。定价时刻之后的请求进入下一期，每个用户每期一张排队记录；
 //            关闭这一期的定价时刻之前可以撤销、全额退回，之后被拒绝
+//   治理：配置修改（单笔上限、信号价格源换成 BTC/USD）等 48 小时时间锁；申购可以立即暂停，
+//         赎回不受影响；只有管理员能操作
+//   回填：某天没人定价，第二天任何人用那天 01:00 发布的价格回填均线，只能回填一次
+//   申购上限：算上待成交的申购，超过就拒绝；撤销部分成交的待成交申购，领走份额、退回 USDC
+//   价格源：用 BTC/USD 作信号时 cbBTC/USD 即使有也不用，不检查脱锚
+//   捐款：直接转进基金账户的代币不算基金资产
 //
 // 每个请求属于关闭它的定价时刻那一期（期号是那天的日期序号）。第一天的申购在第 0 天提交，
 // 那天没有定价，顺延到第 1 天的定价：领取时用之后第一次定价的记录。
@@ -766,5 +769,27 @@ describe("tide", () => {
     expect(r.referencePrice.toNumber()).to.equal(0);
     const [, why] = await tradeUntilDone();
     expect(why).to.equal("NothingToTrade");
+  });
+
+  it("捐款不算基金资产：直接转进基金账户的代币不进入记账，份额按内部记账发行", async () => {
+    // 有人直接往基金的 USDC 和 cbBTC 账户转账（比如想抬高每份的价格）
+    const donatedUsdc = 10_000 * USDC;
+    const donatedBtc = 50_000_000; // 0.5 cbBTC
+    const ledger = (st: any) => [st.usdc.toString(), st.btc.toString(), st.shareSupply.toString()];
+    const before = ledger((await program.account.fund.fetch(fund)).state);
+    await send([
+      createMintToInstruction(usdcMint.publicKey, fundPda("usdc_vault"), admin.publicKey, donatedUsdc),
+      createMintToInstruction(btcMint.publicKey, fundPda("btc_vault"), admin.publicKey, donatedBtc),
+    ]);
+    // 基金资产和份额（也就是每份对应的资产）都不变
+    expect(ledger((await program.account.fund.fetch(fund)).state)).to.deep.equal(before);
+    // 照常定价、交易：基金只按内部记账的资产运作，捐款一直多在账户里
+    await fixDay(58_000);
+    const [, why] = await tradeUntilDone();
+    expect(why).to.equal("NothingToTrade");
+    const st = (await program.account.fund.fetch(fund)).state;
+    expect(st.sliceCount).to.equal(0);
+    expect(await tokenBalance(fundPda("usdc_vault"))).to.equal(BigInt(st.usdc.toString()) + BigInt(donatedUsdc));
+    expect(await tokenBalance(fundPda("btc_vault"))).to.equal(BigInt(st.btc.toString()) + BigInt(donatedBtc));
   });
 });

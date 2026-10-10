@@ -102,7 +102,7 @@ _Avoid_: Daily limit, max adjustment
 ## Prices
 
 **Signal price** (信号价格):
-The price used for the moving average and the hold-cbBTC-or-USDC signal: Pyth cbBTC/USD when that feed exists, otherwise BTC/USD. The `signal_feed` config says which, and changes only through the timelock.
+The price used for the moving average and the hold-cbBTC-or-USDC signal, from the feed named by the `signal_feed` config: BTC/USD by default, or Pyth cbBTC/USD where that feed exists. It changes only through the timelock.
 
 **Moving average** (均线):
 The average signal price over the last 50 fixing times, one per calendar day; a day with no settlement is backfilled with that day's published fixing price. A day never backfilled is skipped and an earlier day counts instead; prices are kept for 64 days, so with fewer than 50 prices in that span the target is USDC.

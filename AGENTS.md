@@ -6,7 +6,7 @@ Guidance for AI coding agents (and human contributors) working on this repositor
 
 `tide` is a Solana (Anchor) program for a pooled BTC fund. Users queue USDC subscriptions and share redemptions; at 01:00 UTC each day the fixing price is recorded and compared with the 50-day moving average. Settlement then sets aside the redemption slice, nets subscriptions against it, and rebalances the fund toward all-cbBTC (above the average) or all-USDC (below) through capped trades. Shares follow actual execution, never a USD valuation. Users then `claim` their shares or USDC. It is a **devnet prototype**: oracle and exchange are mocks.
 
-**Design in transition.** The target design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/` (decisions; 0005–0007 replace parts of 0002–0004). The invariants below describe that target design. Settlement already runs as a `fix` step plus capped `trade` steps, redeemers are paid what their redemption slice sells for, and subscriptions become shares by the asset they add. The 48-hour config timelock, the subscription pause, the moving-average backfill, the withdrawal fee, the subscription cap and pending cancels are built. The signal follows the `signal_feed` config: BTC/USD by default, cbBTC/USD when that feed is chosen. Treat any difference between that code and these invariants as migration work to do, not as a rule to restore.
+The design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/` (decisions; 0005–0007 replace parts of 0002–0004). The invariants below describe the code as it is.
 
 ## Replies
 
@@ -70,7 +70,7 @@ flowchart LR
 8. **Integer math only.** No floats in `fund-logic` or the program. Use `u128` intermediates and checked arithmetic; round in favor of the fund (down for amounts paid out, up for amounts the fund must sell to cover a payout).
 9. **One settlement per epoch,** opened at its fixing time. Only the keeper may drive it during the keeper window; after that, anyone may.
 10. **Step atomicity.** Settlement is several instructions (ADR 0001). Within each instruction, all token movements and checks happen together, so a failure rolls that step back. The state between steps must always let the next step resume.
-11. **Price feeds.** The signal and moving average use Pyth cbBTC/USD when that feed exists, otherwise BTC/USD (ADR 0005). Netting and `min_out` use cbBTC/USD (BTC/USD when there is no cbBTC/USD feed). When the signal uses cbBTC/USD, a gap above the depeg threshold against BTC/USD blocks buys (ADR 0003), and so does a missing or stale BTC/USD reference, which never blocks sells or fixing. With only BTC/USD there is no depeg check and trades rely on the slippage bound. A missed day's fixing price may be backfilled only with a Pyth update published in that day's fixing window.
+11. **Price feeds.** One feed, named by the `signal_feed` config, drives the signal, the moving average, netting and `min_out`: BTC/USD by default, or Pyth cbBTC/USD where that feed exists (ADR 0005). It is set at `initialize` and changes only through the timelock. When the signal uses cbBTC/USD, a gap above the depeg threshold against BTC/USD blocks buys (ADR 0003), and so does a missing or stale BTC/USD reference, which never blocks sells or fixing. With only BTC/USD there is no depeg check and trades rely on the slippage bound. A missed day's fixing price may be backfilled only with a Pyth update published in that day's fixing window.
 12. **Withdrawal fee.** 1% of the USDC a redeemer claims goes to the fee address, set at `initialize` and changeable only through the 48-hour timelock. `claim` only records it in `FundState.fees_owed` (the USDC stays in the payout vault) and `collect_fees` pays it out, so a problem with the fee address's token account can never block a claim. The rate is capped at 1% in code. There is no performance fee and no redemption fee (ADR 0007).
 
 ## Keeping the two layers in sync
@@ -118,10 +118,26 @@ Changing seeds breaks existing deployments and the tests/scripts that derive the
 - The two randomized tests (`random_simulation_invariants`, `random_simulation_with_trading_costs_never_gets_stuck`) are the main safety net. Do not weaken their assertions to make a change pass; if one fails, the change is probably wrong.
 - When fixing a bug, first add a test that reproduces it.
 - End-to-end tests control time with bankrun's `setClock`; advance the slot before setting the clock so identical transactions are not deduplicated.
+- Each invariant has at least one named test. Keep this table current when you add or rename tests (`fund-logic` tests unless marked e2e):
+
+| Invariant | Tests |
+|---|---|
+| 1 Execution pricing | `redemption_slice_is_paid_its_actual_proceeds_once_sold_out`, `subscription_buys_become_shares_by_the_cbbtc_they_add_and_are_claimed_in_parts`, `netting_fills_subscriptions_with_the_slice_cbbtc_at_the_fixing_price`, `subscriptions_wait_until_the_fund_finishes_its_rebalance` |
+| 2 Fixed pricing time | `fix_price_must_be_published_in_fix_window`, `late_fix_uses_fix_prices_whatever_the_call_time`, `a_request_after_the_fixing_time_joins_the_next_epoch`, `requests_of_skipped_fixings_roll_into_the_next_one`, `a_request_can_be_cancelled_until_its_fixing_time`, `cancelling_a_pending_subscription_refunds_the_unfilled_part_and_keeps_filled_shares` |
+| 3 Internal accounting | `unsold_slices_keep_priority_across_the_next_fixing` (unsold slice cbBTC is not a fund asset), `a_pending_cancel_refunds_the_unfilled_usdc_after_the_subscription_fee`, the token ledger check in every harness step, e2e "捐款不算基金资产" |
+| 4 Exact claims | `redeemer_payouts_plus_fees_equal_the_epoch_payout_exactly`, `the_last_pending_subscriber_to_cancel_takes_everything_left`, both randomized simulations (`drain`) |
+| 5 Share supply | both randomized simulations (`assert_share_supply`), e2e day 1 |
+| 6 No stuck states | `random_simulation_with_trading_costs_never_gets_stuck`, `too_many_unsold_slices_delays_fixing_until_they_sell`, `depeg_blocks_buys_but_not_sells_or_fixing`, `a_missing_reference_blocks_buys_but_not_sells_or_fixing`, `dust_redemption_while_fully_in_btc_does_not_get_stuck` |
+| 7 Trade guards | `rebalance_is_split_into_capped_trades_spaced_by_the_interval`, `trade_min_out_uses_the_valuation_price_at_execution`, `fill_below_min_out_reverts_that_trade_only`, `public_trades_use_the_tighter_slippage_bound` |
+| 8 Integer math | `money_code_uses_integers_only`, `near_full_exit_with_costs_never_sells_the_stayers_btc`, `a_holder_who_stays_keeps_their_cbbtc_per_share_despite_other_flows` |
+| 9 One settlement per epoch | `cannot_fix_before_1am_or_twice`, `only_the_keeper_drives_settlement_inside_the_keeper_window` |
+| 10 Step atomicity | `fill_below_min_out_reverts_that_trade_only`, `too_many_unsold_slices_delays_fixing_until_they_sell` (a failed fix leaves the state unchanged), e2e day 2 rollback |
+| 11 Price feeds | `the_moving_average_records_the_chosen_feeds_fixing_price`, `the_depeg_check_runs_only_when_both_feeds_exist`, `a_gap_then_backfill_restores_the_50_day_average`, `backfill_only_fills_a_missing_day_with_its_fixing_window_price` |
+| 12 Withdrawal fee | `redeemers_pay_the_withdrawal_fee_on_gains_and_losses`, `share_claims_and_refunds_pay_no_withdrawal_fee`, `config_validation` (cap at 1%), e2e day 2 |
 
 ## Mock components
 
-`MockOracle`, `MockMarket`, `init_mock_oracle`, `set_mock_price`, and `init_mock_market` exist only for devnet. When replacing them:
+`MockOracle`, `MockMarket`, `init_mock_oracle`, `set_mock_price`, `init_mock_market` and `set_mock_market_fee` exist only for devnet. When replacing them:
 
 - **Oracle (Pyth):** check publish time against `max_staleness_secs`, reject wide confidence intervals, convert the exponent to micro-USD carefully.
 - **Exchange (Jupiter):** compute the route off-chain, pass route accounts into `trade`, and keep the on-chain `min_out` check against the oracle. Never trust a price supplied by the caller.

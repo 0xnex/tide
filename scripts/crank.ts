@@ -1,6 +1,8 @@
 // 每日结算脚本（devnet 原型用）
 //
 // 做三件事：
+//   0. 昨天没有定价、预言机里还是昨天定价窗口内发布的价格时，先 backfill_price 回填昨天的均线
+//      （写入今天的价格会覆盖它）。
 //   1. 从 Binance 公开行情读取 BTC 价格，写入模拟预言机（主网版本应改用 Pyth，删除这一步）。
 //      Binance 没有 cbBTC 行情，devnet 上把 cbBTC/USD 当作与 BTC/USD 同价；
 //      配置 signal_feed 为 btc 时只写 BTC/USD。Pyth 上线后分别读取 BTC/USD 和 cbBTC/USD。
@@ -9,6 +11,9 @@
 //      NothingToTrade（都做完了）、DepegBlocksBuy（脱锚，等下一次）或 FixPending（定价没成功，
 //      未卖完的赎回资产已经卖完，基金调仓等下一次定价）。
 //      成交低于 min_out 的那一笔会回滚，等下一个间隔重试。
+//   4. 有欠管理人的取款费时调用 collect_fees，付到收费地址。
+//
+// MOCK_PRICE=<USD> 可以代替 Binance 的价格（比如在本地验证器上运行，或者访问不了 Binance）。
 //
 // 用法（每天 UTC 01:00 用 cron 运行一次。模拟预言机的价格就是定价价格，
 // 必须在 1 点后 60 秒内写入并定价，否则当天的定价会被拒绝，但交易照常进行，
@@ -22,6 +27,7 @@
 import * as anchor from "@coral-xyz/anchor";
 import { BN, Program } from "@coral-xyz/anchor";
 import { PublicKey } from "@solana/web3.js";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { Tide } from "../target/types/tide";
 
 const IDL = require("../target/idl/tide.json");
@@ -32,8 +38,11 @@ const DONE = ["NothingToTrade", "DepegBlocksBuy", "FixPending"];
 const RETRY = ["TradeTooSoon", "SlippageExceeded", "StalePrice"];
 // 定价步骤可以跳过、直接去交易的回答
 const FIX_SKIPPABLE = ["AlreadySettled", "TooManySlices", "PriceNotAtFixTime", "TooEarly"];
+// 不用回填或者回填不了的回答（昨天已经有价格、预言机的价格不是昨天定价窗口内发布的等）
+const BACKFILL_SKIPPABLE = ["PriceAlreadyRecorded", "PriceNotAtFixTime", "BackfillOutOfRange", "BadPrice"];
 
 async function btcPriceMicroUsd(): Promise<BN> {
+  if (process.env.MOCK_PRICE) return new BN(Math.round(Number(process.env.MOCK_PRICE) * 1_000_000));
   const r = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT");
   if (!r.ok) throw new Error(`读取价格失败：HTTP ${r.status}`);
   const j: any = await r.json();
@@ -76,10 +85,37 @@ async function main() {
   if (!f.config.keeper.equals(admin)) {
     throw new Error(`钱包 ${admin.toBase58()} 不是清算地址 ${f.config.keeper.toBase58()}，01:00–01:30 会被拒绝`);
   }
+  // 链上时钟：最近的 finalized 区块时间，取不到时用本机时钟
+  async function chainNow(): Promise<number> {
+    try {
+      const t = await provider.connection.getBlockTime(await provider.connection.getSlot("finalized"));
+      if (t) return t;
+    } catch (e) {
+      console.log(`读取链上时间失败，改用本机时钟：${e}`);
+    }
+    return Math.floor(Date.now() / 1000);
+  }
+
+  const yesterday = Math.floor((await chainNow()) / 86_400) - 1;
+  const slot = ((yesterday % 64) + 64) % 64;
+  if (f.state.priceDays[slot].toNumber() !== yesterday || f.state.prices[slot].isZero()) {
+    try {
+      const sig = await program.methods
+        .backfillPrice(new BN(yesterday))
+        .accountsPartial({ caller: admin, fund, oracle })
+        .rpc();
+      console.log(`回填昨天（${yesterday}）的价格：${sig}`);
+    } catch (e) {
+      const name = errorName(e);
+      if (!name || !BACKFILL_SKIPPABLE.includes(name)) throw e;
+      console.log(`没有回填昨天（${name}）`);
+    }
+  }
+
   console.log(`已写入价格：${await postPrice()} USD`);
   try {
-    // 定价记录的期号是当天的日期序号（链上时钟和本机时钟在 1 点附近不会差出一天）
-    const epoch = Math.floor(Date.now() / 1000 / 86_400);
+    // 定价记录的期号是链上时钟当天的日期序号
+    const epoch = Math.floor((await chainNow()) / 86_400);
     const sig = await program.methods
       .fix(new BN(epoch))
       .accountsPartial({
@@ -137,6 +173,23 @@ async function main() {
       console.log(`本次未成交（${name}），${intervalMs / 1000} 秒后重试`);
     }
     await sleep(intervalMs);
+  }
+
+  // 结清欠管理人的取款费（收费地址的 USDC 账户不存在时由清算地址创建）
+  const owed = (await program.account.fund.fetch(fund)).state.feesOwed;
+  if (owed.gtn(0)) {
+    const sig = await program.methods
+      .collectFees()
+      .accountsPartial({
+        caller: admin,
+        fund,
+        usdcMint: f.usdcMint,
+        feeAddress: f.config.feeAddress,
+        feeUsdc: getAssociatedTokenAddressSync(f.usdcMint, f.config.feeAddress, true),
+        payoutVault: fundPda("payout_vault"),
+      })
+      .rpc();
+    console.log(`结清取款费 ${owed.toNumber() / 1e6} USDC：${sig}`);
   }
 
   const after = await program.account.fund.fetch(fund);

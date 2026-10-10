@@ -4,8 +4,6 @@
 
 > **Devnet prototype. Do not use with real money.** The oracle and exchange are mocks. Mainnet needs a security audit and legal advice: pooling other people's money and charging a fee for managing it is regulated in many jurisdictions.
 
-> **Design in transition.** This README shows the target design ([`CONTEXT.md`](CONTEXT.md) for terms, [`docs/adr/`](docs/adr/) for decisions). The code runs settlement as a fixing step plus capped trades. Redeemers are paid their slice's actual proceeds, and subscriptions become shares by the cbBTC they add. The config timelock, subscription pause, moving-average backfill, 1% withdrawal fee, subscription cap and pending cancels are built. The signal uses the feed named by `signal_feed`: BTC/USD by default, or cbBTC/USD. Sections marked *(current code)* describe what runs today.
-
 ---
 
 ## Why this rule
@@ -194,7 +192,7 @@ flowchart LR
 
 ---
 
-## Getting started *(current code)*
+## Getting started
 
 Needs Rust (stable), Solana CLI 2.x, Anchor 0.31.1 (via `avm`), Node.js 20+ and Yarn.
 
@@ -204,8 +202,6 @@ anchor keys sync                       # write program ID
 anchor build
 yarn install && anchor test            # end-to-end
 ```
-
-> The Anchor program has never been compiled in the original author's environment. If `anchor build` fails, the cause is most likely a small API mismatch in the wrapper, not in the accounting.
 
 ### Deploy to devnet
 
@@ -219,6 +215,12 @@ flowchart LR
   A["mock USDC (6)<br/>mock BTC (8) mints"] --> B["init_mock_oracle"] --> C["init_mock_market<br/>+ liquidity"] --> D["initialize"] --> E["init_vaults"] --> F["seed_prices<br/>last 49 days"]
 ```
 
+`scripts/setup.ts` runs these steps with the wallet as admin, keeper and fee address (env: `MOCK_PRICE`, `SETTLE_OFFSET_SECS`, `SIGNAL_FEED`, `TRADE_CAP_USDC`, `DEMO_USDC` for a first subscription):
+
+```bash
+ANCHOR_PROVIDER_URL=https://api.devnet.solana.com ANCHOR_WALLET=$HOME/.config/solana/id.json yarn ts-node scripts/setup.ts
+```
+
 Run the crank daily at 01:00 UTC. The mock price must be posted within 60 s:
 
 ```cron
@@ -228,12 +230,12 @@ Run the crank daily at 01:00 UTC. The mock price must be posted within 60 s:
 ```mermaid
 flowchart LR
   BN["Binance API<br/>BTC price"] --> CR["crank.ts"] -- "set_mock_price" --> O["mock oracle"]
-  CR -- "fix, then trade<br/>every 60 s until done" --> P["tide program"]
+  CR -- "fix, then trade<br/>every 60 s until done,<br/>then collect_fees" --> P["tide program"]
 ```
 
 ---
 
-## Program reference *(current code)*
+## Program reference
 
 | Instruction | Who | Purpose |
 |---|---|---|
@@ -255,26 +257,28 @@ flowchart LR
 
 ### Configuration
 
-| Field | Default | Meaning | |
-|---|---|---|---|
-| `window` | 50 | Moving-average days (max 64) | current |
-| `settle_offset_secs` | 3600 | Fixing time after 00:00 UTC | current |
-| `max_slippage_bps` | 30 | Keeper slippage bound | current |
-| `subscription_fee_bps` | 0 | Subscription fee, kept in fund | current |
-| `min_subscription` | 1 USDC | Minimum subscription | current |
-| `max_staleness_secs` | 600 | Max oracle price age | current |
-| `depeg_threshold_bps` | 200 | cbBTC vs BTC gap that stops buys (with `CbBtc`; a missing BTC/USD reference also stops buys) | current |
-| `signal_feed` | `Btc` | `CbBtc`: signal, moving average, netting and `min_out` use cbBTC/USD, and BTC/USD is the depeg reference (a missing or stale reference blocks buys). `Btc`: no cbBTC/USD feed, everything uses BTC/USD and there is no depeg check. Change via 48 h timelock; switching mixes the two feeds in the moving average for up to 50 days | current |
-| `trade_cap_usdc` | 200,000 USDC | Max notional per trade | current |
-| `min_trade_interval_secs` | 60 | Seconds between trades | current |
-| `public_slippage_bps` | 10 | Non-keeper callers after the window (≤ `max_slippage_bps`) | current |
-| `keeper_window_secs` | 1800 | Keeper-only time after the fixing time | current |
-| `subscription_cap_usdc` | 1,000,000 USDC | Max subscription USDC not yet bought: queued plus pending; a request that would exceed it is rejected; redemptions are uncapped | current |
-| `withdrawal_fee_bps` | 100 (max 100) | Of each redemption claim, rounded down, owed to the manager; share claims and refunds pay none | current |
-| `keeper` | set at creation | Keeper address; change via 48 h timelock | current |
-| Config timelock | 48 h, fixed in code | `propose_config` a whole config, `apply_config` after 48 h; a new proposal restarts the clock. `window` and `settle_offset_secs` are set at creation and cannot change | current |
-| Subscription pause | off | `pause_subscriptions` / `resume_subscriptions`, immediate, admin only; redemptions can never be paused | current |
-| `fee_address` | set at creation | Manager's wallet; `collect_fees` pays the owed fees to its USDC associated token account. Change via 48 h timelock | current |
+Every row below except "Config timelock" and "Subscription pause" is a field of the `config` passed to `initialize`. Fields change later only through `propose_config` / `apply_config`, except `window` and `settle_offset_secs`, which are fixed at creation.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `window` | 50 | Moving-average days (max 64) |
+| `settle_offset_secs` | 3600 | Fixing time after 00:00 UTC |
+| `max_slippage_bps` | 30 | Keeper slippage bound |
+| `subscription_fee_bps` | 0 | Subscription fee, kept in fund |
+| `min_subscription` | 1 USDC | Minimum subscription |
+| `max_staleness_secs` | 600 | Max oracle price age |
+| `depeg_threshold_bps` | 200 | cbBTC vs BTC gap that stops buys (with `CbBtc`; a missing BTC/USD reference also stops buys) |
+| `signal_feed` | `Btc` | `CbBtc`: signal, moving average, netting and `min_out` use cbBTC/USD, and BTC/USD is the depeg reference (a missing or stale reference blocks buys). `Btc`: no cbBTC/USD feed, everything uses BTC/USD and there is no depeg check. Change via 48 h timelock; switching mixes the two feeds in the moving average for up to 50 days |
+| `trade_cap_usdc` | 200,000 USDC | Max notional per trade |
+| `min_trade_interval_secs` | 60 | Seconds between trades |
+| `public_slippage_bps` | 10 | Non-keeper callers after the window (≤ `max_slippage_bps`) |
+| `keeper_window_secs` | 1800 | Keeper-only time after the fixing time |
+| `subscription_cap_usdc` | 1,000,000 USDC | Max subscription USDC not yet bought: queued plus pending; a request that would exceed it is rejected; redemptions are uncapped |
+| `withdrawal_fee_bps` | 100 (max 100) | Of each redemption claim, rounded down, owed to the manager; share claims and refunds pay none |
+| `keeper` | set at creation | Keeper address; change via 48 h timelock |
+| Config timelock | 48 h, fixed in code | `propose_config` a whole config, `apply_config` after 48 h; a new proposal restarts the clock. `window` and `settle_offset_secs` are set at creation and cannot change |
+| Subscription pause | off | `pause_subscriptions` / `resume_subscriptions`, immediate, admin only; redemptions can never be paused |
+| `fee_address` | set at creation | Manager's wallet; `collect_fees` pays the owed fees to its USDC associated token account. Change via 48 h timelock |
 
 ### Accounts (PDAs)
 
@@ -304,10 +308,10 @@ flowchart LR
 
 | Technique | Purpose | Status |
 |---|---|---|
-| Oracle-based `min_out` | Reject bad fills and sandwiches | Implemented (per trade in target design) |
-| Capped, spaced trades | Reduce price impact | Designed, ADR 0001 |
-| Flows pay their own execution | Holders who stay don't pay for others | Designed, ADR 0002 |
-| Keeper window + tighter public bound | Limit what third-party callers can extract | Designed |
+| Oracle-based `min_out` | Reject bad fills and sandwiches | Implemented, checked on every trade |
+| Capped, spaced trades | Reduce price impact | Implemented, ADR 0001 |
+| Flows pay their own execution | Holders who stay don't pay for others | Implemented, ADR 0002 / 0006 |
+| Keeper window + tighter public bound | Limit what third-party callers can extract | Implemented |
 | Randomized execution time | Harder to anticipate | Optional |
 | MEV-protected submission (Jito) | Avoid public mempool | Mainnet |
 | Limit orders (Jupiter) | Price control | Mainnet |
@@ -318,10 +322,10 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-  A["✓ Rename to<br/>subscription / redemption"] --> B["Migrate fund-logic<br/>ADRs 0001–0004"]
+  A["✓ Rename to<br/>subscription / redemption"] --> B["✓ Migrate settlement<br/>ADRs 0001–0007"]
   B --> C["Pyth BTC/USD +<br/>cbBTC/USD"] & D["Jupiter<br/>route off-chain,<br/>min_out on-chain"]
-  B --> E["Keeper · cancel ·<br/>MA backfill"]
-  B --> F["Multisig · timelock ·<br/>subscription pause"]
+  B --> E["✓ Keeper · cancel ·<br/>MA backfill"]
+  B --> F["✓ Timelock · subscription pause<br/>(admin is an external multisig)"]
   C & D & E & F --> G["Monitoring"] --> H["Security audit"] --> I["Legal review"]
 ```
 
