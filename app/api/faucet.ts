@@ -35,10 +35,10 @@ export async function POST(request: Request): Promise<Response> {
   try {
     user = new PublicKey(((await request.json()) as { address?: string }).address ?? "");
   } catch {
-    return reply(400, { error: "地址无效" });
+    return reply(400, { error: "Invalid address" });
   }
   const secret = process.env.FAUCET_SECRET_KEY;
-  if (!secret) return reply(500, { error: "水龙头没有配置" });
+  if (!secret) return reply(500, { error: "The faucet is not configured" });
   const faucet = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(secret)));
   const connection = new Connection(process.env.RPC_URL ?? "https://api.devnet.solana.com", "confirmed");
 
@@ -46,12 +46,12 @@ export async function POST(request: Request): Promise<Response> {
   const admin = new PublicKey(process.env.FUND_ADMIN ?? "Bx5tWUDUrZ1yfkeYAXgimvyST4kRyhPwQe7YKKGNjYja");
   const [fund] = PublicKey.findProgramAddressSync([Buffer.from("fund"), admin.toBuffer()], PROGRAM_ID);
   const fundInfo = await connection.getAccountInfo(fund);
-  if (!fundInfo) return reply(500, { error: "找不到基金" });
+  if (!fundInfo) return reply(500, { error: "Vault not found" });
   const usdcMint = new PublicKey(fundInfo.data.subarray(40, 72));
 
   const ata = getAssociatedTokenAddressSync(usdcMint, user, true);
   if (await connection.getAccountInfo(ata)) {
-    return reply(409, { error: `每个地址只能领一次，这个地址已经领过 ${USDC_PER_ADDRESS.toLocaleString()} 测试 USDC` });
+    return reply(409, { error: `Each address can claim once; this one already received ${USDC_PER_ADDRESS.toLocaleString("en-US")} test USDC` });
   }
   const tx = new Transaction().add(
     createAssociatedTokenAccountInstruction(faucet.publicKey, ata, user, usdcMint),
@@ -67,7 +67,7 @@ export async function POST(request: Request): Promise<Response> {
     return reply(200, { signature, usdc: USDC_PER_ADDRESS, sol: topUp ? SOL_TOP_UP : 0 });
   } catch (e) {
     // 同时来的另一个请求已经建好了账户
-    if (await connection.getAccountInfo(ata)) return reply(409, { error: "这个地址已经领过了" });
-    return reply(502, { error: `发币失败：${(e as Error).message}` });
+    if (await connection.getAccountInfo(ata)) return reply(409, { error: "This address has already claimed" });
+    return reply(502, { error: `Faucet transfer failed: ${(e as Error).message}` });
   }
 }

@@ -26,6 +26,7 @@ import {
   DAY,
 } from "./chain";
 import * as fmt from "./format";
+import { Backtest } from "./BacktestCard";
 
 type Toast = { kind: "ok" | "error" | "busy"; text: string; sig?: string };
 
@@ -59,15 +60,15 @@ export function App() {
     return () => clearInterval(t);
   }, []);
 
-  /** 发一笔交易，显示进度和结果，然后刷新 */
+  /** Send one transaction, show its progress and result, then refresh */
   const run = useCallback(
     async (label: string, send: () => Promise<string>) => {
-      setToast({ kind: "busy", text: `${label}：等待钱包签名和链上确认…` });
+      setToast({ kind: "busy", text: `${label}: waiting for the wallet signature and confirmation…` });
       try {
         const sig = await send();
-        setToast({ kind: "ok", text: `${label}成功`, sig });
+        setToast({ kind: "ok", text: `${label}: done`, sig });
       } catch (e) {
-        setToast({ kind: "error", text: `${label}失败：${describeError(e)}` });
+        setToast({ kind: "error", text: `${label} failed: ${describeError(e)}` });
       }
       await refresh();
     },
@@ -78,14 +79,15 @@ export function App() {
     <div className="page">
       <Header />
       <main className="container">
-        {loadError && !snap && <div className="notice error">读不到基金：{loadError}</div>}
-        {!snap && !loadError && <div className="notice">正在读取链上数据…</div>}
+        {loadError && !snap && <div className="notice error">Could not load the fund: {loadError}</div>}
+        {!snap && !loadError && <div className="notice">Loading on-chain data…</div>}
         {snap && (
           <>
             <VaultHero snap={snap} />
             <div className="grid">
               <div className="col-main">
                 <Overview snap={snap} now={now} />
+                <Backtest />
                 <Strategy snap={snap} now={now} />
                 <Records records={snap.records} />
               </div>
@@ -101,9 +103,9 @@ export function App() {
         {toast && <ToastView toast={toast} onClose={() => setToast(null)} />}
       </main>
       <footer className="footer container">
-        <span>devnet 原型：价格来自 Pyth，兑换是模拟交易所。不是投资建议，未经审计，可能有漏洞。</span>
+        <span>Devnet prototype: prices from Pyth, trades on a mock exchange. Test tokens only. Not investment advice, not audited, may contain bugs.</span>
         <a href={fmt.explorerAddress(PROGRAM_ID.toBase58())} target="_blank" rel="noreferrer">
-          程序 {fmt.short(PROGRAM_ID.toBase58())}
+          Program {fmt.short(PROGRAM_ID.toBase58())}
         </a>
       </footer>
     </div>
@@ -122,7 +124,7 @@ function Header() {
           <span>Tide</span>
         </div>
         <nav className="nav">
-          <span className="nav-item active">基金</span>
+          <span className="nav-item active">Vault</span>
         </nav>
         <div className="header-right">
           <span className="pill">Devnet</span>
@@ -141,16 +143,16 @@ function VaultHero({ snap }: { snap: Snapshot }) {
       <div className="hero-title">
         <div className="token-icon">₿</div>
         <div>
-          <h1>Tide BTC 趋势基金</h1>
-          <p className="muted">价格高于 {cfg.window} 日均线时持有 cbBTC，低于时持有 USDC。每天定价一次，按实际成交发份额。</p>
+          <h1>Tide BTC Trend</h1>
+          <p className="muted">Holds cbBTC when BTC is above its {cfg.window}-day moving average and USDC when it is below. One fixing a day; shares follow actual fills.</p>
         </div>
       </div>
       <div className="tags">
-        <span className="tag">信号 {feed}（Pyth）</span>
-        <span className="tag">{cfg.window} 日均线</span>
-        <span className="tag">取款费 {cfg.withdrawalFeeBps / 100}%</span>
+        <span className="tag">Signal {feed} (Pyth)</span>
+        <span className="tag">{cfg.window}-day average</span>
+        <span className="tag">Withdrawal fee {cfg.withdrawalFeeBps / 100}%</span>
         <a className="tag link" href={fmt.explorerAddress(FUND.toBase58())} target="_blank" rel="noreferrer">
-          基金 {fmt.short(FUND.toBase58())} ↗
+          Vault {fmt.short(FUND.toBase58())} ↗
         </a>
       </div>
     </section>
@@ -160,25 +162,25 @@ function VaultHero({ snap }: { snap: Snapshot }) {
 function Overview({ snap, now }: { snap: Snapshot; now: number }) {
   const s = snap.fund.state;
   const last = snap.records[0];
-  // 只用来显示：按最近一次定价价格折算成美元（基金本身从不按美元估值）
+  // display only: valued at the last fixing price (the fund itself is never valued in USD)
   const indicative = last ? Number(big(s.usdc)) / 1e6 + (Number(big(s.btc)) / 1e8) * (Number(big(last.signalPrice)) / 1e6) : null;
   const perShare = indicative !== null && !s.shareSupply.isZero() ? indicative / (Number(big(s.shareSupply)) / 1e6) : null;
   void now;
   return (
     <section className="card">
       <div className="stats">
-        <Stat label="持有 cbBTC" value={fmt.btc(s.btc)} />
-        <Stat label="持有 USDC" value={fmt.usdc(s.usdc)} />
-        <Stat label="份额总数" value={fmt.shares(s.shareSupply)} />
+        <Stat label="cbBTC held" value={fmt.btc(s.btc)} />
+        <Stat label="USDC held" value={fmt.usdc(s.usdc)} />
+        <Stat label="Total shares" value={fmt.shares(s.shareSupply)} />
         <Stat
-          label="当前目标"
+          label="Target"
           value={<span className={`pill ${s.targetBtc ? "pill-blue" : "pill-gray"}`}>{s.targetBtc ? "cbBTC" : "USDC"}</span>}
         />
       </div>
       {indicative !== null && (
         <p className="muted small">
-          按最近定价价格折算约 ${indicative.toLocaleString("en-US", { maximumFractionDigits: 2 })}
-          {perShare !== null && `，每份约 $${perShare.toFixed(4)}`}（仅供参考，基金不按美元估值）
+          About ${indicative.toLocaleString("en-US", { maximumFractionDigits: 2 })} at the last fixing price
+          {perShare !== null && `, about $${perShare.toFixed(4)} per share`} (indicative; the fund is not valued in USD)
         </p>
       )}
     </section>
@@ -201,13 +203,13 @@ function Strategy({ snap, now }: { snap: Snapshot; now: number }) {
   const ma = last ? Number(big(last.movingAverage)) : 0;
   return (
     <section className="card">
-      <h2>策略</h2>
+      <h2>Fund status</h2>
       <div className="rows">
-        <Row label="最近定价">{last ? `${fmt.dayLabel(last.epoch.toNumber())}（第 ${last.epoch.toNumber()} 期）` : "还没有定价"}</Row>
-        <Row label="信号价格 / 均线">
+        <Row label="Last fixing">{last ? `${fmt.dayLabel(last.epoch.toNumber())} (epoch ${last.epoch.toNumber()})` : "None yet"}</Row>
+        <Row label="Signal / moving average">
           {last ? (
             <span>
-              {fmt.price(last.signalPrice)} / {ma > 0 ? fmt.price(last.movingAverage) : "价格不足"}
+              {fmt.price(last.signalPrice)} / {ma > 0 ? fmt.price(last.movingAverage) : "not enough prices"}
               {ma > 0 && (
                 <span className={`delta ${signal > ma ? "up" : "down"}`}>
                   {signal > ma ? "▲" : "▼"} {(((signal - ma) / ma) * 100).toFixed(2)}%
@@ -218,14 +220,14 @@ function Strategy({ snap, now }: { snap: Snapshot; now: number }) {
             "—"
           )}
         </Row>
-        <Row label="下一个定价时刻">
+        <Row label="Next fixing">
           {fmt.timeLabel(nextFix)}
-          <span className="muted">（{fmt.countdown(nextFix - now)}后）</span>
+          <span className="muted"> (in {fmt.countdown(nextFix - now)})</span>
         </Row>
-        <Row label="申购">
-          {s.subscriptionsPaused ? <span className="pill pill-amber">已暂停</span> : <span className="pill pill-green">开放</span>}
+        <Row label="Subscriptions">
+          {s.subscriptionsPaused ? <span className="pill pill-amber">Paused</span> : <span className="pill pill-green">Open</span>}
         </Row>
-        <Row label="申购额度">
+        <Row label="Subscription cap used">
           <span>
             {fmt.usdc(outstanding)} / {fmt.usdc(cap)} USDC
           </span>
@@ -235,9 +237,9 @@ function Strategy({ snap, now }: { snap: Snapshot; now: number }) {
         <div className="bar-fill" style={{ width: `${Math.min(capPct, 100)}%` }} />
       </div>
       <div className="mini-stats">
-        <span>未卖完的赎回资产 {s.sliceCount} 期</span>
-        <span>待成交申购 {s.pendingCount} 期</span>
-        <span>欠管理人取款费 {fmt.usdc(s.feesOwed)} USDC</span>
+        <span>Unsold redemption slices: {s.sliceCount}</span>
+        <span>Pending subscriptions: {s.pendingCount}</span>
+        <span>Fees owed to the manager: {fmt.usdc(s.feesOwed)} USDC</span>
       </div>
     </section>
   );
@@ -246,21 +248,21 @@ function Strategy({ snap, now }: { snap: Snapshot; now: number }) {
 function Records({ records }: { records: EpochRecord[] }) {
   return (
     <section className="card">
-      <h2>每次定价</h2>
+      <h2>Fixings</h2>
       {records.length === 0 ? (
-        <p className="muted">还没有定价记录。</p>
+        <p className="muted">No fixings yet.</p>
       ) : (
         <div className="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>日期</th>
-                <th className="num">信号</th>
-                <th className="num">均线</th>
-                <th>目标</th>
-                <th className="num">申购 USDC</th>
-                <th className="num">赎回份额</th>
-                <th>状态</th>
+                <th>Date</th>
+                <th className="num">Signal</th>
+                <th className="num">Average</th>
+                <th>Target</th>
+                <th className="num">Subscribed USDC</th>
+                <th className="num">Redeemed shares</th>
+                <th>Status</th>
               </tr>
             </thead>
             <tbody>
@@ -276,9 +278,9 @@ function Records({ records }: { records: EpochRecord[] }) {
                   <td className="num">{fmt.shares(r.redemptionShares)}</td>
                   <td>
                     {r.subscriptionFilled && r.sliceSoldOut ? (
-                      <span className="pill pill-green">完成</span>
+                      <span className="pill pill-green">Done</span>
                     ) : (
-                      <span className="pill pill-amber">成交中</span>
+                      <span className="pill pill-amber">Filling</span>
                     )}
                   </td>
                 </tr>
@@ -306,20 +308,20 @@ function ActionPanel({ snap, now, run, program }: { snap: Snapshot; now: number;
   const balance = tab === "sub" ? snap.usdcBalance : snap.shareBalance;
   const min = big(cfg.minSubscription);
   const problem = !wallet
-    ? "请先连接钱包"
+    ? "Connect a wallet"
     : amount === null || amount === 0n
-      ? "输入数量"
+      ? "Enter an amount"
       : amount > balance
-        ? "余额不足"
+        ? "Insufficient balance"
         : tab === "sub" && amount < min
-          ? `最低申购 ${fmt.usdc(min)} USDC`
+          ? `Minimum ${fmt.usdc(min)} USDC`
           : tab === "sub" && snap.fund.state.subscriptionsPaused
-            ? "申购已暂停"
+            ? "Subscriptions are paused"
             : null;
 
   const submit = () => {
     if (!wallet || amount === null) return;
-    const label = tab === "sub" ? `申购 ${fmt.usdc(amount)} USDC` : `赎回 ${fmt.shares(amount)} 份`;
+    const label = tab === "sub" ? `Subscribe ${fmt.usdc(amount)} USDC` : `Redeem ${fmt.shares(amount)} shares`;
     run(label, () =>
       tab === "sub"
         ? subscribe(program, snap.fund, wallet.publicKey, amount, epoch)
@@ -331,42 +333,42 @@ function ActionPanel({ snap, now, run, program }: { snap: Snapshot; now: number;
     <section className="card action">
       <div className="tabs">
         <button className={tab === "sub" ? "tab active" : "tab"} onClick={() => setTab("sub")}>
-          申购
+          Subscribe
         </button>
         <button className={tab === "red" ? "tab active" : "tab"} onClick={() => setTab("red")}>
-          赎回
+          Redeem
         </button>
       </div>
       <div className="input-box">
         <div className="input-top">
-          <span className="muted small">{tab === "sub" ? "付出" : "赎回份额"}</span>
+          <span className="muted small">{tab === "sub" ? "You pay" : "Shares to redeem"}</span>
           <span className="muted small">
-            余额 {tab === "sub" ? `${fmt.usdc(balance)} USDC` : `${fmt.shares(balance)} 份`}
+            Balance {tab === "sub" ? `${fmt.usdc(balance)} USDC` : `${fmt.shares(balance)} shares`}
             {balance > 0n && (
               <button className="link-btn" onClick={() => setText((Number(balance) / 1e6).toString())}>
-                最大
+                Max
               </button>
             )}
           </span>
         </div>
         <div className="input-row">
           <input inputMode="decimal" placeholder="0.00" value={text} onChange={(e) => setText(e.target.value)} />
-          <span className="unit">{tab === "sub" ? "USDC" : "份"}</span>
+          <span className="unit">{tab === "sub" ? "USDC" : "shares"}</span>
         </div>
       </div>
       <div className="rows compact">
-        <Row label="加入的期">
-          第 {epoch} 期（{fmt.timeLabel(epoch * DAY + offset)} 定价）
+        <Row label="Joins epoch">
+          {epoch} (fixing {fmt.timeLabel(epoch * DAY + offset)})
         </Row>
-        <Row label="撤销">定价时刻之前可以全额撤销</Row>
+        <Row label="Cancel">In full, any time before the fixing</Row>
         {tab === "sub" ? (
-          <Row label="成交">按实际买到的 cbBTC（或 USDC）发份额，可能分几次</Row>
+          <Row label="Fill">Shares by the cbBTC (or USDC) actually added, possibly in parts</Row>
         ) : (
-          <Row label="到账">赎回资产卖完后领取，扣 {cfg.withdrawalFeeBps / 100}% 取款费</Row>
+          <Row label="Payout">Claim once your slice is sold; {cfg.withdrawalFeeBps / 100}% withdrawal fee</Row>
         )}
       </div>
       <button className="btn primary" disabled={problem !== null} onClick={submit}>
-        {problem ?? (tab === "sub" ? "申购" : "赎回")}
+        {problem ?? (tab === "sub" ? "Subscribe" : "Redeem")}
       </button>
     </section>
   );
@@ -383,21 +385,21 @@ interface TicketView {
   detail: string[];
 }
 
-/** 一张排队记录现在的状态（只用来显示；实际数额由程序算） */
+/** What a ticket is waiting for (display only; the program computes the real amounts) */
 function viewTicket(t: Ticket, fund: Fund, records: EpochRecord[], now: number): TicketView {
   const epoch = t.epoch.toNumber();
   const sub = big(t.subscriptionUsdc);
   const red = big(t.redemptionShares);
   const detail: string[] = [];
-  if (sub > 0n) detail.push(`申购 ${fmt.usdc(sub)} USDC`);
-  if (red > 0n) detail.push(`赎回 ${fmt.shares(red)} 份`);
+  if (sub > 0n) detail.push(`Subscribed ${fmt.usdc(sub)} USDC`);
+  if (red > 0n) detail.push(`Redeeming ${fmt.shares(red)} shares`);
   const offset = fund.config.settleOffsetSecs.toNumber();
   if (epoch > fund.state.lastFixDay.toNumber()) {
     const deadline = cancelDeadline(epoch, now, offset);
     const open = now < deadline;
     return {
       epoch,
-      status: open ? `排队中，${fmt.countdown(deadline - now)}后定价` : "等待定价",
+      status: open ? `Queued, fixing in ${fmt.countdown(deadline - now)}` : "Waiting for the fixing",
       tone: "blue",
       canCancel: open,
       canCancelPending: false,
@@ -406,7 +408,7 @@ function viewTicket(t: Ticket, fund: Fund, records: EpochRecord[], now: number):
     };
   }
   const record = recordFor(records, epoch);
-  if (!record) return { epoch, status: "找不到定价记录", tone: "gray", canCancel: false, canCancelPending: false, canClaim: false, detail };
+  if (!record) return { epoch, status: "Fixing record not found", tone: "gray", canCancel: false, canCancelPending: false, canClaim: false, detail };
   let claimable = false;
   let pending = false;
   if (sub > 0n) {
@@ -418,19 +420,19 @@ function viewTicket(t: Ticket, fund: Fund, records: EpochRecord[], now: number):
       pending = true;
       if (owed > 0n) claimable = true;
     }
-    detail.push(record.subscriptionFilled ? "申购已全部成交" : `已成交约 ${fmt.shares(owed)} 份可领`);
+    detail.push(record.subscriptionFilled ? "Subscription fully filled" : `About ${fmt.shares(owed)} shares filled so far`);
   }
   if (red > 0n) {
     if (record.sliceSoldOut) {
       claimable = true;
       const gross = big(record.redemptionShares) > 0n ? (big(record.payoutUsdc) * red) / big(record.redemptionShares) : 0n;
-      detail.push(`赎回约 ${fmt.usdc(gross)} USDC（扣取款费前）`);
-    } else detail.push("赎回资产卖出中");
+      detail.push(`About ${fmt.usdc(gross)} USDC before the withdrawal fee`);
+    } else detail.push("Redemption slice still selling");
   }
   return {
     epoch,
     record,
-    status: claimable ? "可以领取" : pending ? "成交中" : "卖出中",
+    status: claimable ? "Ready to claim" : pending ? "Filling" : "Selling",
     tone: claimable ? "green" : "amber",
     canCancel: false,
     canCancelPending: pending,
@@ -444,22 +446,22 @@ function Position({ snap, now, run, program }: { snap: Snapshot; now: number; ru
   if (!wallet) {
     return (
       <section className="card">
-        <h2>我的仓位</h2>
-        <p className="muted">连接钱包后显示你的份额和排队记录。</p>
+        <h2>Your position</h2>
+        <p className="muted">Connect a wallet to see your shares and tickets.</p>
       </section>
     );
   }
   const user = wallet.publicKey;
   return (
     <section className="card">
-      <h2>我的仓位</h2>
+      <h2>Your position</h2>
       <div className="stats two">
-        <Stat label="持有份额" value={fmt.shares(snap.shareBalance)} />
-        <Stat label="USDC 余额" value={fmt.usdc(snap.usdcBalance)} />
+        <Stat label="Shares" value={fmt.shares(snap.shareBalance)} />
+        <Stat label="USDC balance" value={fmt.usdc(snap.usdcBalance)} />
       </div>
       <TransferShares balance={snap.shareBalance} run={run} program={program} />
       {snap.tickets.length === 0 ? (
-        <p className="muted small">没有排队记录。</p>
+        <p className="muted small">No tickets.</p>
       ) : (
         <ul className="tickets">
           {snap.tickets.map((t) => {
@@ -467,27 +469,27 @@ function Position({ snap, now, run, program }: { snap: Snapshot; now: number; ru
             return (
               <li key={t.address.toBase58()} className="ticket">
                 <div className="ticket-top">
-                  <span className="ticket-epoch">第 {v.epoch} 期 · {fmt.dayLabel(v.epoch)}</span>
+                  <span className="ticket-epoch">Epoch {v.epoch} · {fmt.dayLabel(v.epoch)}</span>
                   <span className={`pill pill-${v.tone}`}>{v.status}</span>
                 </div>
-                <div className="muted small">{v.detail.join("；")}</div>
+                <div className="muted small">{v.detail.join(" · ")}</div>
                 <div className="ticket-actions">
                   {v.canClaim && v.record && (
-                    <button className="btn small primary" onClick={() => run("领取", () => claim(program, snap.fund, user, t, v.record!))}>
-                      领取
+                    <button className="btn small primary" onClick={() => run("Claim", () => claim(program, snap.fund, user, t, v.record!))}>
+                      Claim
                     </button>
                   )}
                   {v.canCancel && (
-                    <button className="btn small" onClick={() => run("撤销", () => cancel(program, snap.fund, user, t))}>
-                      撤销
+                    <button className="btn small" onClick={() => run("Cancel", () => cancel(program, snap.fund, user, t))}>
+                      Cancel
                     </button>
                   )}
                   {v.canCancelPending && v.record && (
                     <button
                       className="btn small"
-                      onClick={() => run("撤销待成交申购", () => cancelPending(program, snap.fund, user, t, v.record!))}
+                      onClick={() => run("Cancel the unfilled part", () => cancelPending(program, snap.fund, user, t, v.record!))}
                     >
-                      撤销未成交部分
+                      Cancel unfilled part
                     </button>
                   )}
                 </div>
@@ -503,19 +505,19 @@ function Position({ snap, now, run, program }: { snap: Snapshot; now: number; ru
 function Faucet({ snap, run }: { snap: Snapshot; run: RunFn }) {
   const wallet = useAnchorWallet();
   if (!wallet) return null;
-  // 已经有 USDC 或份额的钱包不再显示（每个地址只能领一次）
+  // hidden once the wallet holds USDC or shares (one claim per address)
   if (snap.usdcBalance > 0n || snap.shareBalance > 0n || snap.tickets.length > 0) return null;
   return (
     <section className="card highlight">
-      <h3>领取测试 USDC</h3>
-      <p className="muted small">每个地址可以领一次 10,000 测试 USDC，钱包里 SOL 不够时还会送 0.02 SOL 付手续费。</p>
+      <h3>Get test USDC</h3>
+      <p className="muted small">Each address can claim 10,000 test USDC once. If the wallet has too little SOL for fees, it also gets 0.02 devnet SOL.</p>
       <button
         className="btn primary"
         onClick={() =>
-          run("领取 10,000 测试 USDC", async () => (await requestFaucet(wallet.publicKey)).signature)
+          run("Claim 10,000 test USDC", async () => (await requestFaucet(wallet.publicKey)).signature)
         }
       >
-        领取 10,000 测试 USDC
+        Claim 10,000 test USDC
       </button>
     </section>
   );
@@ -526,13 +528,13 @@ function Guide({ snap }: { snap: Snapshot }) {
   const at = new Date(offset * 1000).toISOString().slice(11, 16);
   return (
     <section className="card subtle">
-      <h3>完整流程怎么测</h3>
+      <h3>How to test the full flow</h3>
       <ol className="steps">
-        <li>连接钱包（Phantom 切到 devnet），领取 10,000 测试 USDC。</li>
-        <li>申购。请求会排进下一个定价时刻（每天 {at} UTC）那一期，定价前可以撤销。</li>
-        <li>每天 {at} UTC 后几分钟，自动结算会定价并用真实的 Pyth 价格成交。</li>
-        <li>成交后在“我的仓位”里领取份额。份额是普通代币，可以转给别的钱包。</li>
-        <li>赎回份额，等下一次定价把对应的 cbBTC 卖出，再领取 USDC（扣 1% 取款费）。</li>
+        <li>Connect a wallet (Phantom on devnet) and claim 10,000 test USDC.</li>
+        <li>Subscribe. The request joins the epoch of the next fixing (daily at {at} UTC) and can be cancelled until then.</li>
+        <li>A few minutes after {at} UTC, the daily settlement fixes the epoch and fills it at the real Pyth price.</li>
+        <li>Claim your shares under "Your position". Shares are ordinary tokens you can send to another wallet.</li>
+        <li>Redeem shares. After the next fixing sells your slice, claim the USDC (1% withdrawal fee).</li>
       </ol>
     </section>
   );
@@ -551,22 +553,22 @@ function TransferShares({ balance, run, program }: { balance: bigint; run: RunFn
     dest = null;
   }
   const problem = !dest
-    ? "输入对方地址"
+    ? "Enter a recipient address"
     : dest.equals(wallet.publicKey)
-      ? "不能转给自己"
+      ? "Cannot send to yourself"
       : amount === null || amount === 0n
-        ? "输入份额数量"
+        ? "Enter an amount"
         : amount > balance
-          ? "份额不足"
+          ? "Not enough shares"
           : null;
   return (
     <div className="transfer">
-      <h3>转出份额</h3>
-      <input className="field" placeholder="对方钱包地址" value={to} onChange={(e) => setTo(e.target.value)} />
+      <h3>Send shares</h3>
+      <input className="field" placeholder="Recipient wallet address" value={to} onChange={(e) => setTo(e.target.value)} />
       <div className="field-row">
-        <input className="field" inputMode="decimal" placeholder="份额数量" value={text} onChange={(e) => setText(e.target.value)} />
+        <input className="field" inputMode="decimal" placeholder="Shares" value={text} onChange={(e) => setText(e.target.value)} />
         <button className="link-btn" onClick={() => setText((Number(balance) / 1e6).toString())}>
-          最大
+          Max
         </button>
       </div>
       <button
@@ -575,13 +577,13 @@ function TransferShares({ balance, run, program }: { balance: bigint; run: RunFn
         onClick={() =>
           dest &&
           amount !== null &&
-          run(`转出 ${fmt.shares(amount)} 份`, () => transferShares(program, wallet.publicKey, dest!, amount)).then(() => {
+          run(`Send ${fmt.shares(amount)} shares`, () => transferShares(program, wallet.publicKey, dest!, amount)).then(() => {
             setText("");
             setTo("");
           })
         }
       >
-        {problem ?? "转出"}
+        {problem ?? "Send"}
       </button>
     </div>
   );
@@ -593,12 +595,12 @@ function ToastView({ toast, onClose }: { toast: Toast; onClose: () => void }) {
       <span>{toast.text}</span>
       {toast.sig && (
         <a href={fmt.explorer(toast.sig)} target="_blank" rel="noreferrer">
-          查看交易 ↗
+          View transaction ↗
         </a>
       )}
       {toast.kind !== "busy" && (
         <button className="link-btn" onClick={onClose}>
-          关闭
+          Close
         </button>
       )}
     </div>

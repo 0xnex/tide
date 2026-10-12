@@ -9,6 +9,7 @@ import {
 } from "@solana/spl-token";
 import idl from "./idl/tide.json";
 import type { Tide } from "./idl/tide";
+import { ERROR_MESSAGES } from "./errors";
 
 export const RPC_URL: string = import.meta.env.VITE_RPC_URL ?? "https://api.devnet.solana.com";
 export const FUND_ADMIN = new PublicKey(
@@ -30,10 +31,10 @@ export const epochPda = (epoch: number) => pda([Buffer.from("epoch"), FUND.toBuf
 const readOnlyWallet = {
   publicKey: PublicKey.default,
   signTransaction: async () => {
-    throw new Error("请先连接钱包");
+    throw new Error("Connect a wallet first");
   },
   signAllTransactions: async () => {
-    throw new Error("请先连接钱包");
+    throw new Error("Connect a wallet first");
   },
 } as unknown as AnchorWallet;
 
@@ -190,19 +191,17 @@ export async function requestFaucet(user: PublicKey): Promise<{ signature: strin
     body: JSON.stringify({ address: user.toBase58() }),
   });
   const body = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(body.error ?? `水龙头返回 HTTP ${r.status}`);
+  if (!r.ok) throw new Error(body.error ?? `Faucet returned HTTP ${r.status}`);
   return body;
 }
 
-/** 程序错误的说明：用 IDL 里的中文 msg；不是程序错误时返回原始信息 */
+/** 程序错误的英文说明（errors.ts）；不是程序错误时返回原始信息 */
 export function describeError(e: unknown): string {
   const err = e as any;
-  const code: string | undefined = err?.error?.errorCode?.code;
-  const fromIdl = idl.errors.find((x) => x.name.toLowerCase() === code?.toLowerCase());
-  if (fromIdl) return fromIdl.msg;
   const logs: string = (err?.logs ?? []).join("\n");
-  const m = `${err?.message ?? ""}\n${logs}`.match(/Error Code: (\w+)/);
-  const byLog = m && idl.errors.find((x) => x.name.toLowerCase() === m[1].toLowerCase());
-  if (byLog) return byLog.msg;
+  const fromLog = `${err?.message ?? ""}\n${logs}`.match(/Error Code: (\w+)/)?.[1];
+  const code: string | undefined = err?.error?.errorCode?.code ?? fromLog;
+  const name = code && idl.errors.find((x) => x.name.toLowerCase() === code.toLowerCase())?.name;
+  if (name) return ERROR_MESSAGES[name] ?? name;
   return String(err?.message ?? err);
 }

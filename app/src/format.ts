@@ -29,12 +29,12 @@ export const dayLabel = (day: number) => new Date(day * 86_400_000).toISOString(
 /** unix 秒显示成 UTC 时间 */
 export const timeLabel = (sec: number) => new Date(sec * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC";
 
-/** 剩余时间，比如 3 小时 12 分 */
+/** 剩余时间，比如 3h 12m */
 export function countdown(sec: number): string {
-  if (sec <= 0) return "现在";
+  if (sec <= 0) return "now";
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
-  return h > 0 ? `${h} 小时 ${m} 分` : `${m} 分 ${sec % 60} 秒`;
+  return h > 0 ? `${h}h ${m}m` : `${m}m ${sec % 60}s`;
 }
 
 export const short = (addr: string) => `${addr.slice(0, 4)}…${addr.slice(-4)}`;
