@@ -156,6 +156,10 @@ async function main() {
   // 1. 定价：用今天定价时刻的历史价格
   if ((await chainNow()) < today * DAY + offset) {
     console.log("还没到今天的定价时刻，只做交易");
+  } else if (f.state.lastFixDay.toNumber() >= today) {
+    // 今天已经定过价（比如备份的定时又跑了一次）：不再发交易。
+    // 程序升级前写下的定价记录按新结构读不出来，重发 fix 会在读账户时就失败，而不是回答 AlreadySettled。
+    console.log("今天已经定过价，只做交易");
   } else {
     await withPyth(today * DAY + offset, (prices) =>
       attempt("定价", FIX_SKIPPABLE, () =>
