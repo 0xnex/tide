@@ -1037,3 +1037,8 @@ td.num,
   margin-top: 8px;
   padding: 0;
 }
+
+.waiting strong {
+  font-family: var(--mono);
+  color: var(--text);
+}

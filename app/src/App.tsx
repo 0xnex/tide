@@ -186,6 +186,11 @@ function Overview({ snap, spot }: { snap: Snapshot; spot: number | null }) {
   // display only: the fund itself is never valued in USD
   const total = basis ? Number(big(s.usdc)) / 1e6 + (Number(big(s.btc)) / 1e8) * basis.btcUsd : null;
   const price = basis ? sharePrice(big(s.usdc), big(s.btc), big(s.shareSupply), basis.btcUsd) : null;
+  // queued and partly filled subscriptions: still the subscribers' USDC, not fund assets
+  const waiting =
+    big(s.queuedSubscriptionUsdc) +
+    big(s.nextSubscriptionUsdc) +
+    s.pending.slice(0, s.pendingCount).reduce((x: bigint, p: { usdc: BN }) => x + big(p.usdc), 0n);
   return (
     <section className="card">
       <div className="stats five">
@@ -203,6 +208,12 @@ function Overview({ snap, spot }: { snap: Snapshot; spot: number | null }) {
         {basis && ` Valued at BTC $${basis.btcUsd.toLocaleString("en-US", { maximumFractionDigits: 0 })} (${basis.source}).`}{" "}
         Indicative only: the fund is not valued in USD.
       </p>
+      {waiting > 0n && (
+        <p className="muted small waiting">
+          <strong>{fmt.usdc(waiting)} USDC</strong> of subscriptions wait for a fixing. They count as fund
+          assets, and become shares, only once the fund buys with them.
+        </p>
+      )}
     </section>
   );
 }
