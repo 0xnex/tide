@@ -16,6 +16,7 @@
   --red: #c9372c;
   --red-weak: #fdeceb;
   --radius: 14px;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
   color-scheme: light;
 }
@@ -966,4 +967,73 @@ tr:last-child td {
 
 .headline {
   flex: 0 0 auto;
+}
+
+.btc-price {
+  font-weight: 600;
+  font-size: 13.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.btc-price .delta {
+  margin-left: 6px;
+}
+
+@media (max-width: 640px) {
+  .btc-price .delta {
+    display: none;
+  }
+}
+
+.breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--surface-2);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.breakdown strong {
+  font-weight: 600;
+}
+
+.history-title {
+  margin: 18px 0 6px;
+}
+
+/* 数字统一用等宽字体：价格、数量、百分比、表格数字、刻度 */
+.stat-value,
+.headline-value,
+.rows:not(.compact) .row-value,
+td.num,
+.input-row input,
+.btc-price,
+.breakdown strong,
+.tooltip strong,
+.chart .tick,
+.chart .direct,
+.delta,
+.field[inputmode="decimal"] {
+  font-family: var(--mono);
+  letter-spacing: -0.02em;
+}
+
+.hint {
+  margin: 4px 0 4px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--primary-weak);
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.show-all {
+  margin-top: 8px;
+  padding: 0;
 }

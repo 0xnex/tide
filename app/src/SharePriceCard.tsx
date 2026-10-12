@@ -1,6 +1,7 @@
 // 每份价格：(USDC + cbBTC × BTC 价格) ÷ 份额，只用来显示（基金本身从不按美元估值）。
 // 历史点用每次定价记录里定价时（当天申购赎回之前）的资产和份额，价格用那次定价的 Pyth 价格；
 // 最后一个点用现在的资产和实时 BTC 价格。
+import { useState } from "react";
 import { BN } from "@coral-xyz/anchor";
 import { LineChart } from "./LineChart";
 import type { Snapshot } from "./chain";
@@ -22,10 +23,20 @@ export function pricingBasis(snap: Snapshot, spot: number | null): { btcUsd: num
 
 const usd = (v: number, digits = 4) => `$${v.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
 
+const pctChange = (v: number | null) => (v === null ? "—" : `${v >= 0 ? "+" : ""}${(v * 100).toFixed(2)}%`);
+const dateOf = (day: number) => new Date(day * 86_400_000).toISOString().slice(0, 10);
+
+interface PricePoint {
+  day: number;
+  price: number;
+  btcUsd: number;
+  now: boolean;
+}
+
 export function SharePriceCard({ snap, spot }: { snap: Snapshot; spot: number | null }) {
   const s = snap.fund.state;
   const basis = pricingBasis(snap, spot);
-  const history = [...snap.records]
+  const history: PricePoint[] = [...snap.records]
     .reverse()
     .filter((r) => !r.fundShares.isZero())
     .map((r) => ({
@@ -35,12 +46,16 @@ export function SharePriceCard({ snap, spot }: { snap: Snapshot; spot: number | 
       now: false,
     }));
   const current = basis ? sharePrice(big(s.usdc), big(s.btc), big(s.shareSupply), basis.btcUsd) : null;
-  const points =
+  const points: PricePoint[] =
     current !== null && basis
       ? [...history, { day: Math.floor(Date.now() / 86_400_000), price: current, btcUsd: basis.btcUsd, now: true }]
       : history;
   const first = points[0];
-  const change = first && current !== null ? current / first.price - 1 : null;
+  const change = first && current !== null && points.length > 1 ? current / first.price - 1 : null;
+  // 预估的组成：每份对应的 cbBTC 和 USDC
+  const supply = Number(big(s.shareSupply)) / 1e6;
+  const btcPerShare = supply > 0 ? Number(big(s.btc)) / 1e8 / supply : 0;
+  const usdcPerShare = supply > 0 ? Number(big(s.usdc)) / 1e6 / supply : 0;
 
   return (
     <section className="card viz-root">
@@ -48,21 +63,35 @@ export function SharePriceCard({ snap, spot }: { snap: Snapshot; spot: number | 
         <div>
           <h2>Share price</h2>
           <p className="muted small">
-            (USDC + cbBTC × BTC price) ÷ shares. Indicative: the fund is not valued in USD, and the 1% withdrawal fee is
-            not deducted.
+            Estimated as (USDC + cbBTC × BTC price) ÷ shares. Indicative: the fund is not valued in USD, and the 1%
+            withdrawal fee is not deducted.
           </p>
         </div>
         <div className="headline">
+          <div className="muted small">Estimated now</div>
           <div className="headline-value">{current !== null ? usd(current) : "$1.0000"}</div>
           <div className="muted small">
             {current === null
-              ? "No shares yet: the first subscription mints 1 share per USDC"
-              : change !== null && points.length > 1
-                ? `${change >= 0 ? "+" : ""}${(change * 100).toFixed(2)}% since ${new Date(first.day * 86_400_000).toISOString().slice(0, 10)}`
-                : `at BTC ${usd(basis!.btcUsd, 0)} (${basis!.source})`}
+              ? "No shares yet: 1 share per USDC at first"
+              : change !== null
+                ? `${pctChange(change)} since ${dateOf(first.day)}`
+                : `at BTC ${usd(basis!.btcUsd, 0)}`}
           </div>
         </div>
       </div>
+
+      {current !== null && basis && (
+        <div className="breakdown">
+          <span>Each share holds</span>
+          <strong>{btcPerShare.toFixed(8)} cbBTC</strong>
+          <span>× BTC {usd(basis.btcUsd, 0)} ({basis.source})</span>
+          <span>+</span>
+          <strong>{usdcPerShare.toFixed(4)} USDC</strong>
+          <span>=</span>
+          <strong>{usd(current)}</strong>
+        </div>
+      )}
+
       {points.length >= 2 ? (
         <LineChart
           days={points.map((p) => p.day)}
@@ -72,15 +101,70 @@ export function SharePriceCard({ snap, spot }: { snap: Snapshot; spot: number | 
           ariaLabel={`Share price at each fixing, now ${current !== null ? usd(current) : "not available"}`}
           extra={(i) =>
             points[i].now
-              ? `Now, at BTC ${usd(points[i].btcUsd, 0)} (${basis!.source})`
+              ? `Estimated now, at BTC ${usd(points[i].btcUsd, 0)} (${basis!.source})`
               : `At the fixing price, BTC ${usd(points[i].btcUsd, 0)}`
           }
         />
       ) : (
         <p className="muted small">
-          The curve starts once shares exist: each daily fixing adds a point, and the last point uses the live BTC price.
+          The curve starts once shares exist: each daily fixing adds a point, and the last point is the live estimate.
         </p>
       )}
+
+      {points.length > 0 && <History points={points} />}
     </section>
+  );
+}
+
+/** 每份价格的历史变动：最上面是现在的预估，往下是每次定价 */
+function History({ points }: { points: PricePoint[] }) {
+  const [all, setAll] = useState(false);
+  const first = points[0];
+  const rows = points.map((p, i) => ({
+    ...p,
+    vsPrevious: i > 0 ? p.price / points[i - 1].price - 1 : null,
+    vsFirst: i > 0 ? p.price / first.price - 1 : null,
+  }));
+  return (
+    <>
+      <h3 className="history-title">History</h3>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th className="num">BTC price</th>
+              <th className="num">Share price</th>
+              <th className="num">vs previous</th>
+              <th className="num">Since {dateOf(first.day)}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {[...rows].reverse().slice(0, all ? undefined : 10).map((r) => (
+              <tr key={`${r.day}-${r.now}`}>
+                <td>
+                  {r.now ? (
+                    <>
+                      Now <span className="pill pill-blue">estimate</span>
+                    </>
+                  ) : (
+                    `${dateOf(r.day)} fixing`
+                  )}
+                </td>
+                <td className="num">{usd(r.btcUsd, 0)}</td>
+                <td className="num">{usd(r.price)}</td>
+                <td className="num">{pctChange(r.vsPrevious)}</td>
+                <td className="num">{pctChange(r.vsFirst)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {rows.length > 10 && (
+        <button className="link-btn show-all" onClick={() => setAll(!all)}>
+          {all ? "Show the latest 10" : `Show all ${rows.length}`}
+        </button>
+      )}
+    </>
   );
 }

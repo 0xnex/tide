@@ -35,13 +35,21 @@ export interface Result {
   timeInBtc: number; // share of days held in BTC
 }
 
-/** BTC/USD spot price (Coinbase); null when it cannot be read */
-export async function fetchSpotPrice(): Promise<number | null> {
+export interface Spot {
+  price: number; // BTC/USD now
+  change24h: number | null; // change since 24 hours ago (0.01 = +1%)
+}
+
+/** BTC/USD now and its 24-hour change (Coinbase); null when it cannot be read */
+export async function fetchSpot(): Promise<Spot | null> {
   try {
-    const r = await fetch("https://api.exchange.coinbase.com/products/BTC-USD/ticker");
+    const r = await fetch("https://api.exchange.coinbase.com/products/BTC-USD/stats");
     if (!r.ok) return null;
-    const p = Number(((await r.json()) as { price?: string }).price);
-    return p > 0 ? p : null;
+    const j = (await r.json()) as { last?: string; open?: string };
+    const price = Number(j.last);
+    const open = Number(j.open);
+    if (!(price > 0)) return null;
+    return { price, change24h: open > 0 ? price / open - 1 : null };
   } catch {
     return null;
   }

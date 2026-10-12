@@ -28,7 +28,7 @@ import {
 import * as fmt from "./format";
 import { Backtest } from "./BacktestCard";
 import { SharePriceCard, pricingBasis, sharePrice } from "./SharePriceCard";
-import { fetchSpotPrice } from "./backtest";
+import { fetchSpot, type Spot } from "./backtest";
 
 type Toast = { kind: "ok" | "error" | "busy"; text: string; sig?: string };
 
@@ -42,7 +42,8 @@ export function App() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
-  const [spot, setSpot] = useState<number | null>(null); // 实时 BTC 价格，只用来显示每份价格
+  const [spotStats, setSpotStats] = useState<Spot | null>(null); // 实时 BTC 价格，只用来显示
+  const spot = spotStats?.price ?? null;
 
   const refresh = useCallback(async () => {
     try {
@@ -63,7 +64,7 @@ export function App() {
     return () => clearInterval(t);
   }, []);
   useEffect(() => {
-    const load = () => fetchSpotPrice().then((p) => p && setSpot(p));
+    const load = () => fetchSpot().then((p) => p && setSpotStats(p));
     load();
     const t = setInterval(load, 60_000);
     return () => clearInterval(t);
@@ -86,7 +87,7 @@ export function App() {
 
   return (
     <div className="page">
-      <Header />
+      <Header spot={spotStats} />
       <main className="container">
         {loadError && !snap && <div className="notice error">Could not load the fund: {loadError}</div>}
         {!snap && !loadError && <div className="notice">Loading on-chain data…</div>}
@@ -122,7 +123,7 @@ export function App() {
   );
 }
 
-function Header() {
+function Header({ spot }: { spot: Spot | null }) {
   return (
     <header className="header">
       <div className="container header-inner">
@@ -137,6 +138,16 @@ function Header() {
           <span className="nav-item active">Vault</span>
         </nav>
         <div className="header-right">
+          {spot && (
+            <span className="btc-price" title="BTC/USD now (Coinbase) and its 24-hour change">
+              <span className="muted">BTC</span> ${spot.price.toLocaleString("en-US", { maximumFractionDigits: 0 })}
+              {spot.change24h !== null && (
+                <span className={`delta ${spot.change24h >= 0 ? "up" : "down"}`}>
+                  {spot.change24h >= 0 ? "▲" : "▼"} {Math.abs(spot.change24h * 100).toFixed(2)}%
+                </span>
+              )}
+            </span>
+          )}
           <span className="pill">Devnet</span>
           <WalletMultiButton />
         </div>
@@ -316,9 +327,17 @@ function ActionPanel({ snap, now, run, program }: { snap: Snapshot; now: number;
   const amount = fmt.parseAmount(text, decimals);
   const balance = tab === "sub" ? snap.usdcBalance : snap.shareBalance;
   const min = big(cfg.minSubscription);
+  // 赎回要先有份额：申购定价成交、领取之后份额才到钱包
+  const lastFix = snap.fund.state.lastFixDay.toNumber();
+  const waiting = snap.tickets.filter((t) => t.epoch.toNumber() > lastFix && !t.subscriptionUsdc.isZero());
+  const waitingUsdc = waiting.reduce((x, t) => x + big(t.subscriptionUsdc), 0n);
+  const toClaim = snap.tickets.some((t) => !t.subscriptionUsdc.isZero() && viewTicket(t, snap.fund, snap.records, now).canClaim);
+  const noShares = tab === "red" && !!wallet && snap.shareBalance === 0n;
   const problem = !wallet
     ? "Connect a wallet"
-    : amount === null || amount === 0n
+    : noShares
+      ? "No shares yet"
+      : amount === null || amount === 0n
       ? "Enter an amount"
       : amount > balance
         ? "Insufficient balance"
@@ -376,6 +395,17 @@ function ActionPanel({ snap, now, run, program }: { snap: Snapshot; now: number;
           <Row label="Payout">Claim once your slice is sold; {cfg.withdrawalFeeBps / 100}% withdrawal fee</Row>
         )}
       </div>
+      {noShares && (
+        <p className="hint">
+          {toClaim
+            ? 'Your subscription has filled. Claim the shares under "Your position" first, then redeem them here.'
+            : waiting.length > 0
+              ? `Your ${fmt.usdc(waitingUsdc)} USDC subscription fills after the ${fmt.timeLabel(
+                  Math.max(...waiting.map((t) => t.epoch.toNumber())) * DAY + offset,
+                )} fixing. Then claim the shares under "Your position" and redeem them here.`
+              : "You have no shares yet. Subscribe first; after the next fixing, claim your shares and redeem them here."}
+        </p>
+      )}
       <button className="btn primary" disabled={problem !== null} onClick={submit}>
         {problem ?? (tab === "sub" ? "Subscribe" : "Redeem")}
       </button>
