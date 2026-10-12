@@ -2,7 +2,7 @@
 
 **A pooled Bitcoin fund on Solana: hold cbBTC when BTC is above its 50-day moving average, hold USDC when it is below.**
 
-> **Devnet prototype. Do not use with real money.** The oracle and exchange are mocks. Mainnet needs a security audit and legal advice: pooling other people's money and charging a fee for managing it is regulated in many jurisdictions.
+> **Devnet prototype. Do not use with real money.** Prices come from Pyth; the exchange is a mock that fills at the Pyth price (Jupiter is not integrated yet). Mainnet needs a security audit and legal advice: pooling other people's money and charging a fee for managing it is regulated in many jurisdictions.
 
 ---
 
@@ -176,7 +176,10 @@ tide/
 ├── fund-logic/          Pure-Rust accounting + unit tests
 ├── programs/tide/       Anchor program: accounts and token transfers
 ├── tests/tide.ts        End-to-end test (bankrun, time travel)
-├── scripts/crank.ts     Daily settlement script (devnet)
+├── scripts/crank.ts     Daily settlement script (devnet): Pyth prices, fix, trades, fees
+├── scripts/setup.ts     Create a devnet fund (mock tokens and market)
+├── scripts/faucet.ts    Mint mock USDC to a test wallet
+├── app/                 Web frontend (Vite + React), deployed on Vercel
 ├── docs/adr/            Architecture decisions
 ├── docs/agents/         Agent skill configuration
 ├── CONTEXT.md           Domain vocabulary
@@ -188,6 +191,7 @@ flowchart LR
   P["programs/tide<br/>accounts · CPIs"] -- "calls" --> L["fund-logic<br/>all money math"]
   T["tests/tide.ts"] --> P
   C["scripts/crank.ts"] --> P
+  A["app/ (web)"] --> P
 ```
 
 ---
@@ -212,25 +216,26 @@ anchor deploy --provider.cluster devnet
 
 ```mermaid
 flowchart LR
-  A["mock USDC (6)<br/>mock BTC (8) mints"] --> B["init_mock_oracle"] --> C["init_mock_market<br/>+ liquidity"] --> D["initialize"] --> E["init_vaults"] --> F["seed_prices<br/>last 49 days"]
+  A["mock USDC (6)<br/>mock BTC (8) mints"] --> C["init_mock_market<br/>+ liquidity"] --> D["initialize"] --> E["init_vaults"] --> F["seed_prices<br/>last 49 days"]
 ```
 
-`scripts/setup.ts` runs these steps with the wallet as admin, keeper and fee address (env: `MOCK_PRICE`, `SETTLE_OFFSET_SECS`, `SIGNAL_FEED`, `TRADE_CAP_USDC`, `DEMO_USDC` for a first subscription):
+`scripts/setup.ts` runs these steps with the wallet as admin, keeper and fee address (env: `PYTH_API_KEY` or `SEED_PRICE` for the seed price, `SETTLE_OFFSET_SECS`, `SIGNAL_FEED`, `TRADE_CAP_USDC`, `DEMO_USDC` for a first subscription). `scripts/faucet.ts <address> [usdc] [sol]` mints mock USDC (and sends a little SOL) to a test wallet; run it with the admin wallet.
 
 ```bash
 ANCHOR_PROVIDER_URL=https://api.devnet.solana.com ANCHOR_WALLET=$HOME/.config/solana/id.json yarn ts-node scripts/setup.ts
 ```
 
-Run the crank daily at 01:00 UTC. The mock price must be posted within 60 s:
+Run the crank daily after 01:00 UTC. It needs a Hermes API key from [Pyth Terminal](https://pythdata.app/signup) (Hermes requires one since August 2026), read from `PYTH_API_KEY`:
 
 ```cron
-0 1 * * * cd /path/to/tide && ANCHOR_PROVIDER_URL=https://api.devnet.solana.com ANCHOR_WALLET=$HOME/.config/solana/id.json yarn ts-node scripts/crank.ts >> crank.log 2>&1
+5 1 * * * cd /path/to/tide && PYTH_API_KEY=$(cat ~/.config/pyth/api-key) ANCHOR_PROVIDER_URL=https://api.devnet.solana.com ANCHOR_WALLET=$HOME/.config/solana/id.json yarn ts-node scripts/crank.ts >> crank.log 2>&1
 ```
 
 ```mermaid
 flowchart LR
-  BN["Binance API<br/>BTC price"] --> CR["crank.ts"] -- "set_mock_price" --> O["mock oracle"]
-  CR -- "fix, then trade<br/>every 60 s until done,<br/>then collect_fees" --> P["tide program"]
+  H["Hermes<br/>signed Pyth prices"] --> CR["crank.ts"] -- "post update" --> R["Pyth receiver<br/>PriceUpdateV2 accounts"]
+  CR -- "fix (fixing-window price), then trade<br/>every 60 s until done,<br/>then collect_fees" --> P["tide program"]
+  R --> P
 ```
 
 ---
@@ -246,14 +251,16 @@ flowchart LR
 | `request_redemption(shares, epoch)` | holder | Queue a redemption; `epoch` as above |
 | `cancel` | ticket owner | Withdraw a queued ticket in full, until the fixing time that closes its epoch |
 | `cancel_pending` | ticket owner | Any time after the fixing: refund the unfilled part of a subscription and take the shares already filled |
-| `fix(epoch)` | keeper in 01:00–01:30, then anyone | Fixing step, once a day after `settle_offset_secs`; `epoch` is today's day number |
-| `trade` | keeper in 01:00–01:30, then anyone | One capped trade; others in the window get `KeeperOnly`; answers `NothingToTrade`, `TradeTooSoon`, `DepegBlocksBuy` or `FixPending` when there is none |
+| `fix(epoch)` | keeper in 01:00–01:30, then anyone | Fixing step, once a day after `settle_offset_secs`; `epoch` is today's day number; pass Pyth price updates published in the fixing window |
+| `trade` | keeper in 01:00–01:30, then anyone | One capped trade with current Pyth price updates (at most `max_staleness_secs` old); others in the window get `KeeperOnly`; answers `NothingToTrade`, `TradeTooSoon`, `DepegBlocksBuy` or `FixPending` when there is none |
 | `claim` | subscriber / redeemer | Collect filled shares (repeatable) or redemption USDC; pass the record of the fixing that closed the ticket's epoch |
 | `collect_fees` | anyone | Pay the withdrawal fees owed to the manager to the fee address; claims never depend on that account |
-| `backfill_price(day)` | anyone | Record a missed day's signal price, published in that day's fixing window |
+| `backfill_price(day)` | anyone | Record a missed day's signal price from a Pyth price update published in that day's fixing window |
 | `propose_config(config)`, `apply_config` | admin | Config change, applied 48 h after the proposal |
 | `pause_subscriptions`, `resume_subscriptions` | admin | Immediate; redemptions are never paused |
-| `init_mock_oracle(btc, cbbtc)`, `set_mock_price(btc, cbbtc)`, `init_mock_market`, `set_mock_market_fee` | admin | Devnet only; a price of 0 means that feed does not exist |
+| `init_mock_market`, `set_mock_market_fee` | admin | Devnet only: a mock exchange that fills at the Pyth price, until Jupiter is integrated |
+
+Price inputs to `fix`, `trade` and `backfill_price` are two optional accounts, `btc_price_update` and `cbbtc_price_update`: Pyth `PriceUpdateV2` accounts. The program accepts only accounts owned by the Pyth receiver (`rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`), fully verified through Wormhole, with the feed ID from the config; a confidence interval wider than `max_confidence_bps` of the price is rejected.
 
 ### Configuration
 
@@ -266,7 +273,9 @@ Every row below except "Config timelock" and "Subscription pause" is a field of 
 | `max_slippage_bps` | 30 | Keeper slippage bound |
 | `subscription_fee_bps` | 0 | Subscription fee, kept in fund |
 | `min_subscription` | 1 USDC | Minimum subscription |
-| `max_staleness_secs` | 600 | Max oracle price age |
+| `max_staleness_secs` | 120 (setup) | Max age of the Pyth price used by `trade` |
+| `max_confidence_bps` | 100 | Pyth prices whose confidence interval is wider than this share of the price are rejected |
+| `btc_feed_id` / `cbbtc_feed_id` | Pyth BTC/USD `e62df6…5b43` / cbBTC/USD `2817d7…9a97` | Pyth feed IDs; the cbBTC one is needed only with `signal_feed = CbBtc` |
 | `depeg_threshold_bps` | 200 | cbBTC vs BTC gap that stops buys (with `CbBtc`; a missing BTC/USD reference also stops buys) |
 | `signal_feed` | `Btc` | `CbBtc`: signal, moving average, netting and `min_out` use cbBTC/USD, and BTC/USD is the depeg reference (a missing or stale reference blocks buys). `Btc`: no cbBTC/USD feed, everything uses BTC/USD and there is no depeg check. Change via 48 h timelock; switching mixes the two feeds in the moving average for up to 50 days |
 | `trade_cap_usdc` | 200,000 USDC | Max notional per trade |
@@ -290,7 +299,7 @@ Every row below except "Config timelock" and "Subscription pause" is a field of 
 | Subscription escrow / Share escrow / Payout vault | `["subscription_escrow", fund]` / `["share_escrow", fund]` / `["payout_vault", fund]` |
 | Ticket (per user per epoch) | `["ticket", fund, user, epoch as u64 LE]` |
 | Epoch record | `["epoch", fund, epoch as u64 LE]` (epoch = fixing day, unix / 86400) |
-| Mock oracle / Mock market | `["oracle", authority]` / `["market", authority]` |
+| Mock market | `["market", authority]` |
 | Market vaults | `["market_usdc", market]` / `["market_btc", market]` |
 
 ### Units
@@ -308,7 +317,7 @@ Every row below except "Config timelock" and "Subscription pause" is a field of 
 
 | Technique | Purpose | Status |
 |---|---|---|
-| Oracle-based `min_out` | Reject bad fills and sandwiches | Implemented, checked on every trade |
+| Oracle-based `min_out` | Reject bad fills and sandwiches | Implemented with Pyth, checked on every trade |
 | Capped, spaced trades | Reduce price impact | Implemented, ADR 0001 |
 | Flows pay their own execution | Holders who stay don't pay for others | Implemented, ADR 0002 / 0006 |
 | Keeper window + tighter public bound | Limit what third-party callers can extract | Implemented |

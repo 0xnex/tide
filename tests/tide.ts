@@ -18,6 +18,10 @@
 //   申购上限：算上待成交的申购，超过就拒绝；撤销部分成交的待成交申购，领走份额、退回 USDC
 //   价格源：用 BTC/USD 作信号时 cbBTC/USD 即使有也不用，不检查脱锚
 //   捐款：直接转进基金账户的代币不算基金资产
+//   Pyth：价格更新账户的所有者、验证级别、价格源、置信区间和新鲜度都要检查
+//
+// 价格来自 Pyth 的价格更新账户（PriceUpdateV2）。测试里直接写入这种账户（writePriceUpdate），
+// 代替向 Hermes 取价格、提交给 Pyth 接收程序这两步。
 //
 // 每个请求属于关闭它的定价时刻那一期（期号是那天的日期序号）。第一天的申购在第 0 天提交，
 // 那天没有定价，顺延到第 1 天的定价：领取时用之后第一次定价的记录。
@@ -49,6 +53,10 @@ const PUBLIC_SLIPPAGE_BPS = 10; // 窗口之后其他人的滑点上限
 const SUBSCRIPTION_CAP = 5_000; // 申购上限（USDC），比默认的 100 万小，方便测试
 const MARKET_FEE_BPS = 18; // 模拟交易所的手续费：0.075% 手续费 + 约 0.1% 滑点
 const usd = (x: number) => new BN(Math.round(x * USDC)); // 价格单位：微美元
+const PYTH_RECEIVER = new PublicKey("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ");
+const BTC_FEED = "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43"; // Pyth BTC/USD
+const CBBTC_FEED = "2817d7bfe5c64b8ea956e9a26f573ef64e72e4d7891f2d6af9bcc93f7aff9a97"; // Pyth cbBTC/USD
+const PRICE_UPDATE_V2 = Buffer.from("22f123639d7ef4cd", "hex");
 
 describe("tide", () => {
   let context: ProgramTestContext;
@@ -61,7 +69,12 @@ describe("tide", () => {
   const usdcMint = Keypair.generate();
   const btcMint = Keypair.generate();
 
-  let fund: PublicKey, oracle: PublicKey, market: PublicKey, shareMint: PublicKey;
+  let fund: PublicKey, market: PublicKey, shareMint: PublicKey;
+  // Pyth 价格更新账户（PriceUpdateV2）：测试里直接写入账户数据，代替 Hermes + 接收程序
+  const btcPriceKey = Keypair.generate();
+  const cbbtcPriceKey = Keypair.generate();
+  const btcPriceAcc = btcPriceKey.publicKey;
+  const cbbtcPriceAcc = cbbtcPriceKey.publicKey;
   const pda = (seeds: (Buffer | Uint8Array)[]) =>
     PublicKey.findProgramAddressSync(seeds, program.programId)[0];
   const fundPda = (name: string) => pda([Buffer.from(name), fund.toBuffer()]);
@@ -149,15 +162,54 @@ describe("tide", () => {
     return ata;
   }
 
+  /**
+   * 写入一个 Pyth 价格更新账户（PriceUpdateV2 的布局）。默认由 Pyth 接收程序拥有、完全验证、
+   * 指数 -8、置信区间为价格的 0.01%；opts 可以改成无效的样子来测试程序的校验
+   */
+  async function writePriceUpdate(
+    addr: PublicKey,
+    feedHex: string,
+    usdPrice: number,
+    publishTime: number,
+    opts: { owner?: PublicKey; verification?: number; confBps?: number } = {},
+  ) {
+    const raw = BigInt(Math.round(usdPrice * 1e8));
+    const d = Buffer.alloc(134);
+    PRICE_UPDATE_V2.copy(d, 0);
+    let o = 8 + 32; // write_authority 留空
+    const v = opts.verification ?? 1; // 1 = 完全验证；0 = 部分验证，后面多 1 字节签名数
+    d.writeUInt8(v, o++);
+    if (v === 0) d.writeUInt8(5, o++);
+    Buffer.from(feedHex, "hex").copy(d, o);
+    o += 32;
+    d.writeBigInt64LE(raw, o);
+    d.writeBigUInt64LE((raw * BigInt(opts.confBps ?? 1)) / 10_000n, o + 8);
+    d.writeInt32LE(-8, o + 16);
+    d.writeBigInt64LE(BigInt(publishTime), o + 20);
+    // 账户在 before 里用正常交易建好；这里保留它的 lamports，只改数据和所有者
+    const existing = await context.banksClient.getAccount(addr);
+    context.setAccount(addr, {
+      lamports: Number(existing!.lamports),
+      data: d,
+      owner: opts.owner ?? PYTH_RECEIVER,
+      executable: false,
+    });
+  }
+
+  /** 两个价格源在当前时钟发布新价格；v 为 0 表示没有 cbBTC/USD 价格源（不传这个账户） */
   async function setPrice(p: number, v: number = p) {
     price = p;
     valuation = v;
     pricedAt = now;
-    await program.methods
-      .setMockPrice(usd(p), usd(v))
-      .accountsPartial({ authority: admin.publicKey, oracle })
-      .rpc();
+    await writePriceUpdate(btcPriceAcc, BTC_FEED, p, now);
+    if (v > 0) await writePriceUpdate(cbbtcPriceAcc, CBBTC_FEED, v, now);
   }
+
+  /** 传给 fix / trade / backfill_price 的价格更新账户 */
+  const priceAccounts = () => ({
+    btcPriceUpdate: btcPriceAcc,
+    cbbtcPriceUpdate: valuation > 0 ? cbbtcPriceAcc : null,
+  });
 
   async function fixIx(signer: Keypair = admin) {
     const epoch = Math.floor(now / DAY); // 定价记录的期号：当天的日期序号
@@ -167,7 +219,7 @@ describe("tide", () => {
         cranker: signer.publicKey,
         fund,
         epochRecord: epochPda(epoch),
-        oracle,
+        ...priceAccounts(),
         shareMint,
         usdcVault: fundPda("usdc_vault"),
         subscriptionEscrow: fundPda("subscription_escrow"),
@@ -177,7 +229,7 @@ describe("tide", () => {
       .signers(signer === admin ? [] : [signer]);
   }
 
-  // 第二天 01:00:30 写入两个价格并定价（模拟预言机的价格必须在定价窗口内发布）。
+  // 第二天 01:00:30 发布两个价格并定价（定价价格必须在定价窗口内发布）。
   // price：BTC/USD 信号价格；valuation：cbBTC/USD 估值价格，默认与 BTC 同价。
   // 先确认清算窗口内其他人不能定价
   async function fixDay(p: number, v: number = p) {
@@ -190,7 +242,7 @@ describe("tide", () => {
 
   /** 在当前时钟交易一笔（默认由清算地址签名）；卖出赎回资产时带上最早一期未卖完的记录。返回错误名或 null */
   async function trade(signer: Keypair = admin): Promise<string | null> {
-    // 保持预言机价格新鲜（同一时刻已经写入过就不再写，避免重复交易）
+    // 保持价格新鲜（同一时刻已经发布过就不再写）
     if (pricedAt !== now) await setPrice(price, valuation);
     const f = await program.account.fund.fetch(fund);
     // 最早一期未卖完的赎回资产的记录；没有时用最早一期待成交申购的记录
@@ -202,7 +254,7 @@ describe("tide", () => {
         .accountsPartial({
           cranker: signer.publicKey,
           fund,
-          oracle,
+          ...priceAccounts(),
           market,
           marketUsdc: pda([Buffer.from("market_usdc"), market.toBuffer()]),
           marketBtc: pda([Buffer.from("market_btc"), market.toBuffer()]),
@@ -368,17 +420,30 @@ describe("tide", () => {
       SystemProgram.transfer({ fromPubkey: admin.publicKey, toPubkey: alice.publicKey, lamports: 1e9 }),
       SystemProgram.transfer({ fromPubkey: admin.publicKey, toPubkey: bob.publicKey, lamports: 1e9 }),
     ]);
+    // 两个 Pyth 价格更新账户：先建成 134 字节、由 Pyth 接收程序拥有，之后 setPrice 写入价格
+    const priceRent = Number((await context.banksClient.getRent()).minimumBalance(134n));
+    await send(
+      [btcPriceKey, cbbtcPriceKey].map((k) =>
+        SystemProgram.createAccount({
+          fromPubkey: admin.publicKey,
+          newAccountPubkey: k.publicKey,
+          lamports: priceRent,
+          space: 134,
+          programId: PYTH_RECEIVER,
+        }),
+      ),
+      [btcPriceKey, cbbtcPriceKey],
+    );
+    await setPrice(50_000);
     await createMint(usdcMint, 6);
     await createMint(btcMint, 8);
     aliceUsdc = await ataWith(alice.publicKey, usdcMint.publicKey, 10_000 * USDC);
     bobUsdc = await ataWith(bob.publicKey, usdcMint.publicKey, 10_000 * USDC);
 
-    oracle = pda([Buffer.from("oracle"), admin.publicKey.toBuffer()]);
     market = pda([Buffer.from("market"), admin.publicKey.toBuffer()]);
     fund = pda([Buffer.from("fund"), admin.publicKey.toBuffer()]);
     shareMint = pda([Buffer.from("share_mint"), fund.toBuffer()]);
 
-    await program.methods.initMockOracle(usd(50_000), usd(50_000)).accounts({ authority: admin.publicKey }).rpc();
     await program.methods
       .initMockMarket(MARKET_FEE_BPS)
       .accounts({ authority: admin.publicKey, usdcMint: usdcMint.publicKey, btcMint: btcMint.publicKey })
@@ -404,11 +469,14 @@ describe("tide", () => {
         withdrawalFeeBps: 100,
         subscriptionCapUsdc: new BN(SUBSCRIPTION_CAP * USDC),
         signalFeed: { cbBtc: {} }, // 先用 cbBTC/USD 作信号，治理测试里换成 BTC/USD
+        maxConfidenceBps: 100,
         maxStalenessSecs: new BN(600),
         keeper: admin.publicKey, // 清算地址：这里就是管理员钱包
         feeAddress: manager.publicKey,
+        btcFeedId: [...Buffer.from(BTC_FEED, "hex")],
+        cbbtcFeedId: [...Buffer.from(CBBTC_FEED, "hex")],
       })
-      .accountsPartial({ admin: admin.publicKey, fund, usdcMint: usdcMint.publicKey, btcMint: btcMint.publicKey, shareMint, oracle, market })
+      .accountsPartial({ admin: admin.publicKey, fund, usdcMint: usdcMint.publicKey, btcMint: btcMint.publicKey, shareMint, market })
       .rpc();
     await program.methods
       .initVaults()
@@ -681,13 +749,13 @@ describe("tide", () => {
     const backfill = (day: number, signer: Keypair) =>
       program.methods
         .backfillPrice(new BN(day))
-        .accountsPartial({ caller: signer.publicKey, fund, oracle })
+        .accountsPartial({ caller: signer.publicKey, fund, ...priceAccounts() })
         .signers([signer])
         .rpc();
     // 当天不能回填（应该由定价记录）
     expect(await errorName(backfill(missed, alice))).to.equal("BackfillOutOfRange");
 
-    // 第二天 00:10，预言机还是那一天 01:00:30 的价格：任何人都可以回填
+    // 第二天 00:10，用那一天 01:00:30 发布的价格更新：任何人都可以回填
     await warpTo((missed + 1) * DAY + 600);
     await backfill(missed, alice);
     const f = await program.account.fund.fetch(fund);
@@ -699,7 +767,7 @@ describe("tide", () => {
     await warpTo(now + 1);
     expect(await errorName(backfill(missed, bob))).to.equal("PriceAlreadyRecorded");
 
-    // 前一天同样没人定价，但预言机现在的价格不是那天定价窗口内发布的，不能用来回填
+    // 前一天同样没人定价，但现在的价格更新不是那天定价窗口内发布的，不能用来回填
     await setPrice(58_000);
     expect(await errorName(backfill(missed - 1, alice))).to.equal("PriceNotAtFixTime");
   });
@@ -791,5 +859,22 @@ describe("tide", () => {
     expect(st.sliceCount).to.equal(0);
     expect(await tokenBalance(fundPda("usdc_vault"))).to.equal(BigInt(st.usdc.toString()) + BigInt(donatedUsdc));
     expect(await tokenBalance(fundPda("btc_vault"))).to.equal(BigInt(st.btc.toString()) + BigInt(donatedBtc));
+  });
+
+  it("Pyth 价格账户：只接受接收程序拥有、完全验证、价格源对、置信区间窄、交易时不过旧的价格", async () => {
+    // 先在当前时钟用一个被改坏的 BTC/USD 价格更新去交易（现在信号用 BTC/USD）
+    const tradeWith = async (opts: Parameters<typeof writePriceUpdate>[4], feed = BTC_FEED, age = 0) => {
+      await warpTo(now + 1);
+      await writePriceUpdate(btcPriceAcc, feed, price, now - age, opts);
+      pricedAt = now; // trade() 不要再写正常价格
+      return trade();
+    };
+    expect(await tradeWith({ owner: SystemProgram.programId })).to.equal("WrongPriceAccount");
+    expect(await tradeWith({ verification: 0 })).to.equal("WrongPriceAccount");
+    expect(await tradeWith({}, CBBTC_FEED)).to.equal("WrongPriceAccount");
+    expect(await tradeWith({ confBps: 101 })).to.equal("PriceTooUncertain");
+    expect(await tradeWith({}, BTC_FEED, 601)).to.equal("StalePrice");
+    // 正常的价格更新可以用
+    expect(await tradeWith({})).to.equal("NothingToTrade");
   });
 });

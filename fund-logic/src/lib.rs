@@ -87,6 +87,7 @@ pub enum FundError {
     ConfigFieldFixed,        // 定价时刻和均线窗口只能在创建时设定
     PriceAlreadyRecorded,    // 这一天已经有信号价格
     BackfillOutOfRange,      // 只能回填过去、还在存储范围内（最近 MAX_WINDOW 天）的一天
+    PriceTooUncertain,       // Pyth 价格的置信区间超过 max_confidence_bps
 }
 
 /// 信号（以及均线、轧差、min_out）用哪个价格源
@@ -111,6 +112,7 @@ pub struct Config {
     pub withdrawal_fee_bps: u16,      // 取款费率（领取赎回款时欠管理人），最多 1%
     pub subscription_cap_usdc: u64,   // 申购上限：还没买完的申购（排队的加待成交的）最多这么多
     pub signal_feed: SignalFeed,      // 信号价格源，默认 BTC/USD；创建时设定，只能通过时间锁修改
+    pub max_confidence_bps: u16,      // Pyth 价格的置信区间最多是价格的多少（太宽的价格不用）
 }
 
 impl Config {
@@ -130,6 +132,7 @@ impl Config {
             withdrawal_fee_bps: 100,
             subscription_cap_usdc: 1_000_000_000_000, // 1,000,000 USDC
             signal_feed: SignalFeed::Btc,
+            max_confidence_bps: 100,
         }
     }
 
@@ -159,6 +162,8 @@ impl Config {
         }
         if self.withdrawal_fee_bps > MAX_WITHDRAWAL_FEE_BPS
             || self.subscription_cap_usdc < self.min_subscription
+            || self.max_confidence_bps == 0
+            || self.max_confidence_bps as u128 >= BPS
         {
             return Err(FundError::InvalidConfig);
         }
@@ -334,6 +339,39 @@ pub struct PricePoint {
 pub struct FixPrices {
     pub cbbtc: Option<PricePoint>, // cbBTC/USD
     pub btc: Option<PricePoint>,   // BTC/USD
+}
+
+/// Pyth 价格（整数 price × 10^expo 美元）换算成微美元，向下取整。
+/// 置信区间 conf 超过价格的 max_conf_bps 时拒绝：这时价格源自己都不确定，不能用来定价或限定成交。
+/// 不足 1 微美元、非正数或指数离谱的价格无效。
+pub fn pyth_to_micro_usd(
+    price: i64,
+    conf: u64,
+    expo: i32,
+    max_conf_bps: u16,
+) -> Result<u64, FundError> {
+    if price <= 0 {
+        return Err(FundError::BadPrice);
+    }
+    let p = price as u128;
+    if (conf as u128) * BPS > p * max_conf_bps as u128 {
+        return Err(FundError::PriceTooUncertain);
+    }
+    // 微美元 = 美元 × 10^6，所以要乘 10^(expo + 6)；10^30 还在 u128 范围内
+    let shift = expo.checked_add(6).ok_or(FundError::BadPrice)?;
+    if !(-30..=30).contains(&shift) {
+        return Err(FundError::BadPrice);
+    }
+    let scaled = if shift >= 0 {
+        p.checked_mul(10u128.pow(shift as u32))
+            .ok_or(FundError::Overflow)?
+    } else {
+        p / 10u128.pow(shift.unsigned_abs())
+    };
+    match to_u64(scaled)? {
+        0 => Err(FundError::BadPrice),
+        v => Ok(v),
+    }
 }
 
 /// 按配置选出的价格：price 用于信号、均线、轧差和 min_out（即信号价格和估值价格）；
@@ -2642,6 +2680,15 @@ mod tests {
                 withdrawal_fee_bps: 101,
                 ..cfg()
             },
+            // 置信区间上限在 (0, 100%) 之间
+            Config {
+                max_confidence_bps: 0,
+                ..cfg()
+            },
+            Config {
+                max_confidence_bps: 10_000,
+                ..cfg()
+            },
             // 申购上限不能低于最低申购金额
             Config {
                 subscription_cap_usdc: USDC - 1,
@@ -4327,6 +4374,42 @@ mod tests {
         assert!(
             pending_cancels > 0 && cap_rejections > 0,
             "{pending_cancels} {cap_rejections}"
+        );
+    }
+
+    #[test]
+    fn pyth_prices_convert_to_micro_usd() {
+        let max_conf = cfg().max_confidence_bps;
+        assert_eq!(max_conf, 100);
+        // BTC/USD：价格 8,359,541,100,575 × 10^-8 = 83,595.41100575 USD，微美元向下取整
+        assert_eq!(
+            pyth_to_micro_usd(8_359_541_100_575, 7_883_138_849, -8, max_conf),
+            Ok(83_595_411_005)
+        );
+        // 指数 -6 不用换算；大于 -6 时乘上去；也支持正指数
+        assert_eq!(pyth_to_micro_usd(1_234, 0, -6, max_conf), Ok(1_234));
+        assert_eq!(pyth_to_micro_usd(1_234, 0, -3, max_conf), Ok(1_234_000));
+        assert_eq!(pyth_to_micro_usd(5, 0, 2, max_conf), Ok(500_000_000));
+        // 不足 1 微美元、非正价格、指数太离谱、溢出：价格无效
+        let bad = Err(FundError::BadPrice);
+        assert_eq!(pyth_to_micro_usd(99, 0, -8, max_conf), bad);
+        assert_eq!(pyth_to_micro_usd(0, 0, -8, max_conf), bad);
+        assert_eq!(pyth_to_micro_usd(-1, 0, -8, max_conf), bad);
+        assert_eq!(pyth_to_micro_usd(1, 0, -40, max_conf), bad);
+        assert_eq!(
+            pyth_to_micro_usd(i64::MAX, 0, 12, max_conf),
+            Err(FundError::Overflow)
+        );
+        // 置信区间超过价格的 max_confidence_bps：价格太不确定，不用
+        let p: i64 = 8_000_000_000_000; // 80,000 USD
+        let one_pct = p as u64 / 100;
+        assert_eq!(
+            pyth_to_micro_usd(p, one_pct, -8, max_conf),
+            Ok(80_000_000_000)
+        );
+        assert_eq!(
+            pyth_to_micro_usd(p, one_pct + 1, -8, max_conf),
+            Err(FundError::PriceTooUncertain)
         );
     }
 

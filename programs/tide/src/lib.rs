@@ -26,10 +26,12 @@
 //! - 价格源（ADR 0005）：config.signal_feed 为 CbBtc 时信号、均线、轧差和 min_out 都用 cbBTC/USD，
 //!   有 BTC/USD 时用它检查脱锚；为 Btc 时都用 BTC/USD，不检查脱锚
 //!
+//! - 价格来自 Pyth（pull oracle）：调用人先把 Hermes 签名的价格更新提交给 Pyth 接收程序，
+//!   再把得到的 PriceUpdateV2 账户传进 fix / trade / backfill_price。程序只接受接收程序拥有、
+//!   Wormhole 完全验证、价格源 ID 与配置一致的账户；换算和置信区间检查在 fund-logic
+//!
 //! 原型限制（上主网前必须替换）：
-//! - 价格来自 MockOracle（管理员手动设置 BTC/USD 和 cbBTC/USD 两个价格，0 表示没有这个价格源），
-//!   主网应改为 Pyth 的价格源
-//! - 兑换走 MockMarket（按预言机价格成交、收固定手续费），主网应改为 Jupiter
+//! - 兑换走 MockMarket（按 Pyth 价格成交、收固定手续费），主网应改为 Jupiter
 //!
 //! 所有记账逻辑在 fund-logic crate 中（纯 Rust，有完整单元测试），本文件只负责
 //! 账户校验和代币转账。
@@ -62,7 +64,6 @@ pub mod tide {
         fund.usdc_mint = ctx.accounts.usdc_mint.key();
         fund.btc_mint = ctx.accounts.btc_mint.key();
         fund.share_mint = ctx.accounts.share_mint.key();
-        fund.oracle = ctx.accounts.oracle.key();
         fund.market = ctx.accounts.market.key();
         fund.config = config;
         fund.state = StateData::from_logic(&logic::FundState::new());
@@ -372,7 +373,13 @@ pub mod tide {
         // 模拟预言机每个价格源只有一个价格：它必须在定价窗口内发布，并且不超过
         // max_staleness_secs，所以目前只能在 1 点后几十秒内定价。
         // 换成 Pyth 后，定价价格用 1 点的历史价格更新。
-        let prices = fresh_prices(&ctx.accounts.oracle, &fund_cfg, now)?;
+        // 定价用定价窗口内发布的历史价格，不检查是否过旧（fund-logic 检查发布时间）
+        let prices = pyth_prices(
+            ctx.accounts.btc_price_update.as_ref(),
+            ctx.accounts.cbbtc_price_update.as_ref(),
+            &fund_cfg,
+            None,
+        )?;
 
         let cfg = fund_cfg.to_logic();
         // 基金状态有 1.5KB，放在堆上：SBF 每个栈帧只有 4KB
@@ -465,7 +472,12 @@ pub mod tide {
     pub fn trade(ctx: Context<Trade>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let fund_cfg = ctx.accounts.fund.config;
-        let latest = fresh_prices(&ctx.accounts.oracle, &fund_cfg, now)?;
+        let latest = pyth_prices(
+            ctx.accounts.btc_price_update.as_ref(),
+            ctx.accounts.cbbtc_price_update.as_ref(),
+            &fund_cfg,
+            Some(now),
+        )?;
         let prices = logic::MarketPrices {
             cbbtc: latest.cbbtc.map(|p| p.price),
             btc: latest.btc.map(|p| p.price),
@@ -612,11 +624,15 @@ pub mod tide {
     }
 
     /// 回填没有定价的那一天（day，日期序号）的信号价格，任何人都可以调用。
-    /// 预言机的信号价格必须发布在那一天的定价窗口内，所以不检查是否过旧
-    /// （换成 Pyth 后传那一天的历史价格更新）。
+    /// 传入那一天定价窗口内发布的 Pyth 历史价格更新，所以不检查是否过旧。
     pub fn backfill_price(ctx: Context<BackfillPrice>, day: i64) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
-        let prices = oracle_feeds(&ctx.accounts.oracle);
+        let prices = pyth_prices(
+            ctx.accounts.btc_price_update.as_ref(),
+            ctx.accounts.cbbtc_price_update.as_ref(),
+            &ctx.accounts.fund.config,
+            None,
+        )?;
         let fund = &mut ctx.accounts.fund;
         let cfg = fund.config.to_logic();
         let mut st = fund.state.to_logic();
@@ -628,30 +644,8 @@ pub mod tide {
     }
 
     // ------------------------------------------------------------------
-    // 原型专用：模拟预言机和模拟交易所（主网版本删除）
+    // 原型专用：模拟交易所（换成 Jupiter 之后删除）
     // ------------------------------------------------------------------
-
-    /// 价格为 0 表示没有这个价格源
-    pub fn init_mock_oracle(
-        ctx: Context<InitMockOracle>,
-        btc_price: u64,
-        cbbtc_price: u64,
-    ) -> Result<()> {
-        let o = &mut ctx.accounts.oracle;
-        o.authority = ctx.accounts.authority.key();
-        o.set(btc_price, cbbtc_price, Clock::get()?.unix_timestamp);
-        Ok(())
-    }
-
-    pub fn set_mock_price(
-        ctx: Context<SetMockPrice>,
-        btc_price: u64,
-        cbbtc_price: u64,
-    ) -> Result<()> {
-        let o = &mut ctx.accounts.oracle;
-        o.set(btc_price, cbbtc_price, Clock::get()?.unix_timestamp);
-        Ok(())
-    }
 
     pub fn init_mock_market(ctx: Context<InitMockMarket>, fee_bps: u16) -> Result<()> {
         require!(fee_bps < 10_000, FundErrorCode::InvalidConfig);
@@ -672,11 +666,17 @@ pub mod tide {
     }
 }
 
-/// fund-logic 看不到的配置项：预言机价格最多多旧、清算地址、收费地址
+/// fund-logic 看不到的配置项：价格最多多旧、清算地址、收费地址、Pyth 价格源 ID
 fn check_program_config(config: &ConfigData) -> Result<()> {
     require!(config.max_staleness_secs > 0, FundErrorCode::InvalidConfig);
     require!(
         config.keeper != Pubkey::default() && config.fee_address != Pubkey::default(),
+        FundErrorCode::InvalidConfig
+    );
+    // 用 cbBTC/USD 时还要 BTC/USD 作脱锚检查的参照，两个价格源 ID 都要有
+    let needs_cbbtc = config.signal_feed == SignalFeedData::CbBtc;
+    require!(
+        config.btc_feed_id != [0; 32] && (!needs_cbbtc || config.cbbtc_feed_id != [0; 32]),
         FundErrorCode::InvalidConfig
     );
     Ok(())
@@ -708,32 +708,78 @@ fn fund_transfer<'info>(
     )
 }
 
-/// 模拟预言机的两个价格源及发布时间；价格为 0 表示没有这个价格源
-fn oracle_feeds(oracle: &MockOracle) -> logic::FixPrices {
-    let feed = |price: u64, publish_time: i64| {
-        (price > 0).then_some(logic::PricePoint {
-            price,
-            publish_time,
-        })
-    };
-    logic::FixPrices {
-        cbbtc: feed(oracle.cbbtc_price, oracle.cbbtc_publish_time),
-        btc: feed(oracle.btc_price, oracle.btc_publish_time),
-    }
+/// Pyth 接收程序（pull oracle）：主网和 devnet 是同一个地址
+pub const PYTH_RECEIVER: Pubkey =
+    anchor_lang::solana_program::pubkey!("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ");
+/// PriceUpdateV2 账户的鉴别符
+const PRICE_UPDATE_V2: [u8; 8] = [0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd];
+
+fn le_bytes<const N: usize>(b: &[u8]) -> Result<[u8; N]> {
+    b.get(..N)
+        .and_then(|x| x.try_into().ok())
+        .ok_or_else(|| error!(FundErrorCode::WrongPriceAccount))
 }
 
-/// 读取价格源并检查是否过旧（fund-logic 看不到）。选定的价格源（signal_feed）过旧时报错；
-/// 另一个只是脱锚检查的参照，过旧时当作没有：fund-logic 会因此不买入，但卖出和定价照常。
+/// 读取一个 Pyth 价格更新账户（PriceUpdateV2）。程序看得到、fund-logic 看不到的检查都在这里：
+/// - 由 Pyth 接收程序拥有（别人伪造不了这样的账户）
+/// - 经过 Wormhole 完全验证（不接受部分验证）
+/// - 价格源 ID 与配置一致
+/// 价格的换算和置信区间检查在 fund-logic。
+fn read_pyth(
+    acc: &AccountInfo,
+    feed_id: &[u8; 32],
+    cfg: &logic::Config,
+) -> Result<logic::PricePoint> {
+    require_keys_eq!(*acc.owner, PYTH_RECEIVER, FundErrorCode::WrongPriceAccount);
+    let data = acc.try_borrow_data()?;
+    // 8 字节鉴别符 + 32 字节 write_authority + 验证级别：1 是完全验证，0 是部分验证（后面多 1 字节）
+    require!(
+        data.get(..8) == Some(&PRICE_UPDATE_V2[..]) && data.get(40) == Some(&1),
+        FundErrorCode::WrongPriceAccount
+    );
+    // PriceFeedMessage：feed_id 32 | price i64 | conf u64 | exponent i32 | publish_time i64
+    let m = data.get(41..).unwrap_or_default();
+    require!(
+        m.get(..32) == Some(&feed_id[..]),
+        FundErrorCode::WrongPriceAccount
+    );
+    let price = i64::from_le_bytes(le_bytes(m.get(32..).unwrap_or_default())?);
+    let conf = u64::from_le_bytes(le_bytes(m.get(40..).unwrap_or_default())?);
+    let expo = i32::from_le_bytes(le_bytes(m.get(48..).unwrap_or_default())?);
+    let publish_time = i64::from_le_bytes(le_bytes(m.get(52..).unwrap_or_default())?);
+    Ok(logic::PricePoint {
+        price: logic::pyth_to_micro_usd(price, conf, expo, cfg.max_confidence_bps)
+            .map_err(map_err)?,
+        publish_time,
+    })
+}
+
+/// 读取传入的 Pyth 价格更新。now 为 Some 时（交易）检查是否过旧；定价和回填用历史价格，传 None，
+/// 由 fund-logic 检查发布时间在定价窗口内。
+/// 选定的价格源（signal_feed）有问题时报错；另一个只是脱锚检查的参照，
+/// 读不出、过旧或太不确定时当作没有：fund-logic 会因此不买入，但卖出和定价照常。
 // 不内联：trade 的栈帧已经接近 SBF 的 4KB 上限
 #[inline(never)]
-fn fresh_prices(oracle: &MockOracle, cfg: &ConfigData, now: i64) -> Result<logic::FixPrices> {
+fn pyth_prices(
+    btc: Option<&UncheckedAccount>,
+    cbbtc: Option<&UncheckedAccount>,
+    cfg: &ConfigData,
+    now: Option<i64>,
+) -> Result<logic::FixPrices> {
+    let logic_cfg = cfg.to_logic();
     let fresh = |p: &logic::PricePoint| {
-        now >= p.publish_time && now - p.publish_time <= cfg.max_staleness_secs
+        now.is_none_or(|t| t >= p.publish_time && t - p.publish_time <= cfg.max_staleness_secs)
     };
-    let feeds = oracle_feeds(oracle);
+    let read =
+        |acc: Option<&UncheckedAccount>, feed_id: &[u8; 32]| -> Result<Option<logic::PricePoint>> {
+            acc.map(|a| read_pyth(a, feed_id, &logic_cfg)).transpose()
+        };
     let (chosen, reference) = match cfg.signal_feed {
-        SignalFeedData::CbBtc => (feeds.cbbtc, feeds.btc),
-        SignalFeedData::Btc => (feeds.btc, None),
+        SignalFeedData::CbBtc => (
+            read(cbbtc, &cfg.cbbtc_feed_id)?,
+            read(btc, &cfg.btc_feed_id).ok().flatten(),
+        ),
+        SignalFeedData::Btc => (read(btc, &cfg.btc_feed_id)?, None),
     };
     if let Some(p) = chosen {
         require!(fresh(&p), FundErrorCode::StalePrice);
@@ -777,9 +823,12 @@ pub struct ConfigData {
     pub withdrawal_fee_bps: u16,
     pub subscription_cap_usdc: u64,
     pub signal_feed: SignalFeedData,
-    pub max_staleness_secs: i64, // 预言机价格最多允许多旧
+    pub max_confidence_bps: u16,
+    pub max_staleness_secs: i64, // 交易用的 Pyth 价格最多允许多旧 // 预言机价格最多允许多旧
     pub keeper: Pubkey,          // 清算地址：清算窗口内唯一能驱动结算的签名人
-    pub fee_address: Pubkey, // 收费地址（管理人）：collect_fees 把取款费付到它的 USDC 关联代币账户
+    pub fee_address: Pubkey,
+    pub btc_feed_id: [u8; 32],   // Pyth BTC/USD 价格源 ID
+    pub cbbtc_feed_id: [u8; 32], // Pyth cbBTC/USD 价格源 ID（signal_feed 为 Btc 时可以全 0） // 收费地址（管理人）：collect_fees 把取款费付到它的 USDC 关联代币账户
 }
 
 impl ConfigData {
@@ -801,6 +850,7 @@ impl ConfigData {
                 SignalFeedData::CbBtc => logic::SignalFeed::CbBtc,
                 SignalFeedData::Btc => logic::SignalFeed::Btc,
             },
+            max_confidence_bps: self.max_confidence_bps,
         }
     }
 
@@ -927,7 +977,6 @@ pub struct Fund {
     pub usdc_mint: Pubkey,
     pub btc_mint: Pubkey,
     pub share_mint: Pubkey,
-    pub oracle: Pubkey,
     pub market: Pubkey,
     pub config: ConfigData,
     pub state: StateData,
@@ -1056,27 +1105,7 @@ impl EpochRecord {
     }
 }
 
-/// 原型专用：模拟预言机，两个价格源，单位为“每枚 BTC 的微美元”（USD × 1e6）
-#[account]
-#[derive(InitSpace)]
-pub struct MockOracle {
-    pub authority: Pubkey,
-    pub btc_price: u64, // BTC/USD，0 表示没有这个价格源
-    pub btc_publish_time: i64,
-    pub cbbtc_price: u64, // cbBTC/USD，0 表示没有这个价格源
-    pub cbbtc_publish_time: i64,
-}
-
-impl MockOracle {
-    fn set(&mut self, btc_price: u64, cbbtc_price: u64, now: i64) {
-        self.btc_price = btc_price;
-        self.btc_publish_time = now;
-        self.cbbtc_price = cbbtc_price;
-        self.cbbtc_publish_time = now;
-    }
-}
-
-/// 原型专用：模拟交易所，按预言机价格成交任意数量（以注入的流动性为限），收 fee_bps 手续费
+/// 原型专用：模拟交易所，按 Pyth 价格成交任意数量（以注入的流动性为限），收 fee_bps 手续费
 #[account]
 #[derive(InitSpace)]
 pub struct MockMarket {
@@ -1160,7 +1189,6 @@ pub struct Initialize<'info> {
         mint::decimals = 6, mint::authority = fund
     )]
     pub share_mint: Box<Account<'info, Mint>>,
-    pub oracle: Box<Account<'info, MockOracle>>,
     #[account(
         constraint = market.usdc_mint == usdc_mint.key() @ FundErrorCode::WrongMint,
         constraint = market.btc_mint == btc_mint.key() @ FundErrorCode::WrongMint
@@ -1356,7 +1384,7 @@ pub struct Fix<'info> {
     #[account(mut)]
     pub cranker: Signer<'info>,
     #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump,
-              has_one = oracle, has_one = share_mint)]
+              has_one = share_mint)]
     pub fund: Box<Account<'info, Fund>>,
     /// 当天的定价记录。已经存在只可能是今天定价过了：这时由 fund-logic 回答 AlreadySettled，
     /// 不会改写它（所以用 init_if_needed，而不是让创建账户失败）
@@ -1365,7 +1393,10 @@ pub struct Fix<'info> {
         seeds = [b"epoch", fund.key().as_ref(), &epoch.to_le_bytes()], bump
     )]
     pub epoch_record: Box<Account<'info, EpochRecord>>,
-    pub oracle: Box<Account<'info, MockOracle>>,
+    /// CHECK: Pyth BTC/USD 价格更新（PriceUpdateV2），由 read_pyth 校验所有者、验证级别和价格源 ID
+    pub btc_price_update: Option<UncheckedAccount<'info>>,
+    /// CHECK: Pyth cbBTC/USD 价格更新，同上；signal_feed 为 Btc 时不用
+    pub cbbtc_price_update: Option<UncheckedAccount<'info>>,
     #[account(mut)]
     pub share_mint: Box<Account<'info, Mint>>,
     #[account(mut, seeds = [b"usdc_vault", fund.key().as_ref()], bump)]
@@ -1385,9 +1416,12 @@ pub struct Trade<'info> {
     /// 清算窗口内只能是清算地址，之后任何人都可以（滑点上限更严）
     pub cranker: Signer<'info>,
     #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump,
-              has_one = oracle, has_one = market)]
+              has_one = market)]
     pub fund: Box<Account<'info, Fund>>,
-    pub oracle: Box<Account<'info, MockOracle>>,
+    /// CHECK: Pyth BTC/USD 价格更新（PriceUpdateV2），由 read_pyth 校验所有者、验证级别和价格源 ID
+    pub btc_price_update: Option<UncheckedAccount<'info>>,
+    /// CHECK: Pyth cbBTC/USD 价格更新，同上；signal_feed 为 Btc 时不用
+    pub cbbtc_price_update: Option<UncheckedAccount<'info>>,
     #[account(seeds = [b"market", market.authority.as_ref()], bump = market.bump)]
     pub market: Box<Account<'info, MockMarket>>,
     #[account(mut, seeds = [b"market_usdc", market.key().as_ref()], bump)]
@@ -1439,26 +1473,12 @@ pub struct CollectFees<'info> {
 #[derive(Accounts)]
 pub struct BackfillPrice<'info> {
     pub caller: Signer<'info>,
-    #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump, has_one = oracle)]
+    #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump)]
     pub fund: Box<Account<'info, Fund>>,
-    pub oracle: Box<Account<'info, MockOracle>>,
-}
-
-#[derive(Accounts)]
-pub struct InitMockOracle<'info> {
-    #[account(mut)]
-    pub authority: Signer<'info>,
-    #[account(init, payer = authority, space = 8 + MockOracle::INIT_SPACE,
-              seeds = [b"oracle", authority.key().as_ref()], bump)]
-    pub oracle: Box<Account<'info, MockOracle>>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct SetMockPrice<'info> {
-    pub authority: Signer<'info>,
-    #[account(mut, has_one = authority)]
-    pub oracle: Box<Account<'info, MockOracle>>,
+    /// CHECK: Pyth BTC/USD 价格更新（PriceUpdateV2），由 read_pyth 校验所有者、验证级别和价格源 ID
+    pub btc_price_update: Option<UncheckedAccount<'info>>,
+    /// CHECK: Pyth cbBTC/USD 价格更新，同上；signal_feed 为 Btc 时不用
+    pub cbbtc_price_update: Option<UncheckedAccount<'info>>,
 }
 
 #[derive(Accounts)]
@@ -1564,6 +1584,10 @@ pub enum FundErrorCode {
     BackfillOutOfRange,
     #[msg("超过申购上限（算上待成交的申购）")]
     SubscriptionCapExceeded,
+    #[msg("Pyth 价格的置信区间太宽")]
+    PriceTooUncertain,
+    #[msg("不是有效的 Pyth 价格更新账户（所有者、验证级别或价格源不对）")]
+    WrongPriceAccount,
 }
 
 fn map_err(e: logic::FundError) -> Error {
@@ -1598,6 +1622,7 @@ fn map_err(e: logic::FundError) -> Error {
         E::PriceAlreadyRecorded => FundErrorCode::PriceAlreadyRecorded,
         E::BackfillOutOfRange => FundErrorCode::BackfillOutOfRange,
         E::SubscriptionCapExceeded => FundErrorCode::SubscriptionCapExceeded,
+        E::PriceTooUncertain => FundErrorCode::PriceTooUncertain,
     };
     error!(code)
 }

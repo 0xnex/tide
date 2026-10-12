@@ -4,7 +4,7 @@ Guidance for AI coding agents (and human contributors) working on this repositor
 
 ## Project in one paragraph
 
-`tide` is a Solana (Anchor) program for a pooled BTC fund. Users queue USDC subscriptions and share redemptions; at 01:00 UTC each day the fixing price is recorded and compared with the 50-day moving average. Settlement then sets aside the redemption slice, nets subscriptions against it, and rebalances the fund toward all-cbBTC (above the average) or all-USDC (below) through capped trades. Shares follow actual execution, never a USD valuation. Users then `claim` their shares or USDC. It is a **devnet prototype**: oracle and exchange are mocks.
+`tide` is a Solana (Anchor) program for a pooled BTC fund. Users queue USDC subscriptions and share redemptions; at 01:00 UTC each day the fixing price is recorded and compared with the 50-day moving average. Settlement then sets aside the redemption slice, nets subscriptions against it, and rebalances the fund toward all-cbBTC (above the average) or all-USDC (below) through capped trades. Shares follow actual execution, never a USD valuation. Users then `claim` their shares or USDC. It is a **devnet prototype**: prices come from Pyth, the exchange is a mock.
 
 The design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/` (decisions; 0005–0007 replace parts of 0002–0004). The invariants below describe the code as it is.
 
@@ -18,13 +18,15 @@ Write every reply in plain language: short sentences, one idea each. Lead with t
 fund-logic/            ← ALL accounting. Pure Rust, no dependencies, fully unit-tested.
 programs/tide/         ← Thin Anchor wrapper: validates accounts, moves tokens, calls fund-logic.
 tests/                 ← End-to-end tests (TypeScript, bankrun with clock control).
-scripts/crank.ts       ← Daily settlement script (devnet).
+scripts/crank.ts       ← Daily settlement script (devnet): posts Pyth prices, fix, trades, collect_fees.
+scripts/setup.ts       ← Creates a devnet fund; scripts/faucet.ts mints mock USDC to test wallets.
+app/                   ← Web frontend (Vite + React, deployed on Vercel). Own package.json; copy the IDL with `yarn sync-idl`.
 ```
 
 **Rule: arithmetic about money belongs in `fund-logic`, never in the Anchor program.** The program may only:
 - convert between Anchor account structs and `fund_logic` structs,
 - perform CPIs (transfer, mint, burn) for amounts that `fund-logic` returned,
-- check things `fund-logic` cannot see (signers, PDAs, oracle staleness, mint decimals).
+- check things `fund-logic` cannot see (signers, PDAs, the Pyth price account's owner / verification / feed ID, price staleness, mint decimals).
 
 If you need new math, add a function to `fund-logic`, test it there, then call it from the program.
 
@@ -84,7 +86,8 @@ These are easy to break when editing:
 - `EpochRecord` (program) mirrors `fund_logic::EpochRecord`, including the five `unclaimed_*` fields and the two `cancelled_*` fields. Update `set_from_logic`, `set_unclaimed`, and `to_logic`.
 - Every `fund_logic::FundError` variant needs a matching `FundErrorCode` and an arm in `map_err`. The match is exhaustive, so the compiler will remind you.
 - `ConfigData.signal_feed` (`SignalFeedData`) mirrors `fund_logic::SignalFeed`; map it in `to_logic`.
-- `ConfigData` has three extra fields checked in the program, not in `fund-logic`: `max_staleness_secs`, `keeper` (mapped to `fund_logic::Caller`) and `fee_address` (where `collect_fees` sends the withdrawal fee).
+- `ConfigData` has extra fields checked in the program, not in `fund-logic`: `max_staleness_secs`, `keeper` (mapped to `fund_logic::Caller`), `fee_address` (where `collect_fees` sends the withdrawal fee) and the Pyth feed IDs `btc_feed_id` / `cbbtc_feed_id`.
+- After changing the program's interface, run `yarn sync-idl` in `app/` so the frontend uses the new IDL.
 
 ## Units
 
@@ -107,7 +110,7 @@ These are easy to break when editing:
 | Vaults | `"usdc_vault" / "btc_vault" / "subscription_escrow" / "share_escrow" / "payout_vault", fund` |
 | Ticket | `"ticket", fund, user, epoch.to_le_bytes()` |
 | Epoch record | `"epoch", fund, epoch.to_le_bytes()` |
-| Mock oracle / market | `"oracle", authority` / `"market", authority` |
+| Mock market | `"market", authority` |
 | Market vaults | `"market_usdc" / "market_btc", market` |
 
 Changing seeds breaks existing deployments and the tests/scripts that derive these addresses. Update `tests/tide.ts` and `scripts/crank.ts` in the same change.
@@ -137,9 +140,8 @@ Changing seeds breaks existing deployments and the tests/scripts that derive the
 
 ## Mock components
 
-`MockOracle`, `MockMarket`, `init_mock_oracle`, `set_mock_price`, `init_mock_market` and `set_mock_market_fee` exist only for devnet. When replacing them:
+The oracle is real Pyth: `read_pyth` in the program checks the account owner (Pyth receiver), full Wormhole verification and the feed ID; `fund_logic::pyth_to_micro_usd` converts the exponent (rounding down) and rejects wide confidence intervals; `trade` also checks `max_staleness_secs`. `MockMarket`, `init_mock_market` and `set_mock_market_fee` exist only for devnet. When replacing them:
 
-- **Oracle (Pyth):** check publish time against `max_staleness_secs`, reject wide confidence intervals, convert the exponent to micro-USD carefully.
 - **Exchange (Jupiter):** compute the route off-chain, pass route accounts into `trade`, and keep the on-chain `min_out` check against the oracle. Never trust a price supplied by the caller.
 - Remove the mock instructions from mainnet builds (e.g. behind a cargo feature).
 

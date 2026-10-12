@@ -1,16 +1,17 @@
-// 创建一个 devnet（或本地验证器）上的基金，用模拟代币、模拟预言机和模拟交易所（原型专用）。
+// 创建一个 devnet（或本地验证器）上的基金：价格用 Pyth，代币和交易所是模拟的（原型专用）。
 //
 // 步骤与 README 的 “Deploy to devnet” 一致：
-//   模拟 USDC（6 位）和 BTC（8 位）代币 -> init_mock_oracle -> init_mock_market + 注入流动性
-//   -> initialize -> init_vaults -> seed_prices（最近 49 天）
+//   模拟 USDC（6 位）和 BTC（8 位）代币 -> init_mock_market + 注入流动性
+//   -> initialize -> init_vaults -> seed_prices（最近 49 天，都用 Pyth 的最新 BTC/USD 价格）
 // 可选：DEMO_USDC=<数量> 给钱包铸造模拟 USDC 并申购这么多，让第一次 crank 有事可做。
 //
 // 用法（钱包同时是管理员、清算地址和收费地址，程序已经 anchor deploy）：
 //   ANCHOR_PROVIDER_URL=https://api.devnet.solana.com ANCHOR_WALLET=~/.config/solana/id.json \
-//   MOCK_PRICE=60000 yarn ts-node scripts/setup.ts
+//   yarn ts-node scripts/setup.ts
 //
 // 环境变量（都可选）：
-//   MOCK_PRICE           初始价格（USD），默认读 Binance 的 BTC 价格
+//   SEED_PRICE           种子价格（USD），默认取 Pyth 的最新 BTC/USD 价格（要 PYTH_API_KEY）
+//   PYTH_API_KEY         Hermes 的 API key（从 Pyth Terminal 申请）
 //   SETTLE_OFFSET_SECS   定价时刻在 UTC 0 点之后多少秒，默认 3600（01:00）；以后不能修改
 //   SIGNAL_FEED          btc（默认）或 cbbtc
 //   TRADE_CAP_USDC       单笔交易上限，默认 200000
@@ -33,11 +34,22 @@ const IDL = require("../target/idl/tide.json");
 const USDC = 1_000_000;
 const DAY = 86_400;
 
+// Pyth 价格源 ID（主网和 devnet 相同）
+const BTC_FEED = "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
+const CBBTC_FEED = "2817d7bfe5c64b8ea956e9a26f573ef64e72e4d7891f2d6af9bcc93f7aff9a97";
+
+/** 种子价格：SEED_PRICE，或者 Pyth 的最新 BTC/USD 价格 */
 async function btcPriceUsd(): Promise<number> {
-  if (process.env.MOCK_PRICE) return Number(process.env.MOCK_PRICE);
-  const r = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT");
-  if (!r.ok) throw new Error(`读取价格失败：HTTP ${r.status}`);
-  return Number(((await r.json()) as any).price);
+  if (process.env.SEED_PRICE) return Number(process.env.SEED_PRICE);
+  const hermes = process.env.HERMES_URL ?? "https://hermes.pyth.network";
+  const key = process.env.PYTH_API_KEY;
+  if (!key) throw new Error("缺少 PYTH_API_KEY（或者用 SEED_PRICE 指定种子价格）");
+  const r = await fetch(`${hermes}/v2/updates/price/latest?ids[]=${BTC_FEED}&parsed=true`, {
+    headers: { Authorization: `Bearer ${key}` },
+  });
+  if (!r.ok) throw new Error(`Hermes 返回 HTTP ${r.status}`);
+  const p = ((await r.json()) as any).parsed[0].price;
+  return Number(p.price) * 10 ** p.expo;
 }
 
 async function main() {
@@ -51,7 +63,6 @@ async function main() {
 
   const fund = pda([Buffer.from("fund"), admin.toBuffer()]);
   if (await provider.connection.getAccountInfo(fund)) throw new Error(`基金已经存在：${fund.toBase58()}`);
-  const oracle = pda([Buffer.from("oracle"), admin.toBuffer()]);
   const market = pda([Buffer.from("market"), admin.toBuffer()]);
   const shareMint = pda([Buffer.from("share_mint"), fund.toBuffer()]);
   const marketUsdc = pda([Buffer.from("market_usdc"), market.toBuffer()]);
@@ -87,11 +98,7 @@ async function main() {
   await send(tx, [usdcMint, btcMint]);
   console.log(`模拟 USDC：${usdcMint.publicKey.toBase58()}，模拟 BTC：${btcMint.publicKey.toBase58()}`);
 
-  // 2. 模拟预言机和模拟交易所（0.18% 手续费），注入 100 万 USDC 和 20 BTC 的流动性
-  await program.methods
-    .initMockOracle(usd(price), btcFeed ? new BN(0) : usd(price))
-    .accounts({ authority: admin })
-    .rpc();
+  // 2. 模拟交易所（按 Pyth 价格成交，0.18% 手续费），注入 100 万 USDC 和 20 BTC 的流动性
   await program.methods
     .initMockMarket(18)
     .accounts({ authority: admin, usdcMint: usdcMint.publicKey, btcMint: btcMint.publicKey })
@@ -120,9 +127,12 @@ async function main() {
       withdrawalFeeBps: 100,
       subscriptionCapUsdc: new BN(1_000_000 * USDC),
       signalFeed: btcFeed ? { btc: {} } : { cbBtc: {} },
-      maxStalenessSecs: new BN(600),
+      maxConfidenceBps: 100,
+      maxStalenessSecs: new BN(120), // 交易用的 Pyth 价格最多 2 分钟
       keeper: admin,
       feeAddress: admin,
+      btcFeedId: [...Buffer.from(BTC_FEED, "hex")],
+      cbbtcFeedId: [...Buffer.from(CBBTC_FEED, "hex")],
     })
     .accountsPartial({
       admin,
@@ -130,7 +140,6 @@ async function main() {
       usdcMint: usdcMint.publicKey,
       btcMint: btcMint.publicKey,
       shareMint,
-      oracle,
       market,
     })
     .rpc();
