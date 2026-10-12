@@ -1,4 +1,6 @@
-# 每日结算（devnet）：每天 01:05 UTC 用 Pyth 价格定价、交易、结清取款费。也可以在 Actions 页面手动运行。
+# 每日结算（devnet）：用 Pyth 价格定价、交易、结清取款费。
+# 每天 01:05 UTC 由 Supabase 的定时任务准时启动（supabase/crank-trigger.sql，GitHub 自己的定时常常晚几十分钟）；
+# 下面 01:40 的定时只是备份：那时结算已经做完的话，这次运行什么也不做。也可以在 Actions 页面手动运行。
 # 需要的仓库 Secrets：
 #   KEEPER_KEYPAIR  清算地址（也是网站用的基金的管理员）的私钥，solana-keygen 的 JSON 数组
 #   PYTH_API_KEY    Hermes 的 API key（Pyth Terminal）
@@ -6,7 +8,7 @@ name: Daily settlement (devnet)
 
 on:
   schedule:
-    - cron: "5 1 * * *"
+    - cron: "40 1 * * *"
   workflow_dispatch:
 
 permissions:

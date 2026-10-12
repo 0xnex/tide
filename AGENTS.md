@@ -22,7 +22,7 @@ scripts/crank.ts       ← Daily settlement script (devnet): posts Pyth prices, 
 scripts/setup.ts       ← Creates a devnet fund (incl. share token metadata); scripts/faucet.ts mints mock USDC to test wallets.
 app/                   ← Web frontend (Vite + React, deployed on Vercel). Own package.json; copy the IDL with `yarn sync-idl`.
 app/api/faucet.ts      ← Vercel function: 10,000 mock USDC (+ a little SOL) once per address, signed by a faucet wallet (env FAUCET_SECRET_KEY) that holds the mock USDC mint authority.
-.github/workflows/     ← crank.yml runs the crank daily at 01:05 UTC with secrets KEEPER_KEYPAIR and PYTH_API_KEY; it copies the IDL from app/src/idl.
+.github/workflows/     ← crank.yml runs the crank with secrets KEEPER_KEYPAIR and PYTH_API_KEY; it copies the IDL from app/src/idl. Started at 01:05 UTC by Supabase pg_cron (supabase/crank-trigger.sql, token via scripts/supabase-token.sh); its own 01:40 schedule is a no-op backup.
 ```
 
 **Rule: arithmetic about money belongs in `fund-logic`, never in the Anchor program.** The program may only:
