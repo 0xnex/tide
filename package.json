@@ -20,5 +20,8 @@
     "ts-mocha": "^10.0.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.6.3"
+  },
+  "resolutions": {
+    "**/jito-ts/@solana/web3.js": "^1.98.0"
   }
 }
