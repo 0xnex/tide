@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAnchorWallet, useConnection } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { BN } from "@coral-xyz/anchor";
+import { PublicKey } from "@solana/web3.js";
 import {
   FUND,
   PROGRAM_ID,
@@ -15,7 +16,9 @@ import {
   recordFor,
   redeem,
   requestEpoch,
+  requestFaucet,
   subscribe,
+  transferShares,
   type EpochRecord,
   type Fund,
   type Snapshot,
@@ -87,9 +90,10 @@ export function App() {
                 <Records records={snap.records} />
               </div>
               <div className="col-side">
+                <Faucet snap={snap} run={run} />
                 <ActionPanel snap={snap} now={now} run={run} program={program} />
                 <Position snap={snap} now={now} run={run} program={program} />
-                <Faucet />
+                <Guide snap={snap} />
               </div>
             </div>
           </>
@@ -453,6 +457,7 @@ function Position({ snap, now, run, program }: { snap: Snapshot; now: number; ru
         <Stat label="持有份额" value={fmt.shares(snap.shareBalance)} />
         <Stat label="USDC 余额" value={fmt.usdc(snap.usdcBalance)} />
       </div>
+      <TransferShares balance={snap.shareBalance} run={run} program={program} />
       {snap.tickets.length === 0 ? (
         <p className="muted small">没有排队记录。</p>
       ) : (
@@ -495,26 +500,90 @@ function Position({ snap, now, run, program }: { snap: Snapshot; now: number; ru
   );
 }
 
-function Faucet() {
+function Faucet({ snap, run }: { snap: Snapshot; run: RunFn }) {
   const wallet = useAnchorWallet();
-  const [copied, setCopied] = useState(false);
-  const cmd = `yarn ts-node scripts/faucet.ts ${wallet?.publicKey.toBase58() ?? "<你的地址>"}`;
+  if (!wallet) return null;
+  // 已经有 USDC 或份额的钱包不再显示（每个地址只能领一次）
+  if (snap.usdcBalance > 0n || snap.shareBalance > 0n || snap.tickets.length > 0) return null;
   return (
-    <section className="card subtle">
-      <h3>需要测试 USDC？</h3>
-      <p className="muted small">模拟 USDC 由管理员钱包铸造。在仓库里用管理员钱包运行：</p>
-      <code className="code">{cmd}</code>
+    <section className="card highlight">
+      <h3>领取测试 USDC</h3>
+      <p className="muted small">每个地址可以领一次 10,000 测试 USDC，钱包里 SOL 不够时还会送 0.02 SOL 付手续费。</p>
       <button
-        className="link-btn"
-        onClick={() => {
-          navigator.clipboard.writeText(cmd);
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1500);
-        }}
+        className="btn primary"
+        onClick={() =>
+          run("领取 10,000 测试 USDC", async () => (await requestFaucet(wallet.publicKey)).signature)
+        }
       >
-        {copied ? "已复制" : "复制命令"}
+        领取 10,000 测试 USDC
       </button>
     </section>
+  );
+}
+
+function Guide({ snap }: { snap: Snapshot }) {
+  const offset = snap.fund.config.settleOffsetSecs.toNumber();
+  const at = new Date(offset * 1000).toISOString().slice(11, 16);
+  return (
+    <section className="card subtle">
+      <h3>完整流程怎么测</h3>
+      <ol className="steps">
+        <li>连接钱包（Phantom 切到 devnet），领取 10,000 测试 USDC。</li>
+        <li>申购。请求会排进下一个定价时刻（每天 {at} UTC）那一期，定价前可以撤销。</li>
+        <li>每天 {at} UTC 后几分钟，自动结算会定价并用真实的 Pyth 价格成交。</li>
+        <li>成交后在“我的仓位”里领取份额。份额是普通代币，可以转给别的钱包。</li>
+        <li>赎回份额，等下一次定价把对应的 cbBTC 卖出，再领取 USDC（扣 1% 取款费）。</li>
+      </ol>
+    </section>
+  );
+}
+
+function TransferShares({ balance, run, program }: { balance: bigint; run: RunFn; program: Prog }) {
+  const wallet = useAnchorWallet();
+  const [to, setTo] = useState("");
+  const [text, setText] = useState("");
+  if (!wallet || balance === 0n) return null;
+  const amount = fmt.parseAmount(text, 6);
+  let dest: PublicKey | null = null;
+  try {
+    dest = to.trim() ? new PublicKey(to.trim()) : null;
+  } catch {
+    dest = null;
+  }
+  const problem = !dest
+    ? "输入对方地址"
+    : dest.equals(wallet.publicKey)
+      ? "不能转给自己"
+      : amount === null || amount === 0n
+        ? "输入份额数量"
+        : amount > balance
+          ? "份额不足"
+          : null;
+  return (
+    <div className="transfer">
+      <h3>转出份额</h3>
+      <input className="field" placeholder="对方钱包地址" value={to} onChange={(e) => setTo(e.target.value)} />
+      <div className="field-row">
+        <input className="field" inputMode="decimal" placeholder="份额数量" value={text} onChange={(e) => setText(e.target.value)} />
+        <button className="link-btn" onClick={() => setText((Number(balance) / 1e6).toString())}>
+          最大
+        </button>
+      </div>
+      <button
+        className="btn"
+        disabled={problem !== null}
+        onClick={() =>
+          dest &&
+          amount !== null &&
+          run(`转出 ${fmt.shares(amount)} 份`, () => transferShares(program, wallet.publicKey, dest!, amount)).then(() => {
+            setText("");
+            setTo("");
+          })
+        }
+      >
+        {problem ?? "转出"}
+      </button>
+    </div>
   );
 }
 

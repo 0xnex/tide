@@ -1,0 +1,44 @@
+# 每日结算（devnet）：每天 01:05 UTC 用 Pyth 价格定价、交易、结清取款费。也可以在 Actions 页面手动运行。
+# 需要的仓库 Secrets：
+#   KEEPER_KEYPAIR  清算地址（也是网站用的基金的管理员）的私钥，solana-keygen 的 JSON 数组
+#   PYTH_API_KEY    Hermes 的 API key（Pyth Terminal）
+name: Daily settlement (devnet)
+
+on:
+  schedule:
+    - cron: "5 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crank
+  cancel-in-progress: false
+
+jobs:
+  crank:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+      - run: yarn install --frozen-lockfile
+      - name: Program IDL (target/ is not in git; the frontend keeps a copy)
+        run: |
+          mkdir -p target/idl target/types
+          cp app/src/idl/tide.json target/idl/
+          cp app/src/idl/tide.ts target/types/
+      - name: Keeper wallet
+        env:
+          KEEPER_KEYPAIR: ${{ secrets.KEEPER_KEYPAIR }}
+        run: printf '%s' "$KEEPER_KEYPAIR" > "$RUNNER_TEMP/keeper.json"
+      - name: Crank
+        env:
+          ANCHOR_PROVIDER_URL: https://api.devnet.solana.com
+          ANCHOR_WALLET: ${{ runner.temp }}/keeper.json
+          PYTH_API_KEY: ${{ secrets.PYTH_API_KEY }}
+        run: yarn ts-node scripts/crank.ts

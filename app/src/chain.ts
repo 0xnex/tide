@@ -1,8 +1,12 @@
 // 链上地址、读数据和发交易。PDA 种子与程序一致（见 AGENTS.md 的 PDA 表）。
 import { AnchorProvider, BN, Program } from "@coral-xyz/anchor";
 import type { AnchorWallet } from "@solana/wallet-adapter-react";
-import { Connection, PublicKey } from "@solana/web3.js";
-import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { Connection, PublicKey, Transaction } from "@solana/web3.js";
+import {
+  createAssociatedTokenAccountIdempotentInstruction,
+  createTransferCheckedInstruction,
+  getAssociatedTokenAddressSync,
+} from "@solana/spl-token";
 import idl from "./idl/tide.json";
 import type { Tide } from "./idl/tide";
 
@@ -165,6 +169,29 @@ export async function claim(program: Program<Tide>, fund: Fund, user: PublicKey,
       ...userAccounts(fund, user),
     })
     .rpc();
+}
+
+/** 把份额转给另一个钱包（份额是普通的 SPL 代币；对方没有份额账户时由转出人创建） */
+export async function transferShares(program: Program<Tide>, user: PublicKey, to: PublicKey, amount: bigint) {
+  const from = getAssociatedTokenAddressSync(SHARE_MINT, user, true);
+  const dest = getAssociatedTokenAddressSync(SHARE_MINT, to, true);
+  const tx = new Transaction().add(
+    createAssociatedTokenAccountIdempotentInstruction(user, dest, to, SHARE_MINT),
+    createTransferCheckedInstruction(from, SHARE_MINT, dest, user, amount, 6),
+  );
+  return program.provider.sendAndConfirm!(tx);
+}
+
+/** 网站后端的测试水龙头：每个地址一次 10,000 测试 USDC，SOL 不够时再送一点 */
+export async function requestFaucet(user: PublicKey): Promise<{ signature: string; usdc: number; sol: number }> {
+  const r = await fetch("/api/faucet", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ address: user.toBase58() }),
+  });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error ?? `水龙头返回 HTTP ${r.status}`);
+  return body;
 }
 
 /** 程序错误的说明：用 IDL 里的中文 msg；不是程序错误时返回原始信息 */

@@ -1,9 +1,10 @@
-// 测试水龙头（devnet 原型用）：用管理员钱包（模拟 USDC 的铸币权限）给一个测试钱包
-// 铸模拟 USDC，并转一点 SOL 付手续费和租金。程序本身不变。
+// 测试水龙头（devnet 原型用）：用模拟 USDC 的铸币权限钱包给一个测试钱包铸模拟 USDC，
+// 并转一点 SOL 付手续费和租金。程序本身不变。网站上的领币按钮走 app/api/faucet.ts，规则相同。
 //
-// 用法：
+// 用法（FUND_ADMIN 是基金管理员地址，默认就是运行脚本的钱包）：
 //   ANCHOR_PROVIDER_URL=https://api.devnet.solana.com \
-//   ANCHOR_WALLET=~/.config/solana/tide-devnet-admin.json \
+//   ANCHOR_WALLET=~/.config/solana/tide-devnet-faucet.json \
+//   FUND_ADMIN=<基金管理员地址> \
 //   yarn ts-node scripts/faucet.ts <测试钱包地址> [USDC 数量，默认 10000] [SOL 数量，默认 0.05]
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
@@ -27,8 +28,9 @@ async function main() {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
   const program = new Program<Tide>(IDL, provider);
-  const admin = provider.wallet.publicKey;
-  const [fund] = PublicKey.findProgramAddressSync([Buffer.from("fund"), admin.toBuffer()], program.programId);
+  const admin = provider.wallet.publicKey; // 铸币权限钱包，付手续费和 SOL
+  const fundAdmin = process.env.FUND_ADMIN ? new PublicKey(process.env.FUND_ADMIN) : admin;
+  const [fund] = PublicKey.findProgramAddressSync([Buffer.from("fund"), fundAdmin.toBuffer()], program.programId);
   const { usdcMint } = await program.account.fund.fetch(fund);
 
   const ata = getAssociatedTokenAddressSync(usdcMint, user, true);

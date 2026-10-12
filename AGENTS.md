@@ -21,6 +21,8 @@ tests/                 ← End-to-end tests (TypeScript, bankrun with clock cont
 scripts/crank.ts       ← Daily settlement script (devnet): posts Pyth prices, fix, trades, collect_fees.
 scripts/setup.ts       ← Creates a devnet fund; scripts/faucet.ts mints mock USDC to test wallets.
 app/                   ← Web frontend (Vite + React, deployed on Vercel). Own package.json; copy the IDL with `yarn sync-idl`.
+app/api/faucet.ts      ← Vercel function: 10,000 mock USDC (+ a little SOL) once per address, signed by a faucet wallet (env FAUCET_SECRET_KEY) that holds the mock USDC mint authority.
+.github/workflows/     ← crank.yml runs the crank daily at 01:05 UTC with secrets KEEPER_KEYPAIR and PYTH_API_KEY; it copies the IDL from app/src/idl.
 ```
 
 **Rule: arithmetic about money belongs in `fund-logic`, never in the Anchor program.** The program may only:

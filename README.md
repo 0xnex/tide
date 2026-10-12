@@ -179,7 +179,8 @@ tide/
 ├── scripts/crank.ts     Daily settlement script (devnet): Pyth prices, fix, trades, fees
 ├── scripts/setup.ts     Create a devnet fund (mock tokens and market)
 ├── scripts/faucet.ts    Mint mock USDC to a test wallet
-├── app/                 Web frontend (Vite + React), deployed on Vercel
+├── app/                 Web frontend (Vite + React) and app/api/faucet.ts, deployed on Vercel
+├── .github/workflows/   Daily settlement on devnet (GitHub Actions)
 ├── docs/adr/            Architecture decisions
 ├── docs/agents/         Agent skill configuration
 ├── CONTEXT.md           Domain vocabulary
@@ -219,13 +220,13 @@ flowchart LR
   A["mock USDC (6)<br/>mock BTC (8) mints"] --> C["init_mock_market<br/>+ liquidity"] --> D["initialize"] --> E["init_vaults"] --> F["seed_prices<br/>last 49 days"]
 ```
 
-`scripts/setup.ts` runs these steps with the wallet as admin, keeper and fee address (env: `PYTH_API_KEY` or `SEED_PRICE` for the seed price, `SETTLE_OFFSET_SECS`, `SIGNAL_FEED`, `TRADE_CAP_USDC`, `DEMO_USDC` for a first subscription). `scripts/faucet.ts <address> [usdc] [sol]` mints mock USDC (and sends a little SOL) to a test wallet; run it with the admin wallet.
+`scripts/setup.ts` runs these steps with the wallet as admin, keeper and fee address (env: `PYTH_API_KEY` or `SEED_PRICE` for the seed price, `SETTLE_OFFSET_SECS`, `SIGNAL_FEED`, `TRADE_CAP_USDC`, `DEMO_USDC` for a first subscription). `scripts/faucet.ts <address> [usdc] [sol]` mints mock USDC (and sends a little SOL) to a test wallet; run it with the wallet that holds the mock USDC mint authority.
 
 ```bash
 ANCHOR_PROVIDER_URL=https://api.devnet.solana.com ANCHOR_WALLET=$HOME/.config/solana/id.json yarn ts-node scripts/setup.ts
 ```
 
-Run the crank daily after 01:00 UTC. It needs a Hermes API key from [Pyth Terminal](https://pythdata.app/signup) (Hermes requires one since August 2026), read from `PYTH_API_KEY`:
+The GitHub Actions workflow `.github/workflows/crank.yml` runs the crank every day at 01:05 UTC (and on demand from the Actions tab) with the repository secrets `KEEPER_KEYPAIR` and `PYTH_API_KEY`. To run it yourself instead, run the crank daily after 01:00 UTC. It needs a Hermes API key from [Pyth Terminal](https://pythdata.app/signup) (Hermes requires one since August 2026), read from `PYTH_API_KEY`:
 
 ```cron
 5 1 * * * cd /path/to/tide && PYTH_API_KEY=$(cat ~/.config/pyth/api-key) ANCHOR_PROVIDER_URL=https://api.devnet.solana.com ANCHOR_WALLET=$HOME/.config/solana/id.json yarn ts-node scripts/crank.ts >> crank.log 2>&1
