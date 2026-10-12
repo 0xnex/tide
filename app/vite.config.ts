@@ -8,7 +8,7 @@ export default defineConfig({
   plugins: [react(), nodePolyfills({ include: ["buffer", "crypto", "stream", "util"], globals: { Buffer: true } })],
   server: {
     proxy: {
-      "/api": { target: process.env.VITE_API_PROXY ?? "https://app-ten-sable-99.vercel.app", changeOrigin: true },
+      "/api": { target: process.env.VITE_API_PROXY ?? "https://btctide.vercel.app", changeOrigin: true },
     },
   },
 });
