@@ -947,3 +947,23 @@ tr:last-child td {
 .note {
   margin: 14px 0 0;
 }
+
+.headline {
+  text-align: right;
+}
+
+.headline-value {
+  font-size: 26px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.card-head > div:first-child {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.headline {
+  flex: 0 0 auto;
+}

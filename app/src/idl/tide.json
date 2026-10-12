@@ -3267,6 +3267,18 @@
             "type": "u64"
           },
           {
+            "name": "fund_usdc",
+            "type": "u64"
+          },
+          {
+            "name": "fund_btc",
+            "type": "u64"
+          },
+          {
+            "name": "fund_shares",
+            "type": "u64"
+          },
+          {
             "name": "bump",
             "type": "u8"
           }

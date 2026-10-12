@@ -75,7 +75,13 @@ async function tokenBalance(connection: Connection, addr: PublicKey): Promise<bi
 export async function loadSnapshot(program: Program<Tide>, user: PublicKey | null): Promise<Snapshot> {
   const connection = program.provider.connection;
   const fund = await program.account.fund.fetch(FUND);
-  const records = (await program.account.epochRecord.all([{ memcmp: { offset: 8, bytes: FUND.toBase58() } }]))
+  // 按当前账户大小过滤：定价记录加字段之前建的旧记录读不出来，跳过
+  const records = (
+    await program.account.epochRecord.all([
+      { dataSize: program.account.epochRecord.size },
+      { memcmp: { offset: 8, bytes: FUND.toBase58() } },
+    ])
+  )
     .map((r) => r.account)
     .sort((a, b) => b.epoch.toNumber() - a.epoch.toNumber());
   if (!user) return { fund, records, tickets: [], usdcBalance: 0n, shareBalance: 0n };

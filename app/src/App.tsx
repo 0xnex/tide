@@ -27,6 +27,8 @@ import {
 } from "./chain";
 import * as fmt from "./format";
 import { Backtest } from "./BacktestCard";
+import { SharePriceCard, pricingBasis, sharePrice } from "./SharePriceCard";
+import { fetchSpotPrice } from "./backtest";
 
 type Toast = { kind: "ok" | "error" | "busy"; text: string; sig?: string };
 
@@ -40,6 +42,7 @@ export function App() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
+  const [spot, setSpot] = useState<number | null>(null); // 实时 BTC 价格，只用来显示每份价格
 
   const refresh = useCallback(async () => {
     try {
@@ -57,6 +60,12 @@ export function App() {
   }, [refresh]);
   useEffect(() => {
     const t = setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
+    return () => clearInterval(t);
+  }, []);
+  useEffect(() => {
+    const load = () => fetchSpotPrice().then((p) => p && setSpot(p));
+    load();
+    const t = setInterval(load, 60_000);
     return () => clearInterval(t);
   }, []);
 
@@ -86,7 +95,8 @@ export function App() {
             <VaultHero snap={snap} />
             <div className="grid">
               <div className="col-main">
-                <Overview snap={snap} now={now} />
+                <Overview snap={snap} spot={spot} />
+                <SharePriceCard snap={snap} spot={spot} />
                 <Backtest />
                 <Strategy snap={snap} now={now} />
                 <Records records={snap.records} />
@@ -94,7 +104,7 @@ export function App() {
               <div className="col-side">
                 <Faucet snap={snap} run={run} />
                 <ActionPanel snap={snap} now={now} run={run} program={program} />
-                <Position snap={snap} now={now} run={run} program={program} />
+                <Position snap={snap} now={now} spot={spot} run={run} program={program} />
                 <Guide snap={snap} />
               </div>
             </div>
@@ -159,30 +169,29 @@ function VaultHero({ snap }: { snap: Snapshot }) {
   );
 }
 
-function Overview({ snap, now }: { snap: Snapshot; now: number }) {
+function Overview({ snap, spot }: { snap: Snapshot; spot: number | null }) {
   const s = snap.fund.state;
-  const last = snap.records[0];
-  // display only: valued at the last fixing price (the fund itself is never valued in USD)
-  const indicative = last ? Number(big(s.usdc)) / 1e6 + (Number(big(s.btc)) / 1e8) * (Number(big(last.signalPrice)) / 1e6) : null;
-  const perShare = indicative !== null && !s.shareSupply.isZero() ? indicative / (Number(big(s.shareSupply)) / 1e6) : null;
-  void now;
+  const basis = pricingBasis(snap, spot);
+  // display only: the fund itself is never valued in USD
+  const total = basis ? Number(big(s.usdc)) / 1e6 + (Number(big(s.btc)) / 1e8) * basis.btcUsd : null;
+  const price = basis ? sharePrice(big(s.usdc), big(s.btc), big(s.shareSupply), basis.btcUsd) : null;
   return (
     <section className="card">
-      <div className="stats">
+      <div className="stats five">
+        <Stat label="Share price" value={price !== null ? `$${price.toFixed(4)}` : "$1.0000"} />
+        <Stat label="Total value" value={total !== null ? `$${total.toLocaleString("en-US", { maximumFractionDigits: 2 })}` : "—"} />
         <Stat label="cbBTC held" value={fmt.btc(s.btc)} />
         <Stat label="USDC held" value={fmt.usdc(s.usdc)} />
-        <Stat label="Total shares" value={fmt.shares(s.shareSupply)} />
         <Stat
           label="Target"
           value={<span className={`pill ${s.targetBtc ? "pill-blue" : "pill-gray"}`}>{s.targetBtc ? "cbBTC" : "USDC"}</span>}
         />
       </div>
-      {indicative !== null && (
-        <p className="muted small">
-          About ${indicative.toLocaleString("en-US", { maximumFractionDigits: 2 })} at the last fixing price
-          {perShare !== null && `, about $${perShare.toFixed(4)} per share`} (indicative; the fund is not valued in USD)
-        </p>
-      )}
+      <p className="muted small">
+        {fmt.shares(s.shareSupply)} shares outstanding.
+        {basis && ` Valued at BTC $${basis.btcUsd.toLocaleString("en-US", { maximumFractionDigits: 0 })} (${basis.source}).`}{" "}
+        Indicative only: the fund is not valued in USD.
+      </p>
     </section>
   );
 }
@@ -441,7 +450,19 @@ function viewTicket(t: Ticket, fund: Fund, records: EpochRecord[], now: number):
   };
 }
 
-function Position({ snap, now, run, program }: { snap: Snapshot; now: number; run: RunFn; program: Prog }) {
+function Position({
+  snap,
+  now,
+  spot,
+  run,
+  program,
+}: {
+  snap: Snapshot;
+  now: number;
+  spot: number | null;
+  run: RunFn;
+  program: Prog;
+}) {
   const wallet = useAnchorWallet();
   if (!wallet) {
     return (
@@ -452,6 +473,10 @@ function Position({ snap, now, run, program }: { snap: Snapshot; now: number; ru
     );
   }
   const user = wallet.publicKey;
+  const basis = pricingBasis(snap, spot);
+  const s = snap.fund.state;
+  const price = basis ? sharePrice(big(s.usdc), big(s.btc), big(s.shareSupply), basis.btcUsd) : null;
+  const value = price !== null ? (Number(snap.shareBalance) / 1e6) * price : null;
   return (
     <section className="card">
       <h2>Your position</h2>
@@ -459,6 +484,12 @@ function Position({ snap, now, run, program }: { snap: Snapshot; now: number; ru
         <Stat label="Shares" value={fmt.shares(snap.shareBalance)} />
         <Stat label="USDC balance" value={fmt.usdc(snap.usdcBalance)} />
       </div>
+      {value !== null && snap.shareBalance > 0n && (
+        <p className="muted small">
+          About ${value.toLocaleString("en-US", { maximumFractionDigits: 2 })} at ${price!.toFixed(4)} per share
+          (before the 1% withdrawal fee).
+        </p>
+      )}
       <TransferShares balance={snap.shareBalance} run={run} program={program} />
       {snap.tickets.length === 0 ? (
         <p className="muted small">No tickets.</p>

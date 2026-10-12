@@ -1085,6 +1085,9 @@ pub struct EpochRecord {
     pub unclaimed_refund_usdc: u64,
     pub cancelled_subscription_usdc: u64,
     pub cancelled_shares: u64,
+    pub fund_usdc: u64,
+    pub fund_btc: u64,
+    pub fund_shares: u64,
     pub bump: u8,
 }
 
@@ -1109,6 +1112,9 @@ impl EpochRecord {
         self.target_btc = r.target_btc;
         self.cancelled_subscription_usdc = r.cancelled_subscription_usdc;
         self.cancelled_shares = r.cancelled_shares;
+        self.fund_usdc = r.fund_usdc;
+        self.fund_btc = r.fund_btc;
+        self.fund_shares = r.fund_shares;
         self.set_unclaimed(r);
     }
     fn set_unclaimed(&mut self, r: &logic::EpochRecord) {
@@ -1144,6 +1150,9 @@ impl EpochRecord {
             unclaimed_refund_usdc: self.unclaimed_refund_usdc,
             cancelled_subscription_usdc: self.cancelled_subscription_usdc,
             cancelled_shares: self.cancelled_shares,
+            fund_usdc: self.fund_usdc,
+            fund_btc: self.fund_btc,
+            fund_shares: self.fund_shares,
         }
     }
 }

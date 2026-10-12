@@ -35,6 +35,18 @@ export interface Result {
   timeInBtc: number; // share of days held in BTC
 }
 
+/** BTC/USD spot price (Coinbase); null when it cannot be read */
+export async function fetchSpotPrice(): Promise<number | null> {
+  try {
+    const r = await fetch("https://api.exchange.coinbase.com/products/BTC-USD/ticker");
+    if (!r.ok) return null;
+    const p = Number(((await r.json()) as { price?: string }).price);
+    return p > 0 ? p : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Daily BTC/USD closes, oldest first, without today's unfinished candle. Coinbase, then Binance. */
 export async function fetchDailyCloses(days = 600): Promise<DailyClose[]> {
   try {

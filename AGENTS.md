@@ -85,7 +85,7 @@ These are easy to break when editing:
 - `StateData.prices` is `[u64; 64]` and `StateData.price_days` is `[i64; 64]`, both as **literals** (the IDL needs it). They must equal `fund_logic::MAX_WINDOW`; a compile-time assertion enforces this.
 - `StateData.slices` is `[SliceData; 8]` and `StateData.pending` is `[PendingData; 8]`, literals mirroring `fund_logic::Slice` and `fund_logic::Pending`; they must equal `MAX_SLICES` and `MAX_PENDING` (compile-time assertions).
 - `Ticket` (program) mirrors `fund_logic::Ticket`, including `shares_claimed`.
-- `EpochRecord` (program) mirrors `fund_logic::EpochRecord`, including the five `unclaimed_*` fields and the two `cancelled_*` fields. Update `set_from_logic`, `set_unclaimed`, and `to_logic`.
+- `EpochRecord` (program) mirrors `fund_logic::EpochRecord`, including the five `unclaimed_*` fields, the two `cancelled_*` fields and the display-only `fund_usdc` / `fund_btc` / `fund_shares` snapshot (the frontend's share price curve). Update `set_from_logic`, `set_unclaimed`, and `to_logic`.
 - Every `fund_logic::FundError` variant needs a matching `FundErrorCode` and an arm in `map_err`. The match is exhaustive, so the compiler will remind you.
 - `ConfigData.signal_feed` (`SignalFeedData`) mirrors `fund_logic::SignalFeed`; map it in `to_logic`.
 - `ConfigData` has extra fields checked in the program, not in `fund-logic`: `max_staleness_secs`, `keeper` (mapped to `fund_logic::Caller`), `fee_address` (where `collect_fees` sends the withdrawal fee) and the Pyth feed IDs `btc_feed_id` / `cbbtc_feed_id`.

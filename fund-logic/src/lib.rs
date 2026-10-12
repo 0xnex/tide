@@ -311,6 +311,10 @@ pub struct EpochRecord {
     // 留下的人按 (minted_shares − cancelled_shares) × 本人申购额 ÷ (subscription_usdc − cancelled_subscription_usdc) 领取
     pub cancelled_subscription_usdc: u64,
     pub cancelled_shares: u64,
+    // 定价时（划出赎回资产、接收申购之前）基金的资产和份额，只用来显示每份价格曲线，不参与记账
+    pub fund_usdc: u64,
+    pub fund_btc: u64,
+    pub fund_shares: u64,
 }
 
 impl EpochRecord {
@@ -1155,6 +1159,9 @@ pub fn fix(
     let ma = moving_average(&n, day, cfg.window);
     n.target_btc = matches!(ma, Some(m) if signal > m);
 
+    // 当天的资产和份额（这一期的申购赎回之前），记进记录供显示
+    let (fund_usdc, fund_btc, fund_shares) = (n.usdc, n.btc, n.share_supply);
+
     // 3. 赎回资产：按份额比例划出实物，不需要价格
     let redemption_shares = n.queued_redemption_shares;
     let (slice_usdc, slice_btc) = if redemption_shares == 0 {
@@ -1268,6 +1275,9 @@ pub fn fix(
         unclaimed_refund_usdc: refund_usdc,
         cancelled_subscription_usdc: 0,
         cancelled_shares: 0,
+        fund_usdc,
+        fund_btc,
+        fund_shares,
     };
     n.last_fix_day = day;
     // 定价时刻之后提交的请求（下一期）由下一次定价处理
@@ -1918,6 +1928,27 @@ mod tests {
             Err(FundError::AlreadySettled)
         );
         assert!(h.fix_with(101 * DAY + ONE_AM, &at_fix(101, USDC)).is_ok());
+    }
+
+    #[test]
+    fn a_fixing_records_the_holdings_before_that_days_flows() {
+        // 网站用它画每份价格曲线：定价时（划出赎回资产、接收申购之前）基金的资产和份额
+        let mut h = Harness::seeded(50_000 * USDC);
+        let mut ta = Ticket::default();
+        h.subscribe(&mut ta, 1_000 * USDC, 10 * DAY);
+        let r = h.settle_day(10, 51_000 * USDC, 0);
+        assert_eq!((r.fund_usdc, r.fund_btc, r.fund_shares), (0, 0, 0));
+        h.claim(&mut ta).unwrap();
+        let before = h.s.clone();
+
+        h.redeem(&mut ta, 300 * USDC, 11 * DAY);
+        h.subscribe(&mut Ticket::default(), 500 * USDC, 11 * DAY);
+        let r = h.fix_day(11, 52_000 * USDC);
+        assert_eq!(
+            (r.fund_usdc, r.fund_btc, r.fund_shares),
+            (before.usdc, before.btc, before.share_supply)
+        );
+        assert_eq!(r.fund_shares, 1_000 * USDC);
     }
 
     #[test]

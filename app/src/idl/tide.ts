@@ -3273,6 +3273,18 @@ export type Tide = {
             "type": "u64"
           },
           {
+            "name": "fundUsdc",
+            "type": "u64"
+          },
+          {
+            "name": "fundBtc",
+            "type": "u64"
+          },
+          {
+            "name": "fundShares",
+            "type": "u64"
+          },
+          {
             "name": "bump",
             "type": "u8"
           }
