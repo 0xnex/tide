@@ -19,7 +19,7 @@ fund-logic/            ← ALL accounting. Pure Rust, no dependencies, fully uni
 programs/tide/         ← Thin Anchor wrapper: validates accounts, moves tokens, calls fund-logic.
 tests/                 ← End-to-end tests (TypeScript, bankrun with clock control).
 scripts/crank.ts       ← Daily settlement script (devnet): posts Pyth prices, fix, trades, collect_fees.
-scripts/setup.ts       ← Creates a devnet fund; scripts/faucet.ts mints mock USDC to test wallets.
+scripts/setup.ts       ← Creates a devnet fund (incl. share token metadata); scripts/faucet.ts mints mock USDC to test wallets.
 app/                   ← Web frontend (Vite + React, deployed on Vercel). Own package.json; copy the IDL with `yarn sync-idl`.
 app/api/faucet.ts      ← Vercel function: 10,000 mock USDC (+ a little SOL) once per address, signed by a faucet wallet (env FAUCET_SECRET_KEY) that holds the mock USDC mint authority.
 .github/workflows/     ← crank.yml runs the crank daily at 01:05 UTC with secrets KEEPER_KEYPAIR and PYTH_API_KEY; it copies the IDL from app/src/idl.
@@ -122,6 +122,7 @@ Changing seeds breaks existing deployments and the tests/scripts that derive the
 - **Every behavior change needs a `fund-logic` test.** Prefer a focused scenario test plus coverage in the randomized simulations.
 - The two randomized tests (`random_simulation_invariants`, `random_simulation_with_trading_costs_never_gets_stuck`) are the main safety net. Do not weaken their assertions to make a change pass; if one fails, the change is probably wrong.
 - When fixing a bug, first add a test that reproduces it.
+- `init_share_metadata` calls the Metaplex Token Metadata program, which bankrun does not load, so it has no end-to-end test; it was checked on devnet.
 - End-to-end tests control time with bankrun's `setClock`; advance the slot before setting the clock so identical transactions are not deduplicated.
 - Each invariant has at least one named test. Keep this table current when you add or rename tests (`fund-logic` tests unless marked e2e):
 

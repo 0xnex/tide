@@ -38,6 +38,10 @@
 
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
+use anchor_spl::metadata::{
+    create_metadata_accounts_v3, mpl_token_metadata::types::DataV2, CreateMetadataAccountsV3,
+    Metadata,
+};
 use anchor_spl::token::{self, Burn, Mint, MintTo, Token, TokenAccount, Transfer};
 use fund_logic as logic;
 
@@ -75,6 +79,45 @@ pub mod tide {
     /// 第 2 步：创建基金的 5 个代币账户（分开做，避免单条指令账户过多）
     pub fn init_vaults(_ctx: Context<InitVaults>) -> Result<()> {
         Ok(())
+    }
+
+    /// 给份额代币创建 Metaplex 元数据（名称、符号、元数据链接），钱包里就能显示名字和图标。
+    /// 份额的铸币权限是基金 PDA，所以由程序签名；更新权限给管理员，以后可以直接用 Metaplex 工具修改。
+    pub fn init_share_metadata(
+        ctx: Context<InitShareMetadata>,
+        name: String,
+        symbol: String,
+        uri: String,
+    ) -> Result<()> {
+        let admin = ctx.accounts.admin.key();
+        let seeds: &[&[u8]] = &[b"fund", admin.as_ref(), &[ctx.accounts.fund.bump]];
+        create_metadata_accounts_v3(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_metadata_program.to_account_info(),
+                CreateMetadataAccountsV3 {
+                    metadata: ctx.accounts.metadata.to_account_info(),
+                    mint: ctx.accounts.share_mint.to_account_info(),
+                    mint_authority: ctx.accounts.fund.to_account_info(),
+                    payer: ctx.accounts.admin.to_account_info(),
+                    update_authority: ctx.accounts.admin.to_account_info(),
+                    system_program: ctx.accounts.system_program.to_account_info(),
+                    rent: ctx.accounts.rent.to_account_info(),
+                },
+                &[seeds],
+            ),
+            DataV2 {
+                name,
+                symbol,
+                uri,
+                seller_fee_basis_points: 0,
+                creators: None,
+                collection: None,
+                uses: None,
+            },
+            true, // 以后可以修改
+            true, // 更新权限（管理员）签名
+            None,
+        )
     }
 
     /// 首次定价前，管理员写入最近几天的历史价格（到昨天为止，最早的在前），
@@ -1225,6 +1268,27 @@ pub struct InitVaults<'info> {
     pub share_escrow: Box<Account<'info, TokenAccount>>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitShareMetadata<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    #[account(seeds = [b"fund", admin.key().as_ref()], bump = fund.bump,
+              has_one = admin, has_one = share_mint)]
+    pub fund: Box<Account<'info, Fund>>,
+    pub share_mint: Box<Account<'info, Mint>>,
+    /// CHECK: 份额的 Metaplex 元数据账户，地址由种子固定，内容由 Metaplex 程序写入
+    #[account(
+        mut,
+        seeds = [b"metadata", token_metadata_program.key().as_ref(), share_mint.key().as_ref()],
+        bump,
+        seeds::program = token_metadata_program.key()
+    )]
+    pub metadata: UncheckedAccount<'info>,
+    pub token_metadata_program: Program<'info, Metadata>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]

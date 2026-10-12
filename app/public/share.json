@@ -1,0 +1,7 @@
+{
+  "name": "Tide BTC Trend Share",
+  "symbol": "tBTCT",
+  "description": "Tide 基金份额（devnet 测试）：价格高于 50 日均线时持有 cbBTC，低于时持有 USDC。份额是普通代币，可以转给别的钱包；赎回时按份额比例拿到基金资产卖出的 USDC。测试代币，没有价值。",
+  "image": "https://app-ten-sable-99.vercel.app/share.png",
+  "external_url": "https://app-ten-sable-99.vercel.app"
+}

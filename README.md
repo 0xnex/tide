@@ -179,6 +179,7 @@ tide/
 ├── scripts/crank.ts     Daily settlement script (devnet): Pyth prices, fix, trades, fees
 ├── scripts/setup.ts     Create a devnet fund (mock tokens and market)
 ├── scripts/faucet.ts    Mint mock USDC to a test wallet
+├── scripts/share-metadata.ts  Name and icon for the share token (Metaplex metadata)
 ├── app/                 Web frontend (Vite + React) and app/api/faucet.ts, deployed on Vercel
 ├── .github/workflows/   Daily settlement on devnet (GitHub Actions)
 ├── docs/adr/            Architecture decisions
@@ -247,6 +248,7 @@ flowchart LR
 |---|---|---|
 | `initialize(config)` | admin | Create fund account and share mint |
 | `init_vaults` | admin | Create the five fund-owned token accounts |
+| `init_share_metadata(name, symbol, uri)` | admin | Create the share token's Metaplex metadata so wallets show its name and icon; the admin becomes its update authority |
 | `seed_prices(prices)` | admin | Pre-load the signal prices of the days ending yesterday, before the first settlement only |
 | `request_subscription(amount, epoch)` | anyone | Queue a subscription; `epoch` is the day of the next fixing time, used for the ticket address |
 | `request_redemption(shares, epoch)` | holder | Queue a redemption; `epoch` as above |

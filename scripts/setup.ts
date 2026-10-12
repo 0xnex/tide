@@ -28,6 +28,7 @@ import {
   getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
 import { Tide } from "../target/types/tide";
+import { initShareMetadata } from "./share-metadata";
 
 const IDL = require("../target/idl/tide.json");
 
@@ -152,6 +153,8 @@ async function main() {
     .seedPrices(Array(49).fill(usd(price)))
     .accountsPartial({ admin, fund })
     .rpc();
+  // 份额代币的名称、符号和图标（Metaplex 元数据），钱包里显示成基金份额
+  console.log(`份额元数据：${await initShareMetadata(program, admin)}`);
   console.log(`基金：${fund.toBase58()}（定价时刻 UTC 0 点后 ${settleOffset} 秒，信号 ${btcFeed ? "BTC/USD" : "cbBTC/USD"}）`);
 
   // 4. 可选：演示申购
