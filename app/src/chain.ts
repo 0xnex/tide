@@ -1,0 +1,181 @@
+// 链上地址、读数据和发交易。PDA 种子与程序一致（见 AGENTS.md 的 PDA 表）。
+import { AnchorProvider, BN, Program } from "@coral-xyz/anchor";
+import type { AnchorWallet } from "@solana/wallet-adapter-react";
+import { Connection, PublicKey } from "@solana/web3.js";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import idl from "./idl/tide.json";
+import type { Tide } from "./idl/tide";
+
+export const RPC_URL: string = import.meta.env.VITE_RPC_URL ?? "https://api.devnet.solana.com";
+export const FUND_ADMIN = new PublicKey(
+  import.meta.env.VITE_FUND_ADMIN ?? "Bx5tWUDUrZ1yfkeYAXgimvyST4kRyhPwQe7YKKGNjYja",
+);
+export const PROGRAM_ID = new PublicKey(idl.address);
+export const DAY = 86_400;
+
+const pda = (seeds: (Buffer | Uint8Array)[]) => PublicKey.findProgramAddressSync(seeds, PROGRAM_ID)[0];
+const le = (n: number) => new BN(n).toArrayLike(Buffer, "le", 8);
+export const FUND = pda([Buffer.from("fund"), FUND_ADMIN.toBuffer()]);
+export const SHARE_MINT = pda([Buffer.from("share_mint"), FUND.toBuffer()]);
+export const fundVault = (name: string) => pda([Buffer.from(name), FUND.toBuffer()]);
+export const ticketPda = (user: PublicKey, epoch: number) =>
+  pda([Buffer.from("ticket"), FUND.toBuffer(), user.toBuffer(), le(epoch)]);
+export const epochPda = (epoch: number) => pda([Buffer.from("epoch"), FUND.toBuffer(), le(epoch)]);
+
+/** 没连钱包时只读用的 provider */
+const readOnlyWallet = {
+  publicKey: PublicKey.default,
+  signTransaction: async () => {
+    throw new Error("请先连接钱包");
+  },
+  signAllTransactions: async () => {
+    throw new Error("请先连接钱包");
+  },
+} as unknown as AnchorWallet;
+
+export function makeProgram(connection: Connection, wallet?: AnchorWallet): Program<Tide> {
+  const provider = new AnchorProvider(connection, wallet ?? readOnlyWallet, { commitment: "confirmed" });
+  return new Program<Tide>(idl as Tide, provider);
+}
+
+/** 这一刻提交的请求属于哪一期：定价时刻之前是当天，之后是第二天（与 fund-logic 的 request_epoch 一致） */
+export function requestEpoch(nowSec: number, offset: number): number {
+  const day = Math.floor(nowSec / DAY);
+  return nowSec < day * DAY + offset ? day : day + 1;
+}
+
+/** 第 epoch 期最晚什么时刻之前可以撤销（与 fund-logic 的 cancel_deadline 一致） */
+export function cancelDeadline(epoch: number, nowSec: number, offset: number): number {
+  return Math.max(epoch, Math.floor(nowSec / DAY)) * DAY + offset;
+}
+
+export type Fund = Awaited<ReturnType<Program<Tide>["account"]["fund"]["fetch"]>>;
+export type EpochRecord = Awaited<ReturnType<Program<Tide>["account"]["epochRecord"]["fetch"]>>;
+export type Ticket = Awaited<ReturnType<Program<Tide>["account"]["ticket"]["fetch"]>> & { address: PublicKey };
+
+export interface Snapshot {
+  fund: Fund;
+  records: EpochRecord[]; // 新的在前
+  tickets: Ticket[]; // 当前钱包的排队记录
+  usdcBalance: bigint;
+  shareBalance: bigint;
+}
+
+async function tokenBalance(connection: Connection, addr: PublicKey): Promise<bigint> {
+  const info = await connection.getTokenAccountBalance(addr).catch(() => null);
+  return info ? BigInt(info.value.amount) : 0n;
+}
+
+/** 读基金、所有定价记录，以及钱包的排队记录和余额 */
+export async function loadSnapshot(program: Program<Tide>, user: PublicKey | null): Promise<Snapshot> {
+  const connection = program.provider.connection;
+  const fund = await program.account.fund.fetch(FUND);
+  const records = (await program.account.epochRecord.all([{ memcmp: { offset: 8, bytes: FUND.toBase58() } }]))
+    .map((r) => r.account)
+    .sort((a, b) => b.epoch.toNumber() - a.epoch.toNumber());
+  if (!user) return { fund, records, tickets: [], usdcBalance: 0n, shareBalance: 0n };
+  const tickets = (
+    await program.account.ticket.all([
+      { memcmp: { offset: 8, bytes: FUND.toBase58() } },
+      { memcmp: { offset: 40, bytes: user.toBase58() } },
+    ])
+  )
+    .map((t) => ({ ...t.account, address: t.publicKey }))
+    .sort((a, b) => b.epoch.toNumber() - a.epoch.toNumber());
+  const [usdcBalance, shareBalance] = await Promise.all([
+    tokenBalance(connection, getAssociatedTokenAddressSync(fund.usdcMint, user, true)),
+    tokenBalance(connection, getAssociatedTokenAddressSync(SHARE_MINT, user, true)),
+  ]);
+  return { fund, records, tickets, usdcBalance, shareBalance };
+}
+
+/** 关闭这张排队记录那一期的定价记录：first_epoch ≤ 期号 ≤ epoch */
+export function recordFor(records: EpochRecord[], epoch: number): EpochRecord | undefined {
+  return records.find((r) => r.firstEpoch.toNumber() <= epoch && epoch <= r.epoch.toNumber());
+}
+
+// ---------------------------------------------------------------------------
+// 交易
+// ---------------------------------------------------------------------------
+
+export async function subscribe(program: Program<Tide>, fund: Fund, user: PublicKey, amount: bigint, epoch: number) {
+  return program.methods
+    .requestSubscription(new BN(amount.toString()), new BN(epoch))
+    .accountsPartial({
+      user,
+      fund: FUND,
+      ticket: ticketPda(user, epoch),
+      userUsdc: getAssociatedTokenAddressSync(fund.usdcMint, user, true),
+      subscriptionEscrow: fundVault("subscription_escrow"),
+    })
+    .rpc();
+}
+
+export async function redeem(program: Program<Tide>, user: PublicKey, shares: bigint, epoch: number) {
+  return program.methods
+    .requestRedemption(new BN(shares.toString()), new BN(epoch))
+    .accountsPartial({
+      user,
+      fund: FUND,
+      ticket: ticketPda(user, epoch),
+      userShares: getAssociatedTokenAddressSync(SHARE_MINT, user, true),
+      shareEscrow: fundVault("share_escrow"),
+    })
+    .rpc();
+}
+
+const userAccounts = (fund: Fund, user: PublicKey) => ({
+  shareMint: SHARE_MINT,
+  userShares: getAssociatedTokenAddressSync(SHARE_MINT, user, true),
+  userUsdc: getAssociatedTokenAddressSync(fund.usdcMint, user, true),
+  subscriptionEscrow: fundVault("subscription_escrow"),
+  shareEscrow: fundVault("share_escrow"),
+});
+
+export async function cancel(program: Program<Tide>, fund: Fund, user: PublicKey, ticket: Ticket) {
+  return program.methods
+    .cancel()
+    .accountsPartial({ user, fund: FUND, ticket: ticket.address, ...userAccounts(fund, user) })
+    .rpc();
+}
+
+export async function cancelPending(program: Program<Tide>, fund: Fund, user: PublicKey, ticket: Ticket, record: EpochRecord) {
+  return program.methods
+    .cancelPending()
+    .accountsPartial({
+      user,
+      fund: FUND,
+      ticket: ticket.address,
+      epochRecord: epochPda(record.epoch.toNumber()),
+      ...userAccounts(fund, user),
+    })
+    .rpc();
+}
+
+export async function claim(program: Program<Tide>, fund: Fund, user: PublicKey, ticket: Ticket, record: EpochRecord) {
+  return program.methods
+    .claim()
+    .accountsPartial({
+      user,
+      fund: FUND,
+      ticket: ticket.address,
+      epochRecord: epochPda(record.epoch.toNumber()),
+      usdcMint: fund.usdcMint,
+      payoutVault: fundVault("payout_vault"),
+      ...userAccounts(fund, user),
+    })
+    .rpc();
+}
+
+/** 程序错误的说明：用 IDL 里的中文 msg；不是程序错误时返回原始信息 */
+export function describeError(e: unknown): string {
+  const err = e as any;
+  const code: string | undefined = err?.error?.errorCode?.code;
+  const fromIdl = idl.errors.find((x) => x.name.toLowerCase() === code?.toLowerCase());
+  if (fromIdl) return fromIdl.msg;
+  const logs: string = (err?.logs ?? []).join("\n");
+  const m = `${err?.message ?? ""}\n${logs}`.match(/Error Code: (\w+)/);
+  const byLog = m && idl.errors.find((x) => x.name.toLowerCase() === m[1].toLowerCase());
+  if (byLog) return byLog.msg;
+  return String(err?.message ?? err);
+}
