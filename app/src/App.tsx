@@ -29,6 +29,7 @@ import * as fmt from "./format";
 import { Backtest } from "./BacktestCard";
 import { SharePriceCard, pricingBasis, sharePrice } from "./SharePriceCard";
 import { fetchSpot, type Spot } from "./backtest";
+import { buyThreshold, nextFixTime } from "./signal";
 
 type Toast = { kind: "ok" | "error" | "busy"; text: string; sig?: string };
 
@@ -99,7 +100,7 @@ export function App() {
                 <Overview snap={snap} spot={spot} />
                 <SharePriceCard snap={snap} spot={spot} />
                 <Backtest />
-                <Strategy snap={snap} now={now} />
+                <Strategy snap={snap} now={now} spot={spot} />
                 <Records records={snap.records} />
               </div>
               <div className="col-side">
@@ -182,6 +183,7 @@ function VaultHero({ snap }: { snap: Snapshot }) {
 
 function Overview({ snap, spot }: { snap: Snapshot; spot: number | null }) {
   const s = snap.fund.state;
+  const threshold = buyThreshold(snap.fund, Math.floor(nextFixTime(snap.fund, Date.now() / 1000) / DAY));
   const basis = pricingBasis(snap, spot);
   // display only: the fund itself is never valued in USD
   const total = basis ? Number(big(s.usdc)) / 1e6 + (Number(big(s.btc)) / 1e8) * basis.btcUsd : null;
@@ -208,6 +210,18 @@ function Overview({ snap, spot }: { snap: Snapshot; spot: number | null }) {
         {basis && ` Valued at BTC $${basis.btcUsd.toLocaleString("en-US", { maximumFractionDigits: 0 })} (${basis.source}).`}{" "}
         Indicative only: the fund is not valued in USD.
       </p>
+      {!s.targetBtc && s.btc.isZero() && !s.shareSupply.isZero() && (
+        <p className="muted small waiting">
+          The last fixing price was below the {snap.fund.config.window}-day average, so the fund holds only USDC and the
+          share price does not move with BTC.{" "}
+          {threshold !== null && (
+            <>
+              It buys cbBTC if the next fixing price is above <strong>{fmt.price(threshold)}</strong>
+              {spot && <> (BTC now {spotVs(spot, threshold)})</>}.
+            </>
+          )}
+        </p>
+      )}
       {waiting > 0n && (
         <p className="muted small waiting">
           <strong>{fmt.usdc(waiting)} USDC</strong> of subscriptions wait for a fixing. They count as fund
@@ -218,13 +232,18 @@ function Overview({ snap, spot }: { snap: Snapshot; spot: number | null }) {
   );
 }
 
-function Strategy({ snap, now }: { snap: Snapshot; now: number }) {
+/** 实时价格和门槛比较，比如 "$83,340, 0.3% below" */
+function spotVs(spot: number, threshold: number): string {
+  const gap = (spot * 1e6) / threshold - 1;
+  return `$${spot.toLocaleString("en-US", { maximumFractionDigits: 0 })}, ${(Math.abs(gap) * 100).toFixed(1)}% ${gap > 0 ? "above" : "below"}`;
+}
+
+function Strategy({ snap, now, spot }: { snap: Snapshot; now: number; spot: number | null }) {
   const { fund, records } = snap;
   const cfg = fund.config;
   const s = fund.state;
-  const offset = cfg.settleOffsetSecs.toNumber();
-  const today = Math.floor(now / DAY);
-  const nextFix = now < today * DAY + offset ? today * DAY + offset : (today + 1) * DAY + offset;
+  const nextFix = nextFixTime(fund, now);
+  const threshold = buyThreshold(fund, Math.floor(nextFix / DAY));
   const last = records[0];
   const pending = s.pending.slice(0, s.pendingCount).reduce((x: bigint, p: { usdc: BN }) => x + big(p.usdc), 0n);
   const outstanding = big(s.queuedSubscriptionUsdc) + big(s.nextSubscriptionUsdc) + pending;
@@ -254,6 +273,16 @@ function Strategy({ snap, now }: { snap: Snapshot; now: number }) {
         <Row label="Next fixing">
           {fmt.timeLabel(nextFix)}
           <span className="muted"> (in {fmt.countdown(nextFix - now)})</span>
+        </Row>
+        <Row label="Holds cbBTC after it if">
+          {threshold !== null ? (
+            <span>
+              the fixing price is above {fmt.price(threshold)}
+              {spot && <span className="muted"> (BTC now {spotVs(spot, threshold)})</span>}
+            </span>
+          ) : (
+            "not enough prices"
+          )}
         </Row>
         <Row label="Subscriptions">
           {s.subscriptionsPaused ? <span className="pill pill-amber">Paused</span> : <span className="pill pill-green">Open</span>}
