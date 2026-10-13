@@ -23,3 +23,7 @@ id.json
 .idea/
 .vscode/
 *.swp
+
+# Supabase：打包生成的结算函数和 CLI 的本地状态
+supabase/functions/crank/index.js
+supabase/.temp/

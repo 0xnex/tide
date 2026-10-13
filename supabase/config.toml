@@ -1,0 +1,7 @@
+# Supabase 项目 tide（wkklkegrgdcyiwfgdbgf）。只用到定时任务和结算函数，见 scripts/supabase-crank.sh。
+project_id = "tide"
+
+[functions.crank]
+# 部署的是 esbuild 打好的 index.js（源文件 handler.ts）；调用者用 x-crank-secret 头验证，不用 Supabase JWT
+entrypoint = "./functions/crank/index.js"
+verify_jwt = false
