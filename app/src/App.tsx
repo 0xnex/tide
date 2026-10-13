@@ -233,8 +233,8 @@ function Overview({ snap, spot }: { snap: Snapshot; spot: number | null }) {
 }
 
 /** 实时价格和门槛比较，比如 "$83,340, 0.3% below" */
-function spotVs(spot: number, threshold: number): string {
-  const gap = (spot * 1e6) / threshold - 1;
+function spotVs(spot: number, threshold: bigint): string {
+  const gap = (spot * 1e6) / Number(threshold) - 1;
   return `$${spot.toLocaleString("en-US", { maximumFractionDigits: 0 })}, ${(Math.abs(gap) * 100).toFixed(1)}% ${gap > 0 ? "above" : "below"}`;
 }
 
