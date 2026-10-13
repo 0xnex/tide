@@ -18,11 +18,12 @@ Write every reply in plain language: short sentences, one idea each. Lead with t
 fund-logic/            ← ALL accounting. Pure Rust, no dependencies, fully unit-tested.
 programs/tide/         ← Thin Anchor wrapper: validates accounts, moves tokens, calls fund-logic.
 tests/                 ← End-to-end tests (TypeScript, bankrun with clock control).
-scripts/crank.ts       ← Daily settlement script (devnet): posts Pyth prices, fix, trades, collect_fees.
+supabase/functions/    ← Daily settlement (devnet) as a Supabase Edge Function: _shared/crank-core.ts posts Pyth prices, fix, trades, collect_fees; crank/handler.ts runs it for at most ~110 s per call. pg_cron calls it every 10 min 01:05–01:55 UTC (supabase/crank-schedule.sql). Build, deploy and secrets: scripts/supabase-crank.sh (esbuild bundle; index.js is generated, not in git).
+scripts/crank.ts       ← The same crank from Node, without a time limit (manual runs).
 scripts/setup.ts       ← Creates a devnet fund (incl. share token metadata); scripts/faucet.ts mints mock USDC to test wallets.
 app/                   ← Web frontend (Vite + React, deployed on Vercel). Own package.json; copy the IDL with `yarn sync-idl`.
 app/api/faucet.ts      ← Vercel function: 10,000 mock USDC (+ a little SOL) once per address, signed by a faucet wallet (env FAUCET_SECRET_KEY) that holds the mock USDC mint authority.
-.github/workflows/     ← crank.yml runs the crank with secrets KEEPER_KEYPAIR and PYTH_API_KEY; it copies the IDL from app/src/idl. Started at 01:05 UTC by Supabase pg_cron (supabase/crank-trigger.sql, token via scripts/supabase-token.sh); its own 01:40 schedule is a no-op backup.
+.github/workflows/     ← crank.yml runs scripts/crank.ts on manual dispatch only (backup), with secrets KEEPER_KEYPAIR and PYTH_API_KEY; it copies the IDL from app/src/idl.
 ```
 
 **Rule: arithmetic about money belongs in `fund-logic`, never in the Anchor program.** The program may only:

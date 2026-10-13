@@ -1,4 +1,4 @@
-// Supabase Edge Function：每日结算（devnet）。由 supabase/crank-trigger.sql 里的 pg_cron 定时调用，
+// Supabase Edge Function：每日结算（devnet）。由 supabase/crank-schedule.sql 里的 pg_cron 定时调用，
 // 每一步做什么见 ../_shared/crank-core.ts。
 //
 // 这是源文件。部署前用 esbuild 按 Node 的方式把它和依赖打成一个文件 index.js（不进 git），见
@@ -15,8 +15,8 @@
 //   RPC_URL         可选，默认 devnet
 //   HERMES_URL      可选，默认 https://hermes.pyth.network
 //
-// 调用：POST，头 x-crank-secret。默认马上回答 202，结算在后台跑完，日志在 Supabase 的函数日志里；
-// 加 ?wait=1 时等结算跑完，把日志放在回答里（手动检查用）。
+// 调用：POST，头 x-crank-secret。等结算这次运行完再回答，日志放在回答里（JSON：ok 和 log）。
+// 定时任务用 pg_net 调用，最多等 2 分钟，回答记在 net._http_response 里，可以用 SQL 查。
 declare const Deno: any;
 import * as anchor from "@coral-xyz/anchor";
 import { Connection, Keypair, Transaction, VersionedTransaction } from "@solana/web3.js";
@@ -67,7 +67,7 @@ Deno.serve(async (req) => {
     console.log(line);
     lines.push(line);
   };
-  const job = crank(log).then(
+  const ok = await crank(log).then(
     () => true,
     (e) => {
       console.error(e);
@@ -75,13 +75,6 @@ Deno.serve(async (req) => {
       return false;
     },
   );
-  if (new URL(req.url).searchParams.get("wait") !== "1") {
-    // pg_net 默认 5 秒就不等了；让结算在回答之后继续跑完（本机的 edge-runtime 主服务没有 waitUntil，本来就会跑完）
-    const runtime = (globalThis as any).EdgeRuntime;
-    if (typeof runtime?.waitUntil === "function") runtime.waitUntil(job);
-    return new Response("started\n", { status: 202 });
-  }
-  const ok = await job;
   return new Response(JSON.stringify({ ok, log: lines }, null, 2), {
     status: ok ? 200 : 500,
     headers: { "content-type": "application/json" },

@@ -5,7 +5,8 @@
 #       scripts/supabase-crank.sh --secrets   先设置 Secrets 再打包、部署
 #       scripts/supabase-crank.sh --run       部署后调用一次并等结果（会真的结算，重复调用是安全的）
 # Secrets 的来源：KEEPER_KEYPAIR 读 $KEEPER_KEYPAIR_FILE（默认 ~/.config/solana/tide-devnet-admin.json），
-# PYTH_API_KEY 和 SUPABASE_CRANK_SECRET 读仓库根目录的 .env（不进 git）。值不会显示在终端里。
+# PYTH_API_KEY、SUPABASE_CRANK_SECRET 和 SUPABASE_DB_URL（写 Vault 用）读仓库根目录的 .env（不进 git）。
+# 值不会显示在终端里。定时任务本身见 supabase/crank-schedule.sql。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REF=${SUPABASE_PROJECT_REF:-wkklkegrgdcyiwfgdbgf}
@@ -21,7 +22,12 @@ if [[ " $* " == *" --secrets "* ]]; then
     echo "CRANK_SECRET=$(env_value SUPABASE_CRANK_SECRET)"
   } > "$tmp"
   supabase secrets set --project-ref "$REF" --env-file "$tmp" > /dev/null
-  echo "Secrets 已设置"
+  # 定时任务从 Vault 读同一个调用密钥（supabase/crank-schedule.sql）
+  psql "$(env_value SUPABASE_DB_URL)" -q -v ON_ERROR_STOP=1 -v sec="$(env_value SUPABASE_CRANK_SECRET)" <<'SQL'
+delete from vault.secrets where name = 'crank_secret';
+select vault.create_secret(:'sec', 'crank_secret') is not null as stored \gset
+SQL
+  echo "Secrets 已设置（函数和 Vault）"
 fi
 
 # 按 Node 的方式打包（Deno 直接加载 Pyth 的 ESM 依赖会失败）；Deno 没有的 Node 全局变量在开头补上
@@ -34,6 +40,6 @@ sed -i.bak -E 's/from "(assert|buffer|crypto|events|fs|http|https|net|os|path|st
 supabase functions deploy crank --project-ref "$REF" --use-api
 
 if [[ " $* " == *" --run "* ]]; then
-  curl -sS -X POST "https://$REF.supabase.co/functions/v1/crank?wait=1" -H "x-crank-secret: $(env_value SUPABASE_CRANK_SECRET)"
+  curl -sS -X POST "https://$REF.supabase.co/functions/v1/crank" -H "x-crank-secret: $(env_value SUPABASE_CRANK_SECRET)"
   echo
 fi
