@@ -105,7 +105,7 @@ export function App() {
               </div>
               <div className="col-side">
                 <Faucet snap={snap} run={run} />
-                <ActionPanel snap={snap} now={now} run={run} program={program} />
+                <ActionPanel snap={snap} now={now} spot={spot} run={run} program={program} />
                 <Position snap={snap} now={now} spot={spot} run={run} program={program} />
                 <Guide snap={snap} />
               </div>
@@ -246,6 +246,14 @@ function Strategy({ snap, now, spot }: { snap: Snapshot; now: number; spot: numb
   const threshold = buyThreshold(fund, Math.floor(nextFix / DAY));
   const last = records[0];
   const pending = s.pending.slice(0, s.pendingCount).reduce((x: bigint, p: { usdc: BN }) => x + big(p.usdc), 0n);
+  const today = Math.floor(now / DAY);
+  const todayFix = today * DAY + cfg.settleOffsetSecs.toNumber();
+  // 结算每天定价后几分钟内由定时任务运行；过了一小时还没定价就是出了问题
+  const overdue = now > todayFix + 3600 && s.lastFixDay.toNumber() < today;
+  // 还要交易的量：目标 cbBTC 时 USDC 还没买完，目标 USDC 时 cbBTC 还没卖完（不到 1 USDC / 1 聪的尘埃不算）
+  const toBuy = s.targetBtc ? big(s.usdc) + pending : 0n;
+  const toSell = s.targetBtc ? 0n : big(s.btc);
+  const rebalancing = toBuy >= 1_000_000n || toSell > 0n || s.sliceCount > 0;
   const outstanding = big(s.queuedSubscriptionUsdc) + big(s.nextSubscriptionUsdc) + pending;
   const cap = big(cfg.subscriptionCapUsdc);
   const capPct = cap > 0n ? Number((outstanding * 10_000n) / cap) / 100 : 0;
@@ -269,6 +277,23 @@ function Strategy({ snap, now, spot }: { snap: Snapshot; now: number; spot: numb
           ) : (
             "—"
           )}
+        </Row>
+        <Row label="Settlement">
+          {overdue ? (
+            <span className="pill pill-amber">Today's fixing has not run yet</span>
+          ) : rebalancing ? (
+            <span>
+              <span className="pill pill-amber">Trading</span>{" "}
+              {s.sliceCount > 0 && `selling ${s.sliceCount} redemption slice${s.sliceCount > 1 ? "s" : ""}, `}
+              {toBuy > 0n ? `${fmt.usdc(toBuy)} USDC left to buy cbBTC with` : toSell > 0n ? `${fmt.btc(toSell)} cbBTC left to sell` : ""}
+            </span>
+          ) : (
+            <span className="pill pill-green">Fund fully in {s.targetBtc ? "cbBTC" : "USDC"}</span>
+          )}
+        </Row>
+        <Row label="Trades">
+          Up to {fmt.usdc(cfg.tradeCapUsdc)} USDC each, at least {cfg.minTradeIntervalSecs.toNumber()} s apart, at most{" "}
+          {cfg.maxSlippageBps / 100}% slippage
         </Row>
         <Row label="Next fixing">
           {fmt.timeLabel(nextFix)}
@@ -356,7 +381,19 @@ function Records({ records }: { records: EpochRecord[] }) {
 type RunFn = (label: string, send: () => Promise<string>) => Promise<void>;
 type Prog = ReturnType<typeof makeProgram>;
 
-function ActionPanel({ snap, now, run, program }: { snap: Snapshot; now: number; run: RunFn; program: Prog }) {
+function ActionPanel({
+  snap,
+  now,
+  spot,
+  run,
+  program,
+}: {
+  snap: Snapshot;
+  now: number;
+  spot: number | null;
+  run: RunFn;
+  program: Prog;
+}) {
   const wallet = useAnchorWallet();
   const [tab, setTab] = useState<"sub" | "red">("sub");
   const [text, setText] = useState("");
@@ -373,6 +410,18 @@ function ActionPanel({ snap, now, run, program }: { snap: Snapshot; now: number;
   const waitingUsdc = waiting.reduce((x, t) => x + big(t.subscriptionUsdc), 0n);
   const toClaim = snap.tickets.some((t) => !t.subscriptionUsdc.isZero() && viewTicket(t, snap.fund, snap.records, now).canClaim);
   const noShares = tab === "red" && !!wallet && snap.shareBalance === 0n;
+  const fixAt = epoch * DAY + offset;
+  const threshold = buyThreshold(snap.fund, epoch);
+  // 只是参考：真正的份额和赎回款按实际成交计算
+  const basis = pricingBasis(snap, spot);
+  const s = snap.fund.state;
+  const price = basis ? sharePrice(big(s.usdc), big(s.btc), big(s.shareSupply), basis.btcUsd) ?? 1 : null;
+  const estimate =
+    amount && amount > 0n && price && !noShares
+      ? tab === "sub"
+        ? `About ${fmt.shares(BigInt(Math.floor((Number(amount) * (1 - cfg.subscriptionFeeBps / 10_000)) / price)))} shares at $${price.toFixed(4)} per share (the real number follows the fill)`
+        : `About ${fmt.usdc(BigInt(Math.floor(Number(amount) * price * (1 - cfg.withdrawalFeeBps / 10_000))))} USDC after the fee, at $${price.toFixed(4)} per share (you get what your slice sells for)`
+      : null;
   const problem = !wallet
     ? "Connect a wallet"
     : noShares
@@ -425,14 +474,24 @@ function ActionPanel({ snap, now, run, program }: { snap: Snapshot; now: number;
         </div>
       </div>
       <div className="rows compact">
+        {estimate && <Row label="Estimate">{estimate}</Row>}
         <Row label="Joins epoch">
-          {epoch} (fixing {fmt.timeLabel(epoch * DAY + offset)})
+          {epoch} (fixing {fmt.timeLabel(fixAt)})
         </Row>
-        <Row label="Cancel">In full, any time before the fixing</Row>
+        <Row label="Cancel">In full until the fixing, {fmt.countdown(fixAt - now)} from now</Row>
         {tab === "sub" ? (
-          <Row label="Fill">Shares by the cbBTC (or USDC) actually added, possibly in parts</Row>
+          <>
+            <Row label="At the fixing">
+              {threshold !== null
+                ? `Buys cbBTC if the price is above ${fmt.price(threshold)}, otherwise stays in USDC`
+                : "Holds cbBTC above the moving average, USDC below"}
+            </Row>
+            <Row label="Fill">Shares by the cbBTC (or USDC) actually added, possibly in parts</Row>
+            <Row label="Minimum">{fmt.usdc(min)} USDC</Row>
+            {cfg.subscriptionFeeBps > 0 && <Row label="Subscription fee">{cfg.subscriptionFeeBps / 100}%, kept by the fund</Row>}
+          </>
         ) : (
-          <Row label="Payout">Claim once your slice is sold; {cfg.withdrawalFeeBps / 100}% withdrawal fee</Row>
+          <Row label="Payout">What your slice sells for, claimable once sold; {cfg.withdrawalFeeBps / 100}% withdrawal fee</Row>
         )}
       </div>
       {noShares && (
@@ -462,20 +521,28 @@ interface TicketView {
   canCancelPending: boolean;
   canClaim: boolean;
   detail: string[];
+  sharesToClaim: bigint; // 现在领取能拿到的份额（估算）
+  usdcToClaim: bigint; // 现在领取能拿到的 USDC：赎回款扣掉取款费，加上退款（估算）
+  queuedUsdc: bigint; // 还没变成份额的申购款
+  queuedShares: bigint; // 还没卖出的赎回份额
 }
 
-/** What a ticket is waiting for (display only; the program computes the real amounts) */
+const perShare = (usdc: bigint, shares: bigint) => (shares > 0n ? `$${(Number(usdc) / Number(shares)).toFixed(4)}` : "—");
+
+/** What a ticket is waiting for (display only; the program computes the real amounts with the same rounding) */
 function viewTicket(t: Ticket, fund: Fund, records: EpochRecord[], now: number): TicketView {
   const epoch = t.epoch.toNumber();
   const sub = big(t.subscriptionUsdc);
   const red = big(t.redemptionShares);
   const detail: string[] = [];
-  if (sub > 0n) detail.push(`Subscribed ${fmt.usdc(sub)} USDC`);
-  if (red > 0n) detail.push(`Redeeming ${fmt.shares(red)} shares`);
   const offset = fund.config.settleOffsetSecs.toNumber();
+  const none = { sharesToClaim: 0n, usdcToClaim: 0n, queuedUsdc: sub, queuedShares: red };
   if (epoch > fund.state.lastFixDay.toNumber()) {
     const deadline = cancelDeadline(epoch, now, offset);
     const open = now < deadline;
+    if (sub > 0n) detail.push(`Subscribing ${fmt.usdc(sub)} USDC`);
+    if (red > 0n) detail.push(`Redeeming ${fmt.shares(red)} shares`);
+    detail.push(open ? `Fixing ${fmt.timeLabel(deadline)}; cancel before then` : "Waiting for the settlement to fix it");
     return {
       epoch,
       status: open ? `Queued, fixing in ${fmt.countdown(deadline - now)}` : "Waiting for the fixing",
@@ -484,39 +551,68 @@ function viewTicket(t: Ticket, fund: Fund, records: EpochRecord[], now: number):
       canCancelPending: false,
       canClaim: false,
       detail,
+      ...none,
     };
   }
   const record = recordFor(records, epoch);
-  if (!record) return { epoch, status: "Fixing record not found", tone: "gray", canCancel: false, canCancelPending: false, canClaim: false, detail };
-  let claimable = false;
+  if (!record)
+    return { epoch, status: "Fixing record not found", tone: "gray", canCancel: false, canCancelPending: false, canClaim: false, detail, ...none };
+  let sharesToClaim = 0n;
+  let usdcToClaim = 0n;
+  let queuedUsdc = 0n;
+  let queuedShares = 0n;
   let pending = false;
   if (sub > 0n) {
     const basis = big(record.subscriptionUsdc) - big(record.cancelledSubscriptionUsdc);
     const minted = big(record.mintedShares) - big(record.cancelledShares);
-    const owed = basis > 0n ? (minted * sub) / basis - big(t.sharesClaimed) : 0n;
-    if (record.subscriptionFilled) claimable = true;
-    else {
+    const entitled = basis > 0n ? (minted * sub) / basis : 0n;
+    const claimed = big(t.sharesClaimed);
+    if (record.subscriptionFilled) {
+      // 最后一位领取人拿走剩下的全部
+      const unclaimedSub = big(record.unclaimedSubscriptionUsdc);
+      const last = sub === unclaimedSub;
+      sharesToClaim = last ? big(record.unclaimedShares) : entitled - claimed;
+      const refund = unclaimedSub > 0n ? (big(record.unclaimedRefundUsdc) * sub) / unclaimedSub : 0n;
+      usdcToClaim += refund;
+      detail.push(`${fmt.usdc(sub)} USDC became ${fmt.shares(claimed + sharesToClaim)} shares (${perShare(sub, claimed + sharesToClaim)} per share)`);
+      if (claimed > 0n) detail.push(`${fmt.shares(claimed)} already claimed`);
+      if (refund > 0n) detail.push(`${fmt.usdc(refund)} USDC refund`);
+    } else {
       pending = true;
-      if (owed > 0n) claimable = true;
+      sharesToClaim = entitled - claimed;
+      const unfilled = fund.state.pending.slice(0, fund.state.pendingCount).find((p: { epoch: BN }) => p.epoch.eq(record.epoch));
+      queuedUsdc = unfilled && basis > 0n ? (big(unfilled.usdc) * sub) / basis : 0n;
+      detail.push(`Subscribed ${fmt.usdc(sub)} USDC: ${fmt.shares(entitled)} shares so far, ${fmt.usdc(queuedUsdc)} USDC still to buy`);
     }
-    detail.push(record.subscriptionFilled ? "Subscription fully filled" : `About ${fmt.shares(owed)} shares filled so far`);
   }
   if (red > 0n) {
     if (record.sliceSoldOut) {
-      claimable = true;
-      const gross = big(record.redemptionShares) > 0n ? (big(record.payoutUsdc) * red) / big(record.redemptionShares) : 0n;
-      detail.push(`About ${fmt.usdc(gross)} USDC before the withdrawal fee`);
-    } else detail.push("Redemption slice still selling");
+      const unclaimedRed = big(record.unclaimedRedemptionShares);
+      const gross = unclaimedRed > 0n ? (big(record.unclaimedPayoutUsdc) * red) / unclaimedRed : 0n;
+      const fee = (gross * BigInt(fund.config.withdrawalFeeBps)) / 10_000n;
+      usdcToClaim += gross - fee;
+      detail.push(
+        `${fmt.shares(red)} shares sold for ${fmt.usdc(gross)} USDC (${perShare(gross, red)} per share); you get ${fmt.usdc(gross - fee)} after the ${fund.config.withdrawalFeeBps / 100}% fee`,
+      );
+    } else {
+      queuedShares = red;
+      detail.push(`Redeeming ${fmt.shares(red)} shares: the slice is still selling`);
+    }
   }
+  const canClaim = sharesToClaim > 0n || usdcToClaim > 0n || (sub > 0n && record.subscriptionFilled) || (red > 0n && record.sliceSoldOut);
   return {
     epoch,
     record,
-    status: claimable ? "Ready to claim" : pending ? "Filling" : "Selling",
-    tone: claimable ? "green" : "amber",
+    status: canClaim ? "Ready to claim" : pending ? "Filling" : "Selling",
+    tone: canClaim ? "green" : "amber",
     canCancel: false,
     canCancelPending: pending,
-    canClaim: claimable,
+    canClaim,
     detail,
+    sharesToClaim,
+    usdcToClaim,
+    queuedUsdc: pending ? queuedUsdc : 0n,
+    queuedShares,
   };
 }
 
@@ -546,18 +642,67 @@ function Position({
   const basis = pricingBasis(snap, spot);
   const s = snap.fund.state;
   const price = basis ? sharePrice(big(s.usdc), big(s.btc), big(s.shareSupply), basis.btcUsd) : null;
-  const value = price !== null ? (Number(snap.shareBalance) / 1e6) * price : null;
+  const views = snap.tickets.map((t) => viewTicket(t, snap.fund, snap.records, now));
+  const sum = (f: (v: TicketView) => bigint) => views.reduce((x, v) => x + f(v), 0n);
+  const toClaimShares = sum((v) => v.sharesToClaim);
+  const toClaimUsdc = sum((v) => v.usdcToClaim);
+  const queuedUsdc = sum((v) => v.queuedUsdc);
+  const queuedShares = sum((v) => v.queuedShares);
+  const owned = snap.shareBalance + toClaimShares + queuedShares; // 还没卖出的赎回份额也还是你的
+  const value = price !== null ? (Number(owned) / 1e6) * price : null;
+  const lowSol = snap.solBalance !== null && snap.solBalance < 5_000_000; // 少于 0.005 SOL 可能付不起交易费
   return (
     <section className="card">
       <h2>Your position</h2>
       <div className="stats two">
-        <Stat label="Shares" value={fmt.shares(snap.shareBalance)} />
+        <Stat label="Shares in wallet" value={fmt.shares(snap.shareBalance)} />
         <Stat label="USDC balance" value={fmt.usdc(snap.usdcBalance)} />
+        {(toClaimShares > 0n || toClaimUsdc > 0n) && (
+          <Stat
+            label="Ready to claim"
+            value={
+              <span className="claimable">
+                {toClaimShares > 0n && <span>{fmt.shares(toClaimShares)} shares</span>}
+                {toClaimUsdc > 0n && <span>{fmt.usdc(toClaimUsdc)} USDC</span>}
+              </span>
+            }
+          />
+        )}
+        {(queuedUsdc > 0n || queuedShares > 0n) && (
+          <Stat
+            label="In the queue"
+            value={
+              <span className="claimable">
+                {queuedUsdc > 0n && <span>{fmt.usdc(queuedUsdc)} USDC</span>}
+                {queuedShares > 0n && <span>{fmt.shares(queuedShares)} shares</span>}
+              </span>
+            }
+          />
+        )}
       </div>
-      {value !== null && snap.shareBalance > 0n && (
+      {toClaimShares > 0n && snap.shareBalance === 0n && (
+        <p className="hint">Your shares are ready. Press Claim below to move them to your wallet.</p>
+      )}
+      {value !== null && owned > 0n && (
         <p className="muted small">
-          About ${value.toLocaleString("en-US", { maximumFractionDigits: 2 })} at ${price!.toFixed(4)} per share
-          (before the 1% withdrawal fee).
+          {fmt.shares(owned)} shares
+          {owned !== snap.shareBalance &&
+            ` (${[
+              snap.shareBalance > 0n && `${fmt.shares(snap.shareBalance)} in the wallet`,
+              toClaimShares > 0n && `${fmt.shares(toClaimShares)} to claim`,
+              queuedShares > 0n && `${fmt.shares(queuedShares)} being redeemed`,
+            ]
+              .filter(Boolean)
+              .join(", ")})`}
+          , about $
+          {value.toLocaleString("en-US", { maximumFractionDigits: 2 })} at ${price!.toFixed(4)} per share, before the{" "}
+          {snap.fund.config.withdrawalFeeBps / 100}% withdrawal fee. Indicative only.
+        </p>
+      )}
+      {snap.solBalance !== null && (
+        <p className={`small ${lowSol ? "hint" : "muted"}`}>
+          {(snap.solBalance / 1e9).toLocaleString("en-US", { maximumFractionDigits: 4 })} SOL for transaction fees
+          {lowSol && ": low, transactions may fail. Get devnet SOL from faucet.solana.com."}
         </p>
       )}
       <TransferShares balance={snap.shareBalance} run={run} program={program} />
@@ -565,15 +710,19 @@ function Position({
         <p className="muted small">No tickets.</p>
       ) : (
         <ul className="tickets">
-          {snap.tickets.map((t) => {
-            const v = viewTicket(t, snap.fund, snap.records, now);
+          {snap.tickets.map((t, i) => {
+            const v = views[i];
             return (
               <li key={t.address.toBase58()} className="ticket">
                 <div className="ticket-top">
                   <span className="ticket-epoch">Epoch {v.epoch} · {fmt.dayLabel(v.epoch)}</span>
                   <span className={`pill pill-${v.tone}`}>{v.status}</span>
                 </div>
-                <div className="muted small">{v.detail.join(" · ")}</div>
+                {v.detail.map((d) => (
+                  <div key={d} className="muted small">
+                    {d}
+                  </div>
+                ))}
                 <div className="ticket-actions">
                   {v.canClaim && v.record && (
                     <button className="btn small primary" onClick={() => run("Claim", () => claim(program, snap.fund, user, t, v.record!))}>

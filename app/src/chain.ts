@@ -64,6 +64,7 @@ export interface Snapshot {
   tickets: Ticket[]; // 当前钱包的排队记录
   usdcBalance: bigint;
   shareBalance: bigint;
+  solBalance: number | null; // lamports，用来付交易费；没连钱包时为 null
 }
 
 async function tokenBalance(connection: Connection, addr: PublicKey): Promise<bigint> {
@@ -84,7 +85,7 @@ export async function loadSnapshot(program: Program<Tide>, user: PublicKey | nul
   )
     .map((r) => r.account)
     .sort((a, b) => b.epoch.toNumber() - a.epoch.toNumber());
-  if (!user) return { fund, records, tickets: [], usdcBalance: 0n, shareBalance: 0n };
+  if (!user) return { fund, records, tickets: [], usdcBalance: 0n, shareBalance: 0n, solBalance: null };
   const tickets = (
     await program.account.ticket.all([
       { memcmp: { offset: 8, bytes: FUND.toBase58() } },
@@ -93,11 +94,12 @@ export async function loadSnapshot(program: Program<Tide>, user: PublicKey | nul
   )
     .map((t) => ({ ...t.account, address: t.publicKey }))
     .sort((a, b) => b.epoch.toNumber() - a.epoch.toNumber());
-  const [usdcBalance, shareBalance] = await Promise.all([
+  const [usdcBalance, shareBalance, solBalance] = await Promise.all([
     tokenBalance(connection, getAssociatedTokenAddressSync(fund.usdcMint, user, true)),
     tokenBalance(connection, getAssociatedTokenAddressSync(SHARE_MINT, user, true)),
+    connection.getBalance(user).catch(() => null),
   ]);
-  return { fund, records, tickets, usdcBalance, shareBalance };
+  return { fund, records, tickets, usdcBalance, shareBalance, solBalance };
 }
 
 /** 关闭这张排队记录那一期的定价记录：first_epoch ≤ 期号 ≤ epoch */

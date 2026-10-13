@@ -1042,3 +1042,9 @@ td.num,
   font-family: var(--mono);
   color: var(--text);
 }
+
+.claimable {
+  display: flex;
+  flex-direction: column;
+  font-size: 16px;
+}
