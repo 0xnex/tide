@@ -338,7 +338,8 @@ flowchart LR
   B --> C["Pyth BTC/USD +<br/>cbBTC/USD"] & D["Jupiter<br/>route off-chain,<br/>min_out on-chain"]
   B --> E["✓ Keeper · cancel ·<br/>MA backfill"]
   B --> F["✓ Timelock · subscription pause<br/>(admin is an external multisig)"]
-  C & D & E & F --> G["Monitoring"] --> H["Security audit"] --> I["Legal review"]
+  B --> L["Lend idle USDC<br/>ADR 0008"]
+  C & D & E & F & L --> G["Monitoring"] --> H["Security audit"] --> I["Legal review"]
 ```
 
 ### Known limitations

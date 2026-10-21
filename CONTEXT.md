@@ -61,7 +61,7 @@ _Avoid_: Performance fee, profit fee, carry
 An optional charge on each subscription that stays in the fund.
 
 **Subscription pause** (暂停申购):
-The one action the admin may take immediately: stopping new subscriptions. Redemptions can never be paused, and the admin can never move fund assets.
+One of the two actions the admin may take immediately: stopping new subscriptions (the other is lowering the lending cap). Redemptions can never be paused, and the admin can never move fund assets.
 
 ## Settlement
 
@@ -85,7 +85,7 @@ _Avoid_: Day, round, batch
 ## Trading
 
 **Target** (目标持仓):
-What the fund should hold after a settlement: all cbBTC when the signal price is above the moving average, all USDC otherwise.
+What the fund should hold after a settlement: all cbBTC when the signal price is above the moving average, all USDC otherwise (part of it lent, within the lending cap).
 _Avoid_: Position, regime, in-BTC
 
 **Rebalance** (调仓):
@@ -98,6 +98,23 @@ One Jupiter swap within a rebalance, bounded by the valuation price at the momen
 **Trade cap** (单笔交易上限):
 The maximum USDC notional of a single trade; a rebalance larger than the cap is split into several trades.
 _Avoid_: Daily limit, max adjustment
+
+## Lending
+
+**Lending pool** (借贷池):
+The protocol the fund lends its idle USDC to while the target is USDC; on devnet a mock pool.
+_Avoid_: Vault (the fund's own token accounts), yield farm
+
+**Lending receipt** (借贷凭证):
+What the fund holds for its lent USDC: a fund asset worth its claim on the lending pool at the pool's exchange rate, so interest raises the share price.
+_Avoid_: Deposit, aToken, cToken
+
+**Lending cap** (借出上限):
+The largest share of the fund's USDC that may be lent (80% by default); the admin may lower it at once but raise it only through the timelock.
+
+**Buffer** (备用金):
+The fund's USDC not lent, kept in the vault so redemption slices can be paid without waiting on the lending pool.
+_Avoid_: Reserve (ambiguous with the lending pool's reserves)
 
 ## Prices
 
