@@ -101,7 +101,7 @@ export function App() {
                 <SharePriceCard snap={snap} spot={spot} />
                 <Backtest />
                 <Strategy snap={snap} now={now} spot={spot} />
-                <Records records={snap.records} />
+                <Records records={snap.records} window={snap.fund.config.window} />
               </div>
               <div className="col-side">
                 <Faucet snap={snap} run={run} />
@@ -330,10 +330,14 @@ function Strategy({ snap, now, spot }: { snap: Snapshot; now: number; spot: numb
   );
 }
 
-function Records({ records }: { records: EpochRecord[] }) {
+function Records({ records, window }: { records: EpochRecord[]; window: number }) {
   return (
     <section className="card">
       <h2>Fixings</h2>
+      <p className="muted small">
+        Each day at the fixing time the BTC price is compared with its {window}-day average: above it the fund holds
+        cbBTC, otherwise USDC. That day's subscriptions and redemptions are filled after it.
+      </p>
       {records.length === 0 ? (
         <p className="muted">No fixings yet.</p>
       ) : (
@@ -341,35 +345,53 @@ function Records({ records }: { records: EpochRecord[] }) {
           <table>
             <thead>
               <tr>
-                <th>Date</th>
-                <th className="num">Signal</th>
-                <th className="num">Average</th>
-                <th>Target</th>
-                <th className="num">Subscribed USDC</th>
-                <th className="num">Redeemed shares</th>
-                <th>Status</th>
+                <th>Date (UTC)</th>
+                <th className="num">BTC price</th>
+                <th className="num">{window}-day average</th>
+                <th>Fund holds</th>
+                <th className="num">Subscriptions</th>
+                <th className="num">Redemptions</th>
+                <th>Requests</th>
               </tr>
             </thead>
             <tbody>
-              {records.slice(0, 20).map((r) => (
-                <tr key={r.epoch.toString()}>
-                  <td>{fmt.dayLabel(r.epoch.toNumber())}</td>
-                  <td className="num">{fmt.price(r.signalPrice)}</td>
-                  <td className="num">{r.movingAverage.isZero() ? "—" : fmt.price(r.movingAverage)}</td>
-                  <td>
-                    <span className={`pill ${r.targetBtc ? "pill-blue" : "pill-gray"}`}>{r.targetBtc ? "cbBTC" : "USDC"}</span>
-                  </td>
-                  <td className="num">{fmt.usdc(r.subscriptionUsdc)}</td>
-                  <td className="num">{fmt.shares(r.redemptionShares)}</td>
-                  <td>
-                    {r.subscriptionFilled && r.sliceSoldOut ? (
-                      <span className="pill pill-green">Done</span>
-                    ) : (
-                      <span className="pill pill-amber">Filling</span>
-                    )}
-                  </td>
-                </tr>
-              ))}
+              {records.slice(0, 20).map((r, i) => {
+                const prev = records[i + 1]; // 新的在前，下一行是前一次定价
+                const gap = r.movingAverage.isZero() ? null : r.signalPrice.toNumber() / r.movingAverage.toNumber() - 1;
+                const idle = r.subscriptionUsdc.isZero() && r.redemptionShares.isZero();
+                return (
+                  <tr key={r.epoch.toString()}>
+                    <td>{fmt.dayLabel(r.epoch.toNumber())}</td>
+                    <td className="num">
+                      {fmt.price(r.signalPrice)}
+                      {gap !== null && (
+                        <span className={`delta ${gap > 0 ? "up" : "down"}`}>
+                          {gap > 0 ? "+" : "−"}
+                          {(Math.abs(gap) * 100).toFixed(1)}%
+                        </span>
+                      )}
+                    </td>
+                    <td className="num">{r.movingAverage.isZero() ? "—" : fmt.price(r.movingAverage)}</td>
+                    <td>
+                      <span className={`pill ${r.targetBtc ? "pill-blue" : "pill-gray"}`}>{r.targetBtc ? "cbBTC" : "USDC"}</span>
+                      {prev && prev.targetBtc !== r.targetBtc && <span className="muted small"> switched</span>}
+                    </td>
+                    <td className="num">{r.subscriptionUsdc.isZero() ? "—" : `${fmt.usdc(r.subscriptionUsdc)} USDC`}</td>
+                    <td className="num">{r.redemptionShares.isZero() ? "—" : `${fmt.shares(r.redemptionShares)} shares`}</td>
+                    <td>
+                      {idle ? (
+                        <span className="muted">None</span>
+                      ) : !r.subscriptionFilled ? (
+                        <span className="pill pill-amber">Buying</span>
+                      ) : !r.sliceSoldOut ? (
+                        <span className="pill pill-amber">Selling</span>
+                      ) : (
+                        <span className="pill pill-green">Filled</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
