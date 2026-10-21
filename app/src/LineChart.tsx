@@ -1,11 +1,11 @@
 // 折线图：一条或两条线共用一个纵轴，可选的背景带（比如持有 BTC 的日子）、竖直标记线，十字线和提示框（鼠标或方向键）。
 // 一条线可以只覆盖一部分日期（其余是 null），比如模拟部分和实际部分各画一条。
-// 颜色用 .viz-root 里的 --series-1 / --series-2（参考调色板第 1、2 位，浅色和深色都校验过）。
+// 颜色用 .viz-root 里的 --series-1 / --series-2（参考调色板第 1、2 位，浅色和深色都校验过），s3 是灰色的参考线。
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 export interface Series {
   label: string;
-  className: "s1" | "s2";
+  className: "s1" | "s2" | "s3";
   values: (number | null)[]; // null：这一天没有这条线
   dashed?: boolean;
 }
@@ -79,7 +79,10 @@ export function LineChart({ days, series, bands, includeZero, format, tick, dire
   const y = (v: number) => m.top + (1 - (v - lo) / (hi - lo)) * h;
   const yTicks: number[] = [];
   for (let v = lo; v <= hi + step / 2; v += step) yTicks.push(v);
-  const xTicks = n === 1 ? [0] : Array.from(new Set(Array.from({ length: 5 }, (_, k) => Math.round((k * (n - 1)) / 4))));
+  // 窄屏只放 3 个日期，免得挤在一起
+  const xCount = width < 480 ? 3 : 5;
+  const xTicks =
+    n === 1 ? [0] : Array.from(new Set(Array.from({ length: xCount }, (_, k) => Math.round((k * (n - 1)) / (xCount - 1)))));
 
   // 遇到 null 断开，下一个有值的点重新起笔
   const path = (values: (number | null)[]) =>

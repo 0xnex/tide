@@ -106,15 +106,16 @@ function aboveAverage(closes: DailyClose[], i: number): boolean {
 }
 
 /**
- * The strategy's value, as a share price, over the `days` closes up to close day `lastDay`, scaled to be 1 on
- * that day: what a share would have been worth before the fund started at $1 (display only, simulated).
+ * The strategy's value, as a share price, from `days` closes before close day `anchorDay` to the last close,
+ * scaled to be 1 on `anchorDay`: what a share would have been worth around the fund's $1 start (display only,
+ * simulated). points[days] is the anchor; later points continue the simulation next to the actual fund.
  */
-export function simulatedSharePrice(closes: DailyClose[], lastDay: number, days: number): Point[] | null {
-  const end = closes.findIndex((c) => c.day === lastDay);
-  if (end < 0) return null;
-  const r = backtest(closes.slice(0, end + 1), days);
+export function simulatedSharePrice(closes: DailyClose[], anchorDay: number, days: number): Point[] | null {
+  const anchor = closes.findIndex((c) => c.day === anchorDay);
+  if (anchor < 0) return null;
+  const r = backtest(closes, closes.length - 1 - anchor + days);
   if (!r) return null;
-  const scale = r.points[r.points.length - 1].strategy;
+  const scale = r.points[days].strategy;
   return r.points.map((p) => ({ ...p, strategy: p.strategy / scale }));
 }
 

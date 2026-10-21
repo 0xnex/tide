@@ -125,11 +125,12 @@ export function SharePriceCard({ snap, spot, closes }: { snap: Snapshot; spot: n
             }`}
             extra={(i) => {
               const p = chart.rest[i - chart.launchIndex - 1];
-              if (p) return p.now ? `Estimated now, at BTC ${usd(p.btcUsd, 0)} (${basis!.source})` : `At the fixing price, BTC ${usd(p.btcUsd, 0)}`;
+              if (p) return p.now ? `Estimated now, at BTC ${usd(p.btcUsd, 0)} (${basis!.source})` : `Actual at the fixing price, BTC ${usd(p.btcUsd, 0)}`;
               if (i === chart.launchIndex && chart.launched) return "Launch: 1 share per USDC";
               return `Simulated, holding ${chart.bands[i] ? "BTC" : "USDC"}`;
             }}
           />
+          {chart.tracking && <Tracking {...chart.tracking} />}
         </>
       ) : points.length >= 2 ? (
         <LineChart
@@ -163,17 +164,45 @@ function joinedChart(snap: Snapshot, points: PricePoint[], closes: DailyClose[] 
   const launch = launched ? Math.min(...minted) : Math.floor(Date.now() / 86_400_000);
   const sim = simulatedSharePrice(closes, launch - 1, SIMULATED_DAYS);
   if (!sim) return null;
+  const before = sim.slice(0, SIMULATED_DAYS + 1);
+  // 开始之后模拟接着算，按定价日对上实际的点（现在的预估点不是定价，不比）
+  const after = new Map(sim.slice(SIMULATED_DAYS + 1).map((p) => [p.day + 1, p]));
   const rest = points.filter((p) => p.day > launch || p.now);
-  const launchIndex = sim.length - 1;
+  const simAt = (p: PricePoint) => (p.now ? undefined : after.get(p.day));
+  const launchIndex = before.length - 1;
+  // 实际和模拟的差：最近一次两者都有的定价
+  const last = [...rest].reverse().find((p) => simAt(p));
+  const tracking = last && { day: last.day, actual: last.price - 1, simulated: simAt(last)!.strategy - 1 };
   return {
-    days: [...sim.map((p) => p.day + 1), ...rest.map((p) => p.day)],
-    simulated: [...sim.map((p) => p.strategy), ...rest.map(() => null)],
-    actual: [...sim.map((_, i) => (launched && i === launchIndex ? 1 : null)), ...rest.map((p) => p.price)],
-    bands: [...sim.map((p) => p.inBtc), ...rest.map(() => false)],
+    days: [...before.map((p) => p.day + 1), ...rest.map((p) => p.day)],
+    simulated: [...before.map((p) => p.strategy), ...rest.map((p) => simAt(p)?.strategy ?? null)],
+    actual: [...before.map((_, i) => (launched && i === launchIndex ? 1 : null)), ...rest.map((p) => p.price)],
+    bands: [...before.map((p) => p.inBtc), ...rest.map((p) => simAt(p)?.inBtc ?? false)],
     launchIndex,
     launched,
     rest,
+    tracking,
   };
+}
+
+/** 开始以来实际和模拟的收益对比：差值大致是真实交易成本（手续费、滑点、分批交易）和回测假设的差别 */
+function Tracking({ day, actual, simulated }: { day: number; actual: number; simulated: number }) {
+  const gap = actual - simulated;
+  const flat = Math.abs(gap) < 0.0005;
+  return (
+    <div className="tracking">
+      <span className="stat-label">Since launch, to the {dateOf(day)} fixing</span>
+      <span>
+        Actual <strong>{pctChange(actual)}</strong>
+      </span>
+      <span>
+        Simulated <strong>{pctChange(simulated)}</strong>
+      </span>
+      <span className={`pill ${flat ? "pill-gray" : gap > 0 ? "pill-green" : "pill-red"}`}>
+        {flat ? "On track" : `${gap > 0 ? "+" : "−"}${Math.abs(gap * 100).toFixed(2)} pts vs simulated`}
+      </span>
+    </div>
+  );
 }
 
 /** 每份价格的历史变动：最上面是现在的预估，往下是每次定价 */

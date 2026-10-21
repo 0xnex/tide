@@ -918,10 +918,27 @@ tr:last-child td {
   background: var(--series-2);
 }
 
+.swatch.s3 {
+  background: var(--muted);
+}
+
 .swatch.line.dashed {
   background: none;
   border-top: 2px dashed var(--series-1);
   height: 0;
+}
+
+.swatch.line.s3.dashed {
+  border-top-color: var(--muted);
+}
+
+.chart .series.s3,
+.chart circle.s3 {
+  stroke: var(--muted);
+}
+
+.chart circle.s3 {
+  fill: var(--muted);
 }
 
 .chart .series.dashed {
@@ -1215,4 +1232,108 @@ td.num,
 
 .compare-extra {
   margin: 12px 0 16px;
+}
+
+/* 信号：BTC 现在离买入门槛多远 */
+.meter {
+  margin-bottom: 18px;
+}
+
+.meter-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 8px;
+}
+
+.meter-head .up {
+  color: var(--green);
+}
+
+.meter-head .down {
+  color: var(--red);
+}
+
+.meter-track {
+  position: relative;
+  display: flex;
+  height: 26px;
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.meter-side {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+}
+
+.meter-side.usdc {
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.meter-side.btc {
+  justify-content: flex-end;
+  background: var(--primary-weak);
+  color: var(--primary);
+}
+
+.meter-line {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--text);
+  opacity: 0.5;
+}
+
+.meter-dot {
+  position: absolute;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
+  border-radius: 50%;
+  border: 2px solid var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.meter-dot.up {
+  background: var(--green);
+}
+
+.meter-dot.down {
+  background: var(--red);
+}
+
+.meter-scale {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+/* 每份价格：开始以来实际和模拟的对比 */
+.tracking {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+  margin-top: 12px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tracking .stat-label {
+  margin-bottom: 0;
 }

@@ -28,8 +28,9 @@ import {
 import * as fmt from "./format";
 import { Backtest } from "./BacktestCard";
 import { SharePriceCard, pricingBasis, sharePrice } from "./SharePriceCard";
+import { SignalCard } from "./SignalCard";
 import { fetchDailyCloses, fetchSpot, type DailyClose, type Spot } from "./backtest";
-import { buyThreshold, nextFixTime } from "./signal";
+import { nextFixTime } from "./signal";
 import { Icon, type IconName } from "./icons";
 
 type Toast = { kind: "ok" | "error" | "busy"; text: string; sig?: string };
@@ -107,9 +108,10 @@ export function App() {
             <div className="grid">
               <div className="col-main">
                 <Overview snap={snap} spot={spot} />
+                <SignalCard snap={snap} spot={spot} now={now} />
                 <SharePriceCard snap={snap} spot={spot} closes={closes} />
                 <Backtest closes={closes} error={closesError} />
-                <Strategy snap={snap} now={now} spot={spot} />
+                <Strategy snap={snap} now={now} />
                 <Records records={snap.records} window={snap.fund.config.window} />
               </div>
               <div className="col-side">
@@ -216,18 +218,11 @@ function Overview({ snap, spot }: { snap: Snapshot; spot: number | null }) {
   );
 }
 
-/** 实时价格和门槛比较，比如 "$83,340, 0.3% below" */
-function spotVs(spot: number, threshold: bigint): string {
-  const gap = (spot * 1e6) / Number(threshold) - 1;
-  return `BTC $${spot.toLocaleString("en-US", { maximumFractionDigits: 0 })} (${gap > 0 ? "+" : "−"}${(Math.abs(gap) * 100).toFixed(1)}%)`;
-}
-
-function Strategy({ snap, now, spot }: { snap: Snapshot; now: number; spot: number | null }) {
+function Strategy({ snap, now }: { snap: Snapshot; now: number }) {
   const { fund, records } = snap;
   const cfg = fund.config;
   const s = fund.state;
   const nextFix = nextFixTime(fund, now);
-  const threshold = buyThreshold(fund, Math.floor(nextFix / DAY));
   const last = records[0];
   const pending = s.pending.slice(0, s.pendingCount).reduce((x: bigint, p: { usdc: BN }) => x + big(p.usdc), 0n);
   const today = Math.floor(now / DAY);
@@ -275,12 +270,6 @@ function Strategy({ snap, now, spot }: { snap: Snapshot; now: number; spot: numb
           }
         />
         <Stat icon="average" label={`${cfg.window}-day average`} value={ma > 0 ? fmt.price(last!.movingAverage) : "—"} />
-        <Stat
-          icon="target"
-          label="Buys cbBTC above"
-          value={threshold !== null ? fmt.price(threshold) : "—"}
-          sub={spot !== null && threshold !== null ? spotVs(spot, threshold) : undefined}
-        />
         <Stat icon="clock" label="Next fixing" value={fmt.countdown(nextFix - now)} sub={fmt.timeLabel(nextFix)} />
         <Stat icon="sync" label="Settlement" value={settlement} sub={left} />
         <Stat
