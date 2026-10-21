@@ -407,6 +407,11 @@ h3 {
   color: var(--amber);
 }
 
+.pill-red {
+  background: var(--red-weak);
+  color: var(--red);
+}
+
 .pill-gray {
   background: var(--surface-2);
   color: var(--muted);
@@ -913,6 +918,22 @@ tr:last-child td {
   background: var(--series-2);
 }
 
+.swatch.line.dashed {
+  background: none;
+  border-top: 2px dashed var(--series-1);
+  height: 0;
+}
+
+.chart .series.dashed {
+  stroke-dasharray: 5 4;
+}
+
+.chart .marker {
+  stroke: var(--muted);
+  stroke-width: 1;
+  stroke-dasharray: 2 3;
+}
+
 .swatch.band {
   width: 12px;
   height: 12px;
@@ -1117,4 +1138,81 @@ td.num,
   display: flex;
   flex-direction: column;
   font-size: 16px;
+}
+
+/* 回测：策略和持有 BTC 的对比条 */
+.compare {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 24px;
+  margin-bottom: 4px;
+}
+
+@media (max-width: 640px) {
+  .compare {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+}
+
+.compare-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.compare-head .stat-label {
+  margin-bottom: 0;
+}
+
+.cbar {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr) 64px;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  margin-top: 6px;
+}
+
+.cbar strong {
+  text-align: right;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+.cbar .up,
+.fit-table strong.up {
+  color: var(--green);
+}
+
+.cbar .down,
+.fit-table strong.down {
+  color: var(--red);
+}
+
+.cbar-track {
+  height: 10px;
+  background: var(--surface-2);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.cbar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+}
+
+.cbar-fill.s1 {
+  background: var(--series-1);
+}
+
+.cbar-fill.s2 {
+  background: var(--series-2);
+}
+
+.compare-extra {
+  margin: 12px 0 16px;
 }

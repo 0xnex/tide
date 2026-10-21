@@ -1,11 +1,13 @@
-// 折线图：一条或两条线共用一个纵轴，可选的背景带（比如持有 BTC 的日子），十字线和提示框（鼠标或方向键）。
+// 折线图：一条或两条线共用一个纵轴，可选的背景带（比如持有 BTC 的日子）、竖直标记线，十字线和提示框（鼠标或方向键）。
+// 一条线可以只覆盖一部分日期（其余是 null），比如模拟部分和实际部分各画一条。
 // 颜色用 .viz-root 里的 --series-1 / --series-2（参考调色板第 1、2 位，浅色和深色都校验过）。
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 export interface Series {
   label: string;
   className: "s1" | "s2";
-  values: number[];
+  values: (number | null)[]; // null：这一天没有这条线
+  dashed?: boolean;
 }
 
 interface Props {
@@ -18,6 +20,7 @@ interface Props {
   directLabel?: (s: Series, last: number) => string; // 右端的直接标签（宽度够时才显示）
   ariaLabel: string;
   extra?: (i: number) => ReactNode; // 提示框里额外的一行
+  marker?: { index: number; label: string }; // 在第 index 个点画一条竖线
 }
 
 const dateLabel = (day: number) =>
@@ -45,7 +48,13 @@ function useWidth() {
   return { ref, width };
 }
 
-export function LineChart({ days, series, bands, includeZero, format, tick, directLabel, ariaLabel, extra }: Props) {
+/** 最后一个有值的点 */
+function lastIndex(values: (number | null)[]): number {
+  for (let i = values.length - 1; i >= 0; i--) if (values[i] !== null) return i;
+  return -1;
+}
+
+export function LineChart({ days, series, bands, includeZero, format, tick, directLabel, ariaLabel, extra, marker }: Props) {
   const { ref, width } = useWidth();
   const [hover, setHover] = useState<number | null>(null);
   const n = days.length;
@@ -56,7 +65,7 @@ export function LineChart({ days, series, bands, includeZero, format, tick, dire
   const w = width - m.left - m.right;
   const h = height - m.top - m.bottom;
 
-  const all = series.flatMap((s) => s.values);
+  const all = series.flatMap((s) => s.values).filter((v): v is number => v !== null);
   let lo = Math.min(...all, ...(includeZero ? [0] : []));
   let hi = Math.max(...all, ...(includeZero ? [0] : []));
   if (hi - lo < 1e-12) {
@@ -72,7 +81,12 @@ export function LineChart({ days, series, bands, includeZero, format, tick, dire
   for (let v = lo; v <= hi + step / 2; v += step) yTicks.push(v);
   const xTicks = n === 1 ? [0] : Array.from(new Set(Array.from({ length: 5 }, (_, k) => Math.round((k * (n - 1)) / 4))));
 
-  const path = (values: number[]) => values.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join("");
+  // 遇到 null 断开，下一个有值的点重新起笔
+  const path = (values: (number | null)[]) =>
+    values
+      .map((v, i) => (v === null ? "" : `${i && values[i - 1] !== null ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`))
+      .join("");
+  const ends = series.map((s) => lastIndex(s.values));
 
   const runs: [number, number][] = [];
   if (bands) {
@@ -85,7 +99,7 @@ export function LineChart({ days, series, bands, includeZero, format, tick, dire
   }
 
   // 两个直接标签太近时上下推开
-  const labelY = series.map((s) => y(s.values[n - 1]));
+  const labelY = series.map((s, k) => y(s.values[ends[k]] ?? 0));
   if (labelY.length === 2 && Math.abs(labelY[0] - labelY[1]) < 16) {
     const mid = (labelY[0] + labelY[1]) / 2;
     const up = labelY[0] <= labelY[1] ? -8 : 8;
@@ -146,37 +160,55 @@ export function LineChart({ days, series, bands, includeZero, format, tick, dire
             {dateLabel(days[i])}
           </text>
         ))}
-        {drawOrder.map((s) => (
-          <path key={s.label} className={`series ${s.className}`} d={path(s.values)} />
-        ))}
-        {drawOrder.map((s) => (
-          <circle key={s.label} className={`end ${s.className}`} cx={x(n - 1)} cy={y(s.values[n - 1])} r={4} />
-        ))}
-        {showDirect &&
-          series.map((s, k) => (
-            <text key={s.label} className="direct" x={x(n - 1) + 10} y={labelY[k]} dominantBaseline="middle">
-              {directLabel!(s, s.values[n - 1])}
+        {marker && (
+          <g>
+            <line className="marker" x1={x(marker.index)} x2={x(marker.index)} y1={m.top} y2={m.top + h} />
+            <text className="tick" x={x(marker.index) - 4} y={m.top + 10} textAnchor="end">
+              {marker.label}
             </text>
-          ))}
+          </g>
+        )}
+        {drawOrder.map((s) => (
+          <path key={s.label} className={`series ${s.className}${s.dashed ? " dashed" : ""}`} d={path(s.values)} />
+        ))}
+        {series.map(
+          (s, k) =>
+            ends[k] >= 0 && <circle key={s.label} className={`end ${s.className}`} cx={x(ends[k])} cy={y(s.values[ends[k]]!)} r={4} />,
+        )}
+        {showDirect &&
+          series.map(
+            (s, k) =>
+              ends[k] >= 0 && (
+                <text key={s.label} className="direct" x={x(ends[k]) + 10} y={labelY[k]} dominantBaseline="middle">
+                  {directLabel!(s, s.values[ends[k]]!)}
+                </text>
+              ),
+          )}
         {hover !== null && (
           <g>
             <line className="crosshair" x1={x(hover)} x2={x(hover)} y1={m.top} y2={m.top + h} />
-            {drawOrder.map((s) => (
-              <circle key={s.label} className={`dot ${s.className}`} cx={x(hover)} cy={y(s.values[hover])} r={4} />
-            ))}
+            {drawOrder.map((s) => {
+              const v = s.values[hover];
+              return v !== null && <circle key={s.label} className={`dot ${s.className}`} cx={x(hover)} cy={y(v)} r={4} />;
+            })}
           </g>
         )}
       </svg>
       {hover !== null && (
         <div className="tooltip" style={{ left: Math.min(Math.max(x(hover) + 12, 0), width - 190), top: m.top }} role="status">
           <div className="tooltip-date">{fullDate(days[hover])}</div>
-          {series.map((s) => (
-            <div key={s.label} className="tooltip-row">
-              <span className={`swatch line ${s.className}`} />
-              <strong>{format(s.values[hover])}</strong>
-              <span className="muted">{s.label}</span>
-            </div>
-          ))}
+          {series.map((s) => {
+            const v = s.values[hover];
+            return (
+              v !== null && (
+                <div key={s.label} className="tooltip-row">
+                  <span className={`swatch line ${s.className}${s.dashed ? " dashed" : ""}`} />
+                  <strong>{format(v)}</strong>
+                  <span className="muted">{s.label}</span>
+                </div>
+              )
+            );
+          })}
           {extra && <div className="tooltip-row muted">{extra(hover)}</div>}
         </div>
       )}

@@ -1,10 +1,12 @@
 // 每份价格：(USDC + cbBTC × BTC 价格) ÷ 份额，只用来显示（基金本身从不按美元估值）。
 // 历史点用每次定价记录里定价时（当天申购赎回之前）的资产和份额，价格用那次定价的 Pyth 价格；
 // 最后一个点用现在的资产和实时 BTC 价格。
+// 开始之前的部分用回测模拟（虚线），缩放到开始那天正好 1 美元，和实际部分接上。
 import { useState } from "react";
 import { BN } from "@coral-xyz/anchor";
 import { LineChart } from "./LineChart";
 import type { Snapshot } from "./chain";
+import { simulatedSharePrice, type DailyClose } from "./backtest";
 
 const big = (x: BN) => BigInt(x.toString());
 
@@ -33,7 +35,10 @@ interface PricePoint {
   now: boolean;
 }
 
-export function SharePriceCard({ snap, spot }: { snap: Snapshot; spot: number | null }) {
+/** 模拟部分覆盖开始前多少天 */
+const SIMULATED_DAYS = 365;
+
+export function SharePriceCard({ snap, spot, closes }: { snap: Snapshot; spot: number | null; closes: DailyClose[] | null }) {
   const s = snap.fund.state;
   const basis = pricingBasis(snap, spot);
   const history: PricePoint[] = [...snap.records]
@@ -50,6 +55,7 @@ export function SharePriceCard({ snap, spot }: { snap: Snapshot; spot: number | 
     current !== null && basis
       ? [...history, { day: Math.floor(Date.now() / 86_400_000), price: current, btcUsd: basis.btcUsd, now: true }]
       : history;
+  const chart = joinedChart(snap, points, closes);
   const first = points[0];
   const change = first && current !== null && points.length > 1 ? current / first.price - 1 : null;
   // 预估的组成：每份对应的 cbBTC 和 USDC
@@ -89,7 +95,43 @@ export function SharePriceCard({ snap, spot }: { snap: Snapshot; spot: number | 
         </div>
       )}
 
-      {points.length >= 2 ? (
+      {chart ? (
+        <>
+          <div className="legend">
+            {chart.launched && (
+              <span className="legend-item">
+                <span className="swatch line s1" /> Actual
+              </span>
+            )}
+            <span className="legend-item">
+              <span className="swatch line s1 dashed" /> Simulated (backtest)
+            </span>
+            <span className="legend-item">
+              <span className="swatch band" /> Holding BTC (simulated)
+            </span>
+          </div>
+          <LineChart
+            days={chart.days}
+            series={[
+              { label: "Actual", className: "s1", values: chart.actual },
+              { label: "Simulated", className: "s1", values: chart.simulated, dashed: true },
+            ]}
+            bands={chart.bands}
+            marker={{ index: chart.launchIndex, label: chart.launched ? "Launch" : "Today" }}
+            format={(v) => usd(v)}
+            tick={(v, step) => usd(v, step < 0.001 ? 4 : step < 0.01 ? 3 : 2)}
+            ariaLabel={`Simulated share price before the fund started, then the actual share price, now ${
+              current !== null ? usd(current) : "not available"
+            }`}
+            extra={(i) => {
+              const p = chart.rest[i - chart.launchIndex - 1];
+              if (p) return p.now ? `Estimated now, at BTC ${usd(p.btcUsd, 0)} (${basis!.source})` : `At the fixing price, BTC ${usd(p.btcUsd, 0)}`;
+              if (i === chart.launchIndex && chart.launched) return "Launch: 1 share per USDC";
+              return `Simulated, holding ${chart.bands[i] ? "BTC" : "USDC"}`;
+            }}
+          />
+        </>
+      ) : points.length >= 2 ? (
         <LineChart
           days={points.map((p) => p.day)}
           series={[{ label: "Share price", className: "s1", values: points.map((p) => p.price) }]}
@@ -107,6 +149,31 @@ export function SharePriceCard({ snap, spot }: { snap: Snapshot; spot: number | 
       {points.length > 0 && <History points={points} />}
     </section>
   );
+}
+
+/**
+ * 模拟部分接实际部分的数据。开始那天是第一次按 1 美元一份发出份额的定价（还没有份额时就是今天）：
+ * 回测里第 D 天的收盘价对应第 D+1 天的定价，所以模拟到开始前一天的收盘为止，正好落在开始那天、值为 1。
+ * 收盘价还没取到时返回 null。
+ */
+function joinedChart(snap: Snapshot, points: PricePoint[], closes: DailyClose[] | null) {
+  if (!closes) return null;
+  const minted = snap.records.filter((r) => !r.mintedShares.isZero()).map((r) => r.epoch.toNumber());
+  const launched = minted.length > 0;
+  const launch = launched ? Math.min(...minted) : Math.floor(Date.now() / 86_400_000);
+  const sim = simulatedSharePrice(closes, launch - 1, SIMULATED_DAYS);
+  if (!sim) return null;
+  const rest = points.filter((p) => p.day > launch || p.now);
+  const launchIndex = sim.length - 1;
+  return {
+    days: [...sim.map((p) => p.day + 1), ...rest.map((p) => p.day)],
+    simulated: [...sim.map((p) => p.strategy), ...rest.map(() => null)],
+    actual: [...sim.map((_, i) => (launched && i === launchIndex ? 1 : null)), ...rest.map((p) => p.price)],
+    bands: [...sim.map((p) => p.inBtc), ...rest.map(() => false)],
+    launchIndex,
+    launched,
+    rest,
+  };
 }
 
 /** 每份价格的历史变动：最上面是现在的预估，往下是每次定价 */

@@ -28,7 +28,7 @@ import {
 import * as fmt from "./format";
 import { Backtest } from "./BacktestCard";
 import { SharePriceCard, pricingBasis, sharePrice } from "./SharePriceCard";
-import { fetchSpot, type Spot } from "./backtest";
+import { fetchDailyCloses, fetchSpot, type DailyClose, type Spot } from "./backtest";
 import { buyThreshold, nextFixTime } from "./signal";
 import { Icon, type IconName } from "./icons";
 
@@ -46,6 +46,14 @@ export function App() {
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
   const [spotStats, setSpotStats] = useState<Spot | null>(null); // 实时 BTC 价格，只用来显示
   const spot = spotStats?.price ?? null;
+  // 每日收盘价：回测和每份价格的模拟部分共用
+  const [closes, setCloses] = useState<DailyClose[] | null>(null);
+  const [closesError, setClosesError] = useState<string | null>(null);
+  useEffect(() => {
+    fetchDailyCloses()
+      .then(setCloses)
+      .catch((e) => setClosesError(String(e?.message ?? e)));
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -99,8 +107,8 @@ export function App() {
             <div className="grid">
               <div className="col-main">
                 <Overview snap={snap} spot={spot} />
-                <SharePriceCard snap={snap} spot={spot} />
-                <Backtest />
+                <SharePriceCard snap={snap} spot={spot} closes={closes} />
+                <Backtest closes={closes} error={closesError} />
                 <Strategy snap={snap} now={now} spot={spot} />
                 <Records records={snap.records} window={snap.fund.config.window} />
               </div>

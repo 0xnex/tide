@@ -1,27 +1,15 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { LineChart } from "./LineChart";
-import {
-  SWITCH_COST_BPS,
-  WINDOWS,
-  backtest,
-  fetchDailyCloses,
-  type DailyClose,
-  type Result,
-  type WindowKey,
-} from "./backtest";
+import { SWITCH_COST_BPS, WINDOWS, backtest, type DailyClose, type Result, type WindowKey } from "./backtest";
 
 const pct = (x: number, digits = 1) => `${x >= 0 ? "+" : ""}${(x * 100).toFixed(digits)}%`;
+/** 两个比例之差，按百分点；四舍五入后是 0 的不带正负号 */
+const pts = (x: number) => (Math.abs(x) < 0.0005 ? "0.0 pts" : `${x > 0 ? "+" : "−"}${Math.abs(x * 100).toFixed(1)} pts`);
+/** 差值的颜色：策略更好是绿色，更差是红色，差不多是灰色 */
+const tone = (x: number) => (Math.abs(x) < 0.0005 ? "muted" : x > 0 ? "up" : "down");
 
-export function Backtest() {
-  const [closes, setCloses] = useState<DailyClose[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
+export function Backtest({ closes, error }: { closes: DailyClose[] | null; error: string | null }) {
   const [key, setKey] = useState<WindowKey>("1Y");
-
-  useEffect(() => {
-    fetchDailyCloses()
-      .then(setCloses)
-      .catch((e) => setError(String(e?.message ?? e)));
-  }, []);
 
   const results = useMemo(() => {
     if (!closes) return null;
@@ -54,13 +42,34 @@ export function Backtest() {
       {!error && !result && <p className="muted">Loading price history…</p>}
       {result && (
         <>
-          <div className="stats five">
-            <Stat label="Strategy" value={pct(result.strategyReturn)} tone={result.strategyReturn >= 0 ? "up" : "down"} />
-            <Stat label="Buy & hold BTC" value={pct(result.holdReturn)} tone={result.holdReturn >= 0 ? "up" : "down"} />
-            <Stat label="Max drawdown" value={`${pct(result.strategyDrawdown)} vs ${pct(result.holdDrawdown)}`} small />
-            <Stat label="Switches" value={String(result.switches)} />
-            <Stat label="Time in BTC" value={`${Math.round(result.timeInBtc * 100)}%`} />
+          <div className="compare">
+            <Compare
+              label="Return"
+              strategy={result.strategyReturn}
+              hold={result.holdReturn}
+              diff={result.strategyReturn - result.holdReturn}
+              badge={`${pts(result.strategyReturn - result.holdReturn)} vs hold`}
+            />
+            <Compare
+              label="Max drawdown"
+              strategy={result.strategyDrawdown}
+              hold={result.holdDrawdown}
+              // 回撤是负数：策略的数更大就是回撤更浅
+              diff={result.strategyDrawdown - result.holdDrawdown}
+              badge={
+                tone(result.strategyDrawdown - result.holdDrawdown) === "muted"
+                  ? "Same as hold"
+                  : `${Math.abs((result.strategyDrawdown - result.holdDrawdown) * 100).toFixed(1)} pts ${
+                      result.strategyDrawdown > result.holdDrawdown ? "shallower" : "deeper"
+                    }`
+              }
+            />
           </div>
+          <div className="mini-stats compare-extra">
+            <span>Switches {result.switches}</span>
+            <span>Time in BTC {Math.round(result.timeInBtc * 100)}%</span>
+          </div>
+
           <div className="legend">
             <span className="legend-item">
               <span className="swatch line s1" /> Strategy
@@ -86,6 +95,7 @@ export function Backtest() {
             ariaLabel={`Return of the strategy (${pct(result.strategyReturn)}) and of holding BTC (${pct(result.holdReturn)}) over the period`}
             extra={(i) => `Holding ${result.points[i].inBtc ? "BTC" : "USDC"}`}
           />
+
           <SummaryTable results={results!} />
           <p className="muted small note">
             Coinbase daily closes · {SWITCH_COST_BPS / 100}% per switch · excludes the 1% withdrawal fee · Past results do
@@ -97,11 +107,26 @@ export function Backtest() {
   );
 }
 
-function Stat({ label, value, tone, small }: { label: string; value: string; tone?: "up" | "down"; small?: boolean }) {
+/** 策略和持有 BTC 的一项指标：两根横条，长度按绝对值，标签写出差多少 */
+function Compare({ label, strategy, hold, diff, badge }: { label: string; strategy: number; hold: number; diff: number; badge: string }) {
+  const scale = Math.max(Math.abs(strategy), Math.abs(hold)) || 1;
+  const bar = (name: string, cls: "s1" | "s2", v: number) => (
+    <div className="cbar">
+      <span className="muted">{name}</span>
+      <span className="cbar-track">
+        <span className={`cbar-fill ${cls}`} style={{ width: `${(Math.abs(v) / scale) * 100}%` }} />
+      </span>
+      <strong className={v >= 0 ? "up" : "down"}>{pct(v)}</strong>
+    </div>
+  );
   return (
-    <div className="stat">
-      <div className="stat-label">{label}</div>
-      <div className={`stat-value ${small ? "stat-small" : ""} ${tone ?? ""}`}>{value}</div>
+    <div>
+      <div className="compare-head">
+        <span className="stat-label">{label}</span>
+        <span className={`pill ${{ up: "pill-green", down: "pill-red", muted: "pill-gray" }[tone(diff)]}`}>{badge}</span>
+      </div>
+      {bar("Strategy", "s1", strategy)}
+      {bar("Hold BTC", "s2", hold)}
     </div>
   );
 }
@@ -109,34 +134,42 @@ function Stat({ label, value, tone, small }: { label: string; value: string; ton
 function SummaryTable({ results }: { results: Record<WindowKey, Result | null> }) {
   return (
     <table className="fit-table summary">
-        <thead>
-          <tr>
-            <th>Period</th>
-            <th className="num">Strategy</th>
-            <th className="num">Buy & hold</th>
-            <th className="num">Drawdown</th>
-            <th className="num hide-sm">Switches</th>
-            <th className="num hide-sm">In BTC</th>
-          </tr>
-        </thead>
-        <tbody>
-          {WINDOWS.map((w) => {
-            const r = results[w.key];
-            if (!r) return null;
-            return (
-              <tr key={w.key}>
-                <td>{w.key}</td>
-                <td className="num">{pct(r.strategyReturn)}</td>
-                <td className="num">{pct(r.holdReturn)}</td>
-                <td className="num">
-                  {pct(r.strategyDrawdown)} / {pct(r.holdDrawdown)}
-                </td>
-                <td className="num hide-sm">{r.switches}</td>
-                <td className="num hide-sm">{Math.round(r.timeInBtc * 100)}%</td>
-              </tr>
-            );
-          })}
-        </tbody>
+      <thead>
+        <tr>
+          <th>Period</th>
+          <th className="num">Return vs hold</th>
+          <th className="num">Drawdown vs hold</th>
+          <th className="num hide-sm">Switches</th>
+          <th className="num hide-sm">In BTC</th>
+        </tr>
+      </thead>
+      <tbody>
+        {WINDOWS.map((w) => {
+          const r = results[w.key];
+          if (!r) return null;
+          const ret = r.strategyReturn - r.holdReturn;
+          const dd = r.strategyDrawdown - r.holdDrawdown;
+          return (
+            <tr key={w.key}>
+              <td>{w.key}</td>
+              <td className="num">
+                <strong className={tone(ret)}>{pts(ret)}</strong>
+                <div className="muted small">
+                  {pct(r.strategyReturn)} vs {pct(r.holdReturn)}
+                </div>
+              </td>
+              <td className="num">
+                <strong className={tone(dd)}>{pts(dd)}</strong>
+                <div className="muted small">
+                  {pct(r.strategyDrawdown)} vs {pct(r.holdDrawdown)}
+                </div>
+              </td>
+              <td className="num hide-sm">{r.switches}</td>
+              <td className="num hide-sm">{Math.round(r.timeInBtc * 100)}%</td>
+            </tr>
+          );
+        })}
+      </tbody>
     </table>
   );
 }
