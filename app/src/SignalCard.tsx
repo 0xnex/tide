@@ -94,7 +94,7 @@ function SwitchMeter({ spot, threshold }: { spot: number; threshold: number }) {
           <strong>{usd(threshold)}</strong>
         </span>
         <span className={above ? "up" : "down"}>
-          BTC {usd(spot)} · <strong>{signedPct(gap)}</strong>
+          BTC {usd(spot)} · <strong>{Math.abs(gap * 100).toFixed(1)}%</strong> {above ? "above" : "below"} the buy line
         </span>
       </div>
       <div className="meter-track" role="img" aria-label={`BTC now is ${signedPct(gap)} from the buy line`}>

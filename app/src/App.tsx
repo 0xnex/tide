@@ -151,7 +151,7 @@ function Header({ spot }: { spot: Spot | null }) {
               <span className="muted">BTC</span> ${spot.price.toLocaleString("en-US", { maximumFractionDigits: 0 })}
               {spot.change24h !== null && (
                 <span className={`delta ${spot.change24h >= 0 ? "up" : "down"}`}>
-                  {spot.change24h >= 0 ? "▲" : "▼"} {Math.abs(spot.change24h * 100).toFixed(2)}%
+                  {spot.change24h >= 0 ? "▲" : "▼"} {Math.abs(spot.change24h * 100).toFixed(2)}% <span className="muted">24h</span>
                 </span>
               )}
             </span>
