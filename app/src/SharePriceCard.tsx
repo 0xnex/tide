@@ -105,7 +105,7 @@ export function SharePriceCard({ snap, spot, closes }: { snap: Snapshot; spot: n
               </span>
             )}
             <span className="legend-item">
-              <span className="swatch line s1 dashed" /> Simulated (backtest)
+              <span className="swatch line s1 dashed" /> Simulated (past prices)
             </span>
             <span className="legend-item">
               <span className="swatch band" /> Holding BTC (simulated)

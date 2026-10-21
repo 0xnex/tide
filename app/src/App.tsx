@@ -108,11 +108,10 @@ export function App() {
             <VaultHero snap={snap} />
             <div className="grid">
               <div className="col-main">
-                <Overview snap={snap} spot={spot} />
+                <Overview snap={snap} spot={spot} now={now} />
                 <SignalCard snap={snap} spot={spot} now={now} />
                 <SharePriceCard snap={snap} spot={spot} closes={closes} />
                 <Backtest closes={closes} error={closesError} />
-                <Strategy snap={snap} now={now} />
                 <Records records={snap.records} window={snap.fund.config.window} />
               </div>
               <div className="col-side">
@@ -186,21 +185,47 @@ function VaultHero({ snap }: { snap: Snapshot }) {
   );
 }
 
-function Overview({ snap, spot }: { snap: Snapshot; spot: number | null }) {
-  const s = snap.fund.state;
+function Overview({ snap, spot, now }: { snap: Snapshot; spot: number | null; now: number }) {
+  const { fund } = snap;
+  const cfg = fund.config;
+  const s = fund.state;
   const basis = pricingBasis(snap, spot);
   // display only: the fund itself is never valued in USD
   const usdc = fundUsdc(snap); // 含借出的
   const total = basis ? Number(usdc) / 1e6 + (Number(big(s.btc)) / 1e8) * basis.btcUsd : null;
   const price = basis ? sharePrice(usdc, big(s.btc), big(s.shareSupply), basis.btcUsd) : null;
   // queued and partly filled subscriptions: still the subscribers' USDC, not fund assets
-  const waiting =
-    big(s.queuedSubscriptionUsdc) +
-    big(s.nextSubscriptionUsdc) +
-    s.pending.slice(0, s.pendingCount).reduce((x: bigint, p: { usdc: BN }) => x + big(p.usdc), 0n);
+  const pending = s.pending.slice(0, s.pendingCount).reduce((x: bigint, p: { usdc: BN }) => x + big(p.usdc), 0n);
+  const waiting = big(s.queuedSubscriptionUsdc) + big(s.nextSubscriptionUsdc) + pending;
+  const cap = big(cfg.subscriptionCapUsdc);
+  const capPct = cap > 0n ? Number((waiting * 10_000n) / cap) / 100 : 0;
+  const nextFix = nextFixTime(fund, now);
+  const today = Math.floor(now / DAY);
+  const todayFix = today * DAY + cfg.settleOffsetSecs.toNumber();
+  // 结算每天定价后几分钟内由定时任务运行；过了一小时还没定价就是出了问题
+  const overdue = now > todayFix + 3600 && s.lastFixDay.toNumber() < today;
+  // 还要交易的量：目标 cbBTC 时 USDC 还没买完，目标 USDC 时 cbBTC 还没卖完（不到 1 USDC / 1 聪的尘埃不算）
+  const toBuy = s.targetBtc ? usdc + pending : 0n;
+  const toSell = s.targetBtc ? 0n : big(s.btc);
+  const rebalancing = toBuy >= 1_000_000n || toSell > 0n || s.sliceCount > 0;
+  const settlement = overdue ? (
+    <span className="pill pill-amber">Not fixed yet</span>
+  ) : rebalancing ? (
+    <span className="pill pill-amber">Trading</span>
+  ) : (
+    <span className="pill pill-green">Done</span>
+  );
+  const left = rebalancing
+    ? [
+        s.sliceCount > 0 && `${s.sliceCount} slice${s.sliceCount > 1 ? "s" : ""} selling`,
+        toBuy > 0n ? `${fmt.usdc(toBuy)} USDC to buy` : toSell > 0n ? `${fmt.btc(toSell)} cbBTC to sell` : "",
+      ]
+        .filter(Boolean)
+        .join(", ")
+    : undefined;
   return (
     <section className="card">
-      <div className="stats five">
+      <div className="stats eight">
         <Stat icon="tag" label="Share price" value={price !== null ? `$${price.toFixed(4)}` : "$1.0000"} sub="estimate" />
         <Stat
           icon="wallet"
@@ -227,84 +252,23 @@ function Overview({ snap, spot }: { snap: Snapshot; spot: number | null }) {
           label="Holds"
           value={<span className={`pill ${s.targetBtc ? "pill-blue" : "pill-gray"}`}>{s.targetBtc ? "cbBTC" : "USDC"}</span>}
         />
-      </div>
-    </section>
-  );
-}
-
-function Strategy({ snap, now }: { snap: Snapshot; now: number }) {
-  const { fund, records } = snap;
-  const cfg = fund.config;
-  const s = fund.state;
-  const nextFix = nextFixTime(fund, now);
-  const last = records[0];
-  const pending = s.pending.slice(0, s.pendingCount).reduce((x: bigint, p: { usdc: BN }) => x + big(p.usdc), 0n);
-  const today = Math.floor(now / DAY);
-  const todayFix = today * DAY + cfg.settleOffsetSecs.toNumber();
-  // 结算每天定价后几分钟内由定时任务运行；过了一小时还没定价就是出了问题
-  const overdue = now > todayFix + 3600 && s.lastFixDay.toNumber() < today;
-  // 还要交易的量：目标 cbBTC 时 USDC 还没买完，目标 USDC 时 cbBTC 还没卖完（不到 1 USDC / 1 聪的尘埃不算）
-  const toBuy = s.targetBtc ? fundUsdc(snap) + pending : 0n;
-  const toSell = s.targetBtc ? 0n : big(s.btc);
-  const rebalancing = toBuy >= 1_000_000n || toSell > 0n || s.sliceCount > 0;
-  const outstanding = big(s.queuedSubscriptionUsdc) + big(s.nextSubscriptionUsdc) + pending;
-  const cap = big(cfg.subscriptionCapUsdc);
-  const capPct = cap > 0n ? Number((outstanding * 10_000n) / cap) / 100 : 0;
-  const signal = last ? Number(big(last.signalPrice)) : 0;
-  const ma = last ? Number(big(last.movingAverage)) : 0;
-  const settlement = overdue ? (
-    <span className="pill pill-amber">Not fixed yet</span>
-  ) : rebalancing ? (
-    <span className="pill pill-amber">Trading</span>
-  ) : (
-    <span className="pill pill-green">Done</span>
-  );
-  const left = rebalancing
-    ? [
-        s.sliceCount > 0 && `${s.sliceCount} slice${s.sliceCount > 1 ? "s" : ""} selling`,
-        toBuy > 0n ? `${fmt.usdc(toBuy)} USDC to buy` : toSell > 0n ? `${fmt.btc(toSell)} cbBTC to sell` : "",
-      ]
-        .filter(Boolean)
-        .join(", ")
-    : undefined;
-  return (
-    <section className="card">
-      <h2>Fund status</h2>
-      <div className="stats three">
-        <Stat
-          icon="chart"
-          label={last ? `Fixing ${fmt.dayLabel(last.epoch.toNumber()).slice(5)}` : "Last fixing"}
-          value={last ? fmt.price(last.signalPrice) : "—"}
-          sub={
-            ma > 0 && (
-              <span className={`delta ${signal > ma ? "up" : "down"}`}>
-                {signal > ma ? "▲" : "▼"} {Math.abs(((signal - ma) / ma) * 100).toFixed(2)}% vs average
-              </span>
-            )
-          }
-        />
-        <Stat icon="average" label={`${cfg.window}-day average`} value={ma > 0 ? fmt.price(last!.movingAverage) : "—"} />
         <Stat icon="clock" label="Next fixing" value={fmt.countdown(nextFix - now)} sub={fmt.timeLabel(nextFix)} />
         <Stat icon="sync" label="Settlement" value={settlement} sub={left} />
         <Stat
           icon="gauge"
           label="Subscription cap"
-          value={`${capPct.toFixed(1)}%`}
+          value={
+            s.subscriptionsPaused ? <span className="pill pill-amber">Paused</span> : `${capPct.toFixed(1)}%`
+          }
           sub={
             <>
-              {fmt.usdc(outstanding)} / {fmt.usdc(cap)} USDC
+              {fmt.usdc(waiting)} / {fmt.usdc(cap)} USDC
               <div className="bar">
                 <div className="bar-fill" style={{ width: `${Math.min(capPct, 100)}%` }} />
               </div>
             </>
           }
         />
-      </div>
-      <div className="mini-stats">
-        {s.subscriptionsPaused && <span className="pill pill-amber">Subscriptions paused</span>}
-        <span>Unsold slices {s.sliceCount}</span>
-        <span>Pending subscriptions {s.pendingCount}</span>
-        <span>Fees owed {fmt.usdc(s.feesOwed)} USDC</span>
       </div>
     </section>
   );

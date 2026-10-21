@@ -21,7 +21,8 @@ export function Backtest({ closes, error }: { closes: DailyClose[] | null; error
     <section className="card viz-root">
       <div className="card-head">
         <div>
-          <h2>Backtest</h2>
+          <h2>Strategy vs holding BTC</h2>
+          <p className="muted small">The fund's rule, simulated on past prices</p>
         </div>
         <div className="segmented" role="tablist" aria-label="Time range">
           {WINDOWS.map((w) => (
