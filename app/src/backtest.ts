@@ -67,8 +67,9 @@ export async function fetchDailyCloses(days = 600): Promise<DailyClose[]> {
 async function fromCoinbase(days: number): Promise<DailyClose[]> {
   const out = new Map<number, number>();
   const now = Math.floor(Date.now() / 1000);
-  // Coinbase returns at most 300 candles per request
-  for (let end = now; out.size < days && end > now - (days + 300) * 86_400; end -= 300 * 86_400) {
+  // Coinbase returns at most 300 candles per request. Each request ends where the previous one starts, so the
+  // candle on the boundary is never skipped (the map drops the duplicate).
+  for (let end = now; out.size < days && end > now - (days + 300) * 86_400; end -= 299 * 86_400) {
     const start = end - 299 * 86_400;
     const url = `https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400&start=${new Date(start * 1000).toISOString()}&end=${new Date(end * 1000).toISOString()}`;
     const r = await fetch(url);
