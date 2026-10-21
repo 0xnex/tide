@@ -32,7 +32,7 @@ import { SharePriceCard, pricingBasis, sharePrice } from "./SharePriceCard";
 import { SignalCard } from "./SignalCard";
 import { fetchDailyCloses, fetchSpot, type DailyClose, type Spot } from "./backtest";
 import { nextFixTime } from "./signal";
-import { Icon, type IconName } from "./icons";
+import { Icon, Logo, type IconName } from "./icons";
 
 type Toast = { kind: "ok" | "error" | "busy"; text: string; sig?: string };
 
@@ -139,10 +139,7 @@ function Header({ spot }: { spot: Spot | null }) {
     <header className="header">
       <div className="container header-inner">
         <div className="brand">
-          <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M2 14c3-4 6-4 9 0s6 4 9 0" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" />
-            <path d="M2 8c3-4 6-4 9 0s6 4 9 0" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" opacity=".45" />
-          </svg>
+          <Logo size={26} />
           <span>Tide</span>
         </div>
         <nav className="nav">
@@ -172,7 +169,7 @@ function VaultHero({ snap }: { snap: Snapshot }) {
   return (
     <section className="hero">
       <div className="hero-title">
-        <div className="token-icon">₿</div>
+        <Logo size={48} />
         <h1>Tide BTC Trend</h1>
       </div>
       <div className="tags">

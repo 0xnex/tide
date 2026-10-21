@@ -157,6 +157,20 @@ h3 {
   font-size: 14px !important;
   font-weight: 600 !important;
   padding: 0 16px !important;
+  white-space: nowrap;
+}
+
+/* 窄手机上放不下全部：去掉页头的 BTC 价格（信号卡片里也有），按钮窄一点 */
+@media (max-width: 440px) {
+  .header-right {
+    gap: 8px;
+  }
+  .header-right .btc-price {
+    display: none;
+  }
+  .wallet-adapter-button {
+    padding: 0 12px !important;
+  }
 }
 
 .wallet-adapter-button:not([disabled]):hover {
@@ -178,16 +192,7 @@ h3 {
   margin: 4px 0 0;
 }
 
-.token-icon {
-  width: 48px;
-  height: 48px;
-  border-radius: 50%;
-  background: #f7931a;
-  color: #fff;
-  display: grid;
-  place-items: center;
-  font-size: 24px;
-  font-weight: 700;
+.logo {
   flex-shrink: 0;
 }
 
