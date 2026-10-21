@@ -1203,16 +1203,27 @@ td.num,
 }
 
 .cbar-track {
+  position: relative;
   height: 10px;
   background: var(--surface-2);
   border-radius: 999px;
-  overflow: hidden;
 }
 
 .cbar-fill {
-  display: block;
+  position: absolute;
+  top: 0;
   height: 100%;
   border-radius: 999px;
+}
+
+/* 0 线：横条从这里向右（正）或向左（负）画 */
+.cbar-zero {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--muted);
 }
 
 .cbar-fill.s1 {

@@ -108,14 +108,21 @@ export function Backtest({ closes, error }: { closes: DailyClose[] | null; error
   );
 }
 
-/** 策略和持有 BTC 的一项指标：两根横条，长度按绝对值，标签写出差多少 */
+/**
+ * 策略和持有 BTC 的一项指标：两根横条从 0 线画出，正数向右、负数向左，标签写出差多少。
+ * 长度按绝对值、都从左边画的话，亏得多的横条反而更长，看起来像更好。
+ */
 function Compare({ label, strategy, hold, diff, badge }: { label: string; strategy: number; hold: number; diff: number; badge: string }) {
-  const scale = Math.max(Math.abs(strategy), Math.abs(hold)) || 1;
+  const lo = Math.min(0, strategy, hold);
+  const hi = Math.max(0, strategy, hold);
+  const span = hi - lo || 1;
+  const at = (v: number) => ((v - lo) / span) * 100; // 数值在横条上的位置（%）
   const bar = (name: string, cls: "s1" | "s2", v: number) => (
     <div className="cbar">
       <span className="muted">{name}</span>
       <span className="cbar-track">
-        <span className={`cbar-fill ${cls}`} style={{ width: `${(Math.abs(v) / scale) * 100}%` }} />
+        <span className={`cbar-fill ${cls}`} style={{ left: `${at(Math.min(v, 0))}%`, width: `${(Math.abs(v) / span) * 100}%` }} />
+        <span className="cbar-zero" style={{ left: `${at(0)}%` }} />
       </span>
       <strong className={v >= 0 ? "up" : "down"}>{pct(v)}</strong>
     </div>
