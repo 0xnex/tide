@@ -4,7 +4,7 @@
 # 用法：scripts/supabase-crank.sh             打包、部署
 #       scripts/supabase-crank.sh --secrets   先设置 Secrets 再打包、部署
 #       scripts/supabase-crank.sh --run       部署后调用一次并等结果（会真的结算，重复调用是安全的）
-# Secrets 的来源：KEEPER_KEYPAIR 读 $KEEPER_KEYPAIR_FILE（默认 ~/.config/solana/tide-devnet-admin-v2.json），
+# Secrets 的来源：KEEPER_KEYPAIR 读 $KEEPER_KEYPAIR_FILE（默认 ~/.config/solana/tide-devnet-admin-v3.json），
 # PYTH_API_KEY、SUPABASE_CRANK_SECRET 和 SUPABASE_DB_URL（写 Vault 用）读仓库根目录的 .env（不进 git）。
 # 值不会显示在终端里。定时任务本身见 supabase/crank-schedule.sql。
 set -euo pipefail
@@ -17,7 +17,7 @@ if [[ " $* " == *" --secrets "* ]]; then
   trap 'rm -f "$tmp"' EXIT
   chmod 600 "$tmp"
   {
-    echo "KEEPER_KEYPAIR=$(tr -d ' \n' < "${KEEPER_KEYPAIR_FILE:-$HOME/.config/solana/tide-devnet-admin-v2.json}")"
+    echo "KEEPER_KEYPAIR=$(tr -d ' \n' < "${KEEPER_KEYPAIR_FILE:-$HOME/.config/solana/tide-devnet-admin-v3.json}")"
     echo "PYTH_API_KEY=$(env_value PYTH_API_KEY)"
     echo "CRANK_SECRET=$(env_value SUPABASE_CRANK_SECRET)"
   } > "$tmp"
