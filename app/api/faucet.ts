@@ -43,7 +43,7 @@ export async function POST(request: Request): Promise<Response> {
   const connection = new Connection(process.env.RPC_URL ?? "https://api.devnet.solana.com", "confirmed");
 
   // 基金账户里管理员之后就是 USDC mint：8 字节鉴别符 + admin 32 字节 + usdc_mint 32 字节
-  const admin = new PublicKey(process.env.FUND_ADMIN ?? "Bx5tWUDUrZ1yfkeYAXgimvyST4kRyhPwQe7YKKGNjYja");
+  const admin = new PublicKey(process.env.FUND_ADMIN ?? "DoFt9r97s51QkpohoCvsYRfcDMkuSof2WtrFqtrhjDKW");
   const [fund] = PublicKey.findProgramAddressSync([Buffer.from("fund"), admin.toBuffer()], PROGRAM_ID);
   const fundInfo = await connection.getAccountInfo(fund);
   if (!fundInfo) return reply(500, { error: "Vault not found" });

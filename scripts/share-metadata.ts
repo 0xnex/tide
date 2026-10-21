@@ -3,7 +3,7 @@
 //
 // 用法：
 //   ANCHOR_PROVIDER_URL=https://api.devnet.solana.com \
-//   ANCHOR_WALLET=~/.config/solana/tide-devnet-admin.json \
+//   ANCHOR_WALLET=~/.config/solana/tide-devnet-admin-v2.json \
 //   yarn ts-node scripts/share-metadata.ts           # 创建
 //   yarn ts-node scripts/share-metadata.ts --update  # 已经创建过：改成新的名称、符号和地址（比如网站换了域名）
 // 环境变量（可选）：SHARE_NAME、SHARE_SYMBOL、SHARE_URI（元数据 JSON 的地址）

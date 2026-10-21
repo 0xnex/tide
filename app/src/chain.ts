@@ -13,7 +13,7 @@ import { ERROR_MESSAGES } from "./errors";
 
 export const RPC_URL: string = import.meta.env.VITE_RPC_URL ?? "https://api.devnet.solana.com";
 export const FUND_ADMIN = new PublicKey(
-  import.meta.env.VITE_FUND_ADMIN ?? "Bx5tWUDUrZ1yfkeYAXgimvyST4kRyhPwQe7YKKGNjYja",
+  import.meta.env.VITE_FUND_ADMIN ?? "DoFt9r97s51QkpohoCvsYRfcDMkuSof2WtrFqtrhjDKW",
 );
 export const PROGRAM_ID = new PublicKey(idl.address);
 export const DAY = 86_400;
