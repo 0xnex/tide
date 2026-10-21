@@ -10,8 +10,9 @@
 //   1. 今天还没定价时，用今天定价时刻（UTC 0 点 + settle_offset_secs）的 Pyth 历史价格调用 fix。
 //      定价价格必须在定价时刻后 60 秒内发布，Hermes 给的是那一刻之后的第一个价格，所以几点运行都可以。
 //   2. 每隔最小交易间隔用最新的 Pyth 价格调用一次 trade，直到程序回答没有可交易的：
-//      NothingToTrade（都做完了）、DepegBlocksBuy（脱锚，等下一次）或 FixPending（定价没成功，
-//      未卖完的赎回资产已经卖完，基金调仓等下一次定价）。
+//      NothingToTrade（都做完了）、DepegBlocksBuy（脱锚，等下一次）、FixPending（定价没成功，
+//      未卖完的赎回资产已经卖完，基金调仓等下一次定价）或 PoolIlliquid（剩下的都要从借贷池取回，
+//      它暂时付不出，等下一次）。目标为 USDC 时，trade 也负责把 USDC 存入借贷池（ADR 0008）。
 //      成交低于 min_out 的那一笔会回滚，等下一个间隔重试。
 //      给了 deadline 时，来不及再做一笔就停下，留给下一次运行（每一步都能从链上状态接着做）。
 //   3. 有欠管理人的取款费时调用 collect_fees，付到收费地址。
@@ -25,9 +26,9 @@ import { PublicKey } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { PythSolanaReceiver } from "@pythnetwork/pyth-solana-receiver";
 
-// 停止交易的回答（都做完了 / 脱锚 / 今天的定价没成功，基金调仓等下一次定价）；
+// 停止交易的回答（都做完了 / 脱锚 / 今天的定价没成功，基金调仓等下一次定价 / 借贷池付不出）；
 // 其余的可重试错误等下一个间隔再试
-const DONE = ["NothingToTrade", "DepegBlocksBuy", "FixPending"];
+const DONE = ["NothingToTrade", "DepegBlocksBuy", "FixPending", "PoolIlliquid"];
 const RETRY = ["TradeTooSoon", "SlippageExceeded", "StalePrice", "PriceTooUncertain"];
 // 定价步骤可以跳过、直接去交易的回答
 const FIX_SKIPPABLE = ["AlreadySettled", "TooManySlices", "PriceNotAtFixTime", "TooEarly", "PriceTooUncertain"];
@@ -72,6 +73,13 @@ export async function runCrank(opts: CrankOptions): Promise<void> {
   const fetchFund = () => (program.account as any).fund.fetch(fund);
 
   const f = await fetchFund();
+  // 借贷池（devnet 是模拟的）：fix 用它的比率，trade 在里面存取
+  const pool: PublicKey = f.pool;
+  const lending = {
+    pool,
+    poolUsdc: pda([Buffer.from("pool_usdc"), pool.toBuffer()]),
+    receiptMint: pda([Buffer.from("pool_receipt"), pool.toBuffer()]),
+  };
   if (!f.config.keeper.equals(admin)) {
     throw new Error(`钱包 ${admin.toBase58()} 不是清算地址 ${f.config.keeper.toBase58()}，清算窗口内会被拒绝`);
   }
@@ -167,6 +175,7 @@ export async function runCrank(opts: CrankOptions): Promise<void> {
           .accountsPartial({
             cranker: admin,
             fund,
+            pool,
             epochRecord: epochPda(today),
             ...prices,
             shareMint,
@@ -201,6 +210,8 @@ export async function runCrank(opts: CrankOptions): Promise<void> {
             market,
             marketUsdc: pda([Buffer.from("market_usdc"), market.toBuffer()]),
             marketBtc: pda([Buffer.from("market_btc"), market.toBuffer()]),
+            lending,
+            receiptVault: fundPda("receipt_vault"),
             usdcVault: fundPda("usdc_vault"),
             btcVault: fundPda("btc_vault"),
             payoutVault: fundPda("payout_vault"),
@@ -240,6 +251,7 @@ export async function runCrank(opts: CrankOptions): Promise<void> {
   const after = await fetchFund();
   log(
     `目标持仓：${after.state.targetBtc ? "cbBTC" : "USDC"}；未卖完的赎回资产 ${after.state.sliceCount} 期；` +
-      `待成交的申购 ${after.state.pendingCount} 笔；下一次定价处理的申购 ${after.state.queuedSubscriptionUsdc.toNumber() / 1e6} USDC`,
+      `待成交的申购 ${after.state.pendingCount} 笔；下一次定价处理的申购 ${after.state.queuedSubscriptionUsdc.toNumber() / 1e6} USDC；` +
+      `借贷凭证 ${after.state.receipts.toNumber() / 1e6} 份`,
   );
 }

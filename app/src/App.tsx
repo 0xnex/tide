@@ -11,6 +11,7 @@ import {
   cancelPending,
   claim,
   describeError,
+  fundUsdc,
   loadSnapshot,
   makeProgram,
   recordFor,
@@ -189,8 +190,9 @@ function Overview({ snap, spot }: { snap: Snapshot; spot: number | null }) {
   const s = snap.fund.state;
   const basis = pricingBasis(snap, spot);
   // display only: the fund itself is never valued in USD
-  const total = basis ? Number(big(s.usdc)) / 1e6 + (Number(big(s.btc)) / 1e8) * basis.btcUsd : null;
-  const price = basis ? sharePrice(big(s.usdc), big(s.btc), big(s.shareSupply), basis.btcUsd) : null;
+  const usdc = fundUsdc(snap); // 含借出的
+  const total = basis ? Number(usdc) / 1e6 + (Number(big(s.btc)) / 1e8) * basis.btcUsd : null;
+  const price = basis ? sharePrice(usdc, big(s.btc), big(s.shareSupply), basis.btcUsd) : null;
   // queued and partly filled subscriptions: still the subscribers' USDC, not fund assets
   const waiting =
     big(s.queuedSubscriptionUsdc) +
@@ -207,7 +209,19 @@ function Overview({ snap, spot }: { snap: Snapshot; spot: number | null }) {
           sub={`${fmt.shares(s.shareSupply)} shares`}
         />
         <Stat icon="btc" label="cbBTC" value={fmt.btc(s.btc)} />
-        <Stat icon="usd" label="USDC" value={fmt.usdc(s.usdc)} sub={waiting > 0n ? `+${fmt.usdc(waiting)} queued` : undefined} />
+        <Stat
+          icon="usd"
+          label="USDC"
+          value={fmt.usdc(usdc)}
+          sub={
+            [
+              snap.lentUsdc > 0n && `${fmt.usdc(snap.lentUsdc)} lent · ${(snap.lendingApyBps / 100).toFixed(1)}% APY`,
+              waiting > 0n && `+${fmt.usdc(waiting)} queued`,
+            ]
+              .filter(Boolean)
+              .join(" · ") || undefined
+          }
+        />
         <Stat
           icon="target"
           label="Holds"
@@ -230,7 +244,7 @@ function Strategy({ snap, now }: { snap: Snapshot; now: number }) {
   // 结算每天定价后几分钟内由定时任务运行；过了一小时还没定价就是出了问题
   const overdue = now > todayFix + 3600 && s.lastFixDay.toNumber() < today;
   // 还要交易的量：目标 cbBTC 时 USDC 还没买完，目标 USDC 时 cbBTC 还没卖完（不到 1 USDC / 1 聪的尘埃不算）
-  const toBuy = s.targetBtc ? big(s.usdc) + pending : 0n;
+  const toBuy = s.targetBtc ? fundUsdc(snap) + pending : 0n;
   const toSell = s.targetBtc ? 0n : big(s.btc);
   const rebalancing = toBuy >= 1_000_000n || toSell > 0n || s.sliceCount > 0;
   const outstanding = big(s.queuedSubscriptionUsdc) + big(s.nextSubscriptionUsdc) + pending;
@@ -408,7 +422,7 @@ function ActionPanel({
   // 只是参考：真正的份额和赎回款按实际成交计算
   const basis = pricingBasis(snap, spot);
   const s = snap.fund.state;
-  const price = basis ? sharePrice(big(s.usdc), big(s.btc), big(s.shareSupply), basis.btcUsd) ?? 1 : null;
+  const price = basis ? sharePrice(fundUsdc(snap), big(s.btc), big(s.shareSupply), basis.btcUsd) ?? 1 : null;
   const estimate =
     amount && amount > 0n && price && !noShares
       ? tab === "sub"
@@ -627,7 +641,7 @@ function Position({
   const user = wallet.publicKey;
   const basis = pricingBasis(snap, spot);
   const s = snap.fund.state;
-  const price = basis ? sharePrice(big(s.usdc), big(s.btc), big(s.shareSupply), basis.btcUsd) : null;
+  const price = basis ? sharePrice(fundUsdc(snap), big(s.btc), big(s.shareSupply), basis.btcUsd) : null;
   const views = snap.tickets.map((t) => viewTicket(t, snap.fund, snap.records, now));
   const sum = (f: (v: TicketView) => bigint) => views.reduce((x, v) => x + f(v), 0n);
   const toClaimShares = sum((v) => v.sharesToClaim);

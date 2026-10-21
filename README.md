@@ -218,10 +218,10 @@ anchor deploy --provider.cluster devnet
 
 ```mermaid
 flowchart LR
-  A["mock USDC (6)<br/>mock BTC (8) mints"] --> C["init_mock_market<br/>+ liquidity"] --> D["initialize"] --> E["init_vaults"] --> F["seed_prices<br/>last 49 days"]
+  A["mock USDC (6)<br/>mock BTC (8) mints"] --> C["init_mock_market<br/>+ liquidity"] --> P["init_mock_pool<br/>+ interest reserve"] --> D["initialize"] --> E["init_vaults<br/>init_receipt_vault"] --> F["seed_prices<br/>last 49 days"]
 ```
 
-`scripts/setup.ts` runs these steps with the wallet as admin, keeper and fee address (env: `PYTH_API_KEY` or `SEED_PRICE` for the seed price, `SETTLE_OFFSET_SECS`, `SIGNAL_FEED`, `TRADE_CAP_USDC`, `DEMO_USDC` for a first subscription). `scripts/faucet.ts <address> [usdc] [sol]` mints mock USDC (and sends a little SOL) to a test wallet; run it with the wallet that holds the mock USDC mint authority.
+`scripts/setup.ts` runs these steps with the wallet as admin, keeper and fee address (env: `PYTH_API_KEY` or `SEED_PRICE` for the seed price, `SETTLE_OFFSET_SECS`, `SIGNAL_FEED`, `TRADE_CAP_USDC`, `LENDING_CAP_BPS`, `POOL_APY_BPS`, `DEMO_USDC` for a first subscription). `scripts/faucet.ts <address> [usdc] [sol]` mints mock USDC (and sends a little SOL) to a test wallet; run it with the wallet that holds the mock USDC mint authority.
 
 ```bash
 ANCHOR_PROVIDER_URL=https://api.devnet.solana.com ANCHOR_WALLET=$HOME/.config/solana/id.json yarn ts-node scripts/setup.ts
@@ -248,6 +248,7 @@ flowchart LR
 |---|---|---|
 | `initialize(config)` | admin | Create fund account and share mint |
 | `init_vaults` | admin | Create the five fund-owned token accounts |
+| `init_receipt_vault` | admin | Create the fund's token account for lending receipts |
 | `init_share_metadata(name, symbol, uri)` | admin | Create the share token's Metaplex metadata so wallets show its name and icon; the admin becomes its update authority |
 | `seed_prices(prices)` | admin | Pre-load the signal prices of the days ending yesterday, before the first settlement only |
 | `request_subscription(amount, epoch)` | anyone | Queue a subscription; `epoch` is the day of the next fixing time, used for the ticket address |
@@ -255,13 +256,15 @@ flowchart LR
 | `cancel` | ticket owner | Withdraw a queued ticket in full, until the fixing time that closes its epoch |
 | `cancel_pending` | ticket owner | Any time after the fixing: refund the unfilled part of a subscription and take the shares already filled |
 | `fix(epoch)` | keeper in 01:00–01:30, then anyone | Fixing step, once a day after `settle_offset_secs`; `epoch` is today's day number; pass Pyth price updates published in the fixing window |
-| `trade` | keeper in 01:00–01:30, then anyone | One capped trade with current Pyth price updates (at most `max_staleness_secs` old); others in the window get `KeeperOnly`; answers `NothingToTrade`, `TradeTooSoon`, `DepegBlocksBuy` or `FixPending` when there is none |
+| `trade` | keeper in 01:00–01:30, then anyone | One capped trade with current Pyth price updates (at most `max_staleness_secs` old); others in the window get `KeeperOnly`; while the target is USDC it also deposits to or withdraws from the lending pool (one action per call, ADR 0008); answers `NothingToTrade`, `TradeTooSoon`, `DepegBlocksBuy`, `FixPending` or `PoolIlliquid` when there is none |
 | `claim` | subscriber / redeemer | Collect filled shares (repeatable) or redemption USDC; pass the record of the fixing that closed the ticket's epoch |
 | `collect_fees` | anyone | Pay the withdrawal fees owed to the manager to the fee address; claims never depend on that account |
 | `backfill_price(day)` | anyone | Record a missed day's signal price from a Pyth price update published in that day's fixing window |
 | `propose_config(config)`, `apply_config` | admin | Config change, applied 48 h after the proposal |
 | `pause_subscriptions`, `resume_subscriptions` | admin | Immediate; redemptions are never paused |
+| `lower_lending_cap(bps)` | admin | Immediate, down to 0; raising goes through the timelock |
 | `init_mock_market`, `set_mock_market_fee` | admin | Devnet only: a mock exchange that fills at the Pyth price, until Jupiter is integrated |
+| `init_mock_pool(apy_bps)`, `set_mock_pool(apy_bps, withdraw_limit, haircut_bps)` | admin | Devnet only: a mock lending pool with a set rate, a withdrawable limit (0 = cannot pay) and a one-off loss |
 
 Price inputs to `fix`, `trade` and `backfill_price` are two optional accounts, `btc_price_update` and `cbbtc_price_update`: Pyth `PriceUpdateV2` accounts. The program accepts only accounts owned by the Pyth receiver (`rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ`), fully verified through Wormhole, with the feed ID from the config; a confidence interval wider than `max_confidence_bps` of the price is rejected.
 
@@ -291,6 +294,7 @@ Every row below except "Config timelock" and "Subscription pause" is a field of 
 | Config timelock | 48 h, fixed in code | `propose_config` a whole config, `apply_config` after 48 h; a new proposal restarts the clock. `window` and `settle_offset_secs` are set at creation and cannot change |
 | Subscription pause | off | `pause_subscriptions` / `resume_subscriptions`, immediate, admin only; redemptions can never be paused |
 | `fee_address` | set at creation | Manager's wallet; `collect_fees` pays the owed fees to its USDC associated token account. Change via 48 h timelock |
+| `lending_cap_bps` | 8000 | Share of the fund's USDC (vault + lent) that may be lent while the target is USDC. `lower_lending_cap` lowers it at once; raising goes through the timelock |
 
 ### Accounts (PDAs)
 
@@ -304,6 +308,9 @@ Every row below except "Config timelock" and "Subscription pause" is a field of 
 | Epoch record | `["epoch", fund, epoch as u64 LE]` (epoch = fixing day, unix / 86400) |
 | Mock market | `["market", authority]` |
 | Market vaults | `["market_usdc", market]` / `["market_btc", market]` |
+| Mock lending pool | `["pool", authority]` |
+| Pool USDC vault / receipt mint | `["pool_usdc", pool]` / `["pool_receipt", pool]` |
+| Fund receipt vault | `["receipt_vault", fund]` |
 
 ### Units
 
@@ -338,7 +345,7 @@ flowchart LR
   B --> C["Pyth BTC/USD +<br/>cbBTC/USD"] & D["Jupiter<br/>route off-chain,<br/>min_out on-chain"]
   B --> E["✓ Keeper · cancel ·<br/>MA backfill"]
   B --> F["✓ Timelock · subscription pause<br/>(admin is an external multisig)"]
-  B --> L["Lend idle USDC<br/>ADR 0008"]
+  B --> L["Real lending pool<br/>(mock done, ADR 0008)"]
   C & D & E & F & L --> G["Monitoring"] --> H["Security audit"] --> I["Legal review"]
 ```
 

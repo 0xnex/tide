@@ -1161,6 +1161,12 @@ export type Tide = {
           }
         },
         {
+          "name": "pool",
+          "relations": [
+            "fund"
+          ]
+        },
+        {
           "name": "epochRecord",
           "docs": [
             "当天的定价记录。已经存在只可能是今天定价过了：这时由 fund-logic 回答 AlreadySettled，",
@@ -1459,6 +1465,217 @@ export type Tide = {
           "type": "u16"
         }
       ]
+    },
+    {
+      "name": "initMockPool",
+      "docs": [
+        "创建模拟借贷池：1 份凭证起始值 1 USDC 原始单位，按 apy_bps 计息，取回不设限。",
+        "利息由池子的 USDC 账户支付，管理员要先往里注入足够的 USDC"
+      ],
+      "discriminator": [
+        213,
+        213,
+        102,
+        121,
+        93,
+        88,
+        12,
+        161
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "authority"
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdcMint"
+        },
+        {
+          "name": "poolUsdc",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  95,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "pool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "receiptMint",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108,
+                  95,
+                  114,
+                  101,
+                  99,
+                  101,
+                  105,
+                  112,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "pool"
+              }
+            ]
+          }
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "systemProgram",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "apyBps",
+          "type": "u16"
+        }
+      ]
+    },
+    {
+      "name": "initReceiptVault",
+      "docs": [
+        "第 3 步：创建基金存放借贷凭证的代币账户"
+      ],
+      "discriminator": [
+        152,
+        198,
+        53,
+        115,
+        236,
+        151,
+        178,
+        123
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "fund"
+          ]
+        },
+        {
+          "name": "fund",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "admin"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pool",
+          "relations": [
+            "fund"
+          ]
+        },
+        {
+          "name": "receiptMint"
+        },
+        {
+          "name": "receiptVault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  99,
+                  101,
+                  105,
+                  112,
+                  116,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "fund"
+              }
+            ]
+          }
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "systemProgram",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
     },
     {
       "name": "initShareMetadata",
@@ -1871,6 +2088,9 @@ export type Tide = {
           "name": "market"
         },
         {
+          "name": "pool"
+        },
+        {
           "name": "tokenProgram",
           "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         },
@@ -1887,6 +2107,59 @@ export type Tide = {
               "name": "configData"
             }
           }
+        }
+      ]
+    },
+    {
+      "name": "lowerLendingCap",
+      "docs": [
+        "立即降低借出上限（ADR 0008），比如借贷池出问题时降到 0：之后的 trade 把超出的 USDC 取回。",
+        "提高只能通过 propose_config 的时间锁；还没生效的提议里的上限一起降低"
+      ],
+      "discriminator": [
+        201,
+        163,
+        248,
+        157,
+        131,
+        80,
+        43,
+        215
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "fund"
+          ]
+        },
+        {
+          "name": "fund",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  117,
+                  110,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "admin"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "bps",
+          "type": "u16"
         }
       ]
     },
@@ -2409,11 +2682,72 @@ export type Tide = {
       ]
     },
     {
+      "name": "setMockPool",
+      "docs": [
+        "设定模拟借贷池：先按旧年化计息到此刻，再按 haircut_bps 亏损（比率立即下降），",
+        "换成新的年化和可取回额度（之后每次取回从额度里扣，0 表示付不出）"
+      ],
+      "discriminator": [
+        226,
+        222,
+        154,
+        244,
+        83,
+        213,
+        204,
+        40
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "pool"
+          ]
+        },
+        {
+          "name": "pool",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  111,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "authority"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "apyBps",
+          "type": "u16"
+        },
+        {
+          "name": "withdrawLimit",
+          "type": "u64"
+        },
+        {
+          "name": "haircutBps",
+          "type": "u16"
+        }
+      ]
+    },
+    {
       "name": "trade",
       "docs": [
-        "一笔交易（或一次不交易的申购成交）。epoch_record 传最早一期未卖完的赎回资产的记录",
-        "（fund.state.slices[0].epoch）；没有赎回资产时传最早一期待成交申购的记录",
-        "（fund.state.pending[0].epoch）；都没有时不传。基金调仓用不到它。"
+        "一笔交易（或一次不交易的申购成交、一次借贷池存取）。epoch_record 传最早一期未卖完的",
+        "赎回资产的记录（fund.state.slices[0].epoch）；没有赎回资产时传最早一期待成交申购的记录",
+        "（fund.state.pending[0].epoch）；都没有时不传。基金调仓和借贷池存取用不到它。"
       ],
       "discriminator": [
         178,
@@ -2543,6 +2877,93 @@ export type Tide = {
               {
                 "kind": "account",
                 "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "lending",
+          "accounts": [
+            {
+              "name": "pool",
+              "writable": true,
+              "pda": {
+                "seeds": [
+                  {
+                    "kind": "const",
+                    "value": [
+                      112,
+                      111,
+                      111,
+                      108
+                    ]
+                  },
+                  {
+                    "kind": "account",
+                    "path": "pool.authority",
+                    "account": "mockPool"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "poolUsdc",
+              "writable": true,
+              "pda": {
+                "seeds": [
+                  {
+                    "kind": "const",
+                    "value": [
+                      112,
+                      111,
+                      111,
+                      108,
+                      95,
+                      117,
+                      115,
+                      100,
+                      99
+                    ]
+                  },
+                  {
+                    "kind": "account",
+                    "path": "pool"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "receiptMint",
+              "writable": true
+            }
+          ]
+        },
+        {
+          "name": "receiptVault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  99,
+                  101,
+                  105,
+                  112,
+                  116,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "fund"
               }
             ]
           }
@@ -2756,6 +3177,19 @@ export type Tide = {
       ]
     },
     {
+      "name": "mockPool",
+      "discriminator": [
+        58,
+        196,
+        208,
+        241,
+        31,
+        216,
+        243,
+        48
+      ]
+    },
+    {
       "name": "ticket",
       "discriminator": [
         41,
@@ -2820,6 +3254,19 @@ export type Tide = {
         20,
         179,
         98
+      ]
+    },
+    {
+      "name": "lendingCapLowered",
+      "discriminator": [
+        136,
+        160,
+        184,
+        223,
+        67,
+        161,
+        117,
+        179
       ]
     },
     {
@@ -3047,6 +3494,21 @@ export type Tide = {
       "code": 6036,
       "name": "wrongPriceAccount",
       "msg": "不是有效的 Pyth 价格更新账户（所有者、验证级别或价格源不对）"
+    },
+    {
+      "code": 6037,
+      "name": "poolIlliquid",
+      "msg": "借贷池暂时付不出要取回的 USDC，稍后重试"
+    },
+    {
+      "code": 6038,
+      "name": "lendingCapNotLower",
+      "msg": "立即修改只能降低借出上限，提高要走时间锁"
+    },
+    {
+      "code": 6039,
+      "name": "wrongPool",
+      "msg": ""
     }
   ],
   "types": [
@@ -3120,6 +3582,10 @@ export type Tide = {
           },
           {
             "name": "maxConfidenceBps",
+            "type": "u16"
+          },
+          {
+            "name": "lendingCapBps",
             "type": "u16"
           },
           {
@@ -3361,6 +3827,10 @@ export type Tide = {
             "type": "pubkey"
           },
           {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
             "name": "config",
             "type": {
               "defined": {
@@ -3394,6 +3864,18 @@ export type Tide = {
       }
     },
     {
+      "name": "lendingCapLowered",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bps",
+            "type": "u16"
+          }
+        ]
+      }
+    },
+    {
       "name": "mockMarket",
       "docs": [
         "原型专用：模拟交易所，按 Pyth 价格成交任意数量（以注入的流动性为限），收 fee_bps 手续费"
@@ -3416,6 +3898,50 @@ export type Tide = {
           {
             "name": "feeBps",
             "type": "u16"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "mockPool",
+      "docs": [
+        "原型专用：模拟借贷池。1 份凭证值 rate ÷ RATE_ONE 个 USDC 原始单位，按 apy_bps 单利计息；",
+        "withdraw_limit 是还能取回多少 USDC（模拟借贷池付不出），管理员还可以让比率下降（模拟亏损）"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "usdcMint",
+            "type": "pubkey"
+          },
+          {
+            "name": "receiptMint",
+            "type": "pubkey"
+          },
+          {
+            "name": "rate",
+            "type": "u64"
+          },
+          {
+            "name": "lastUpdate",
+            "type": "i64"
+          },
+          {
+            "name": "apyBps",
+            "type": "u16"
+          },
+          {
+            "name": "withdrawLimit",
+            "type": "u64"
           },
           {
             "name": "bump",
@@ -3512,6 +4038,10 @@ export type Tide = {
           {
             "name": "usdc",
             "type": "u64"
+          },
+          {
+            "name": "receipts",
+            "type": "u64"
           }
         ]
       }
@@ -3527,6 +4057,10 @@ export type Tide = {
           },
           {
             "name": "btc",
+            "type": "u64"
+          },
+          {
+            "name": "receipts",
             "type": "u64"
           },
           {
@@ -3689,6 +4223,12 @@ export type Tide = {
           },
           {
             "name": "withoutTrade"
+          },
+          {
+            "name": "deposit"
+          },
+          {
+            "name": "withdraw"
           }
         ]
       }
@@ -3712,6 +4252,10 @@ export type Tide = {
           },
           {
             "name": "amountOut",
+            "type": "u64"
+          },
+          {
+            "name": "withdrawnUsdc",
             "type": "u64"
           },
           {

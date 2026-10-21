@@ -20,6 +20,8 @@ flowchart LR
 |---|---|
 | What is lent | Only the fund's own USDC, only while the target is USDC. Pending subscriptions, redemption payouts and fees owed are never lent |
 | Where | Inside `trade`; deposits and withdrawals are not market trades, so the trade cap, interval, slippage and depeg checks do not apply to them |
+| When | Deposit up to the cap when the gap is at least 100 USDC; withdraw when lent is above the cap by at least 100 USDC, or everything when the cap is 0. The margin stops interest from causing a withdrawal on every call. No deposits while a redemption slice waits on the pool |
+| Rounding | Lent value rounds down for payouts and the cap, and up when it sets a subscriber's shares, so rounding always favours the holders who stay |
 | Switching to cbBTC | Each capped buy withdraws only what it spends; the rest keeps earning |
 | Redemption slice | Takes its pro-rata share of USDC, receipts and cbBTC in kind; its receipts are swapped with the buffer first, then withdrawn |
 | Pool cannot pay | The step waits and retries; the fund keeps holding USDC (still earning). Settlement never fails permanently |

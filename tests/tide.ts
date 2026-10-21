@@ -19,6 +19,10 @@
 //   价格源：用 BTC/USD 作信号时 cbBTC/USD 即使有也不用，不检查脱锚
 //   捐款：直接转进基金账户的代币不算基金资产
 //   Pyth：价格更新账户的所有者、验证级别、价格源、置信区间和新鲜度都要检查
+//   借贷（ADR 0008）：借出上限提高要等时间锁；目标为 USDC 时存入借贷池，切换到 cbBTC 时每笔只取回
+//         要花的；借贷池付不出时等待、不失败；管理员立即把上限降到 0，全部取回
+//
+// 前面的场景上限为 0、不借出，只有最后一个场景打开借贷。
 //
 // 价格来自 Pyth 的价格更新账户（PriceUpdateV2）。测试里直接写入这种账户（writePriceUpdate），
 // 代替向 Hermes 取价格、提交给 Pyth 接收程序这两步。
@@ -69,7 +73,7 @@ describe("tide", () => {
   const usdcMint = Keypair.generate();
   const btcMint = Keypair.generate();
 
-  let fund: PublicKey, market: PublicKey, shareMint: PublicKey;
+  let fund: PublicKey, market: PublicKey, shareMint: PublicKey, pool: PublicKey;
   // Pyth 价格更新账户（PriceUpdateV2）：测试里直接写入账户数据，代替 Hermes + 接收程序
   const btcPriceKey = Keypair.generate();
   const cbbtcPriceKey = Keypair.generate();
@@ -211,6 +215,13 @@ describe("tide", () => {
     cbbtcPriceUpdate: valuation > 0 ? cbbtcPriceAcc : null,
   });
 
+  /** trade 用到的借贷池账户 */
+  const lendingAccounts = () => ({
+    pool,
+    poolUsdc: pda([Buffer.from("pool_usdc"), pool.toBuffer()]),
+    receiptMint: pda([Buffer.from("pool_receipt"), pool.toBuffer()]),
+  });
+
   async function fixIx(signer: Keypair = admin) {
     const epoch = Math.floor(now / DAY); // 定价记录的期号：当天的日期序号
     return program.methods
@@ -218,6 +229,7 @@ describe("tide", () => {
       .accountsPartial({
         cranker: signer.publicKey,
         fund,
+        pool,
         epochRecord: epochPda(epoch),
         ...priceAccounts(),
         shareMint,
@@ -258,6 +270,8 @@ describe("tide", () => {
           market,
           marketUsdc: pda([Buffer.from("market_usdc"), market.toBuffer()]),
           marketBtc: pda([Buffer.from("market_btc"), market.toBuffer()]),
+          lending: lendingAccounts(),
+          receiptVault: fundPda("receipt_vault"),
           usdcVault: fundPda("usdc_vault"),
           btcVault: fundPda("btc_vault"),
           payoutVault: fundPda("payout_vault"),
@@ -405,6 +419,14 @@ describe("tide", () => {
     await program.methods.setMockMarketFee(bps).accountsPartial({ authority: admin.publicKey, market }).rpc();
   }
 
+  /** 设定模拟借贷池：年化、还能取回多少 USDC、立即亏损多少 */
+  async function setPool(apyBps: number, withdrawLimit: BN, haircutBps = 0) {
+    await program.methods
+      .setMockPool(apyBps, withdrawLimit, haircutBps)
+      .accountsPartial({ authority: admin.publicKey, pool })
+      .rpc();
+  }
+
   let aliceUsdc: PublicKey, bobUsdc: PublicKey;
 
   before(async () => {
@@ -441,6 +463,7 @@ describe("tide", () => {
     bobUsdc = await ataWith(bob.publicKey, usdcMint.publicKey, 10_000 * USDC);
 
     market = pda([Buffer.from("market"), admin.publicKey.toBuffer()]);
+    pool = pda([Buffer.from("pool"), admin.publicKey.toBuffer()]);
     fund = pda([Buffer.from("fund"), admin.publicKey.toBuffer()]);
     shareMint = pda([Buffer.from("share_mint"), fund.toBuffer()]);
 
@@ -452,6 +475,12 @@ describe("tide", () => {
     await send([
       createMintToInstruction(usdcMint.publicKey, pda([Buffer.from("market_usdc"), market.toBuffer()]), admin.publicKey, 1_000_000 * USDC),
       createMintToInstruction(btcMint.publicKey, pda([Buffer.from("market_btc"), market.toBuffer()]), admin.publicKey, 100 * 1e8),
+    ]);
+
+    // 模拟借贷池：年化 10%；利息从池子的 USDC 里付，先注入一些
+    await program.methods.initMockPool(1_000).accounts({ authority: admin.publicKey, usdcMint: usdcMint.publicKey }).rpc();
+    await send([
+      createMintToInstruction(usdcMint.publicKey, lendingAccounts().poolUsdc, admin.publicKey, 100_000 * USDC),
     ]);
 
     await program.methods
@@ -470,17 +499,22 @@ describe("tide", () => {
         subscriptionCapUsdc: new BN(SUBSCRIPTION_CAP * USDC),
         signalFeed: { cbBtc: {} }, // 先用 cbBTC/USD 作信号，治理测试里换成 BTC/USD
         maxConfidenceBps: 100,
+        lendingCapBps: 0, // 先不借出，最后的借贷场景通过时间锁打开
         maxStalenessSecs: new BN(600),
         keeper: admin.publicKey, // 清算地址：这里就是管理员钱包
         feeAddress: manager.publicKey,
         btcFeedId: [...Buffer.from(BTC_FEED, "hex")],
         cbbtcFeedId: [...Buffer.from(CBBTC_FEED, "hex")],
       })
-      .accountsPartial({ admin: admin.publicKey, fund, usdcMint: usdcMint.publicKey, btcMint: btcMint.publicKey, shareMint, market })
+      .accountsPartial({ admin: admin.publicKey, fund, usdcMint: usdcMint.publicKey, btcMint: btcMint.publicKey, shareMint, market, pool })
       .rpc();
     await program.methods
       .initVaults()
       .accountsPartial({ admin: admin.publicKey, fund, usdcMint: usdcMint.publicKey, btcMint: btcMint.publicKey, shareMint })
+      .rpc();
+    await program.methods
+      .initReceiptVault()
+      .accountsPartial({ admin: admin.publicKey, fund, pool, receiptMint: lendingAccounts().receiptMint })
       .rpc();
     await program.methods
       .seedPrices(Array(49).fill(usd(50_000)))
@@ -876,5 +910,86 @@ describe("tide", () => {
     expect(await tradeWith({}, BTC_FEED, 601)).to.equal("StalePrice");
     // 正常的价格更新可以用
     expect(await tradeWith({})).to.equal("NothingToTrade");
+  });
+
+  it("借贷：上限提高等时间锁；目标为 USDC 时存入，买入时只取回要花的，付不出时等待，紧急降到 0 全部取回", async () => {
+    const asAdmin = { admin: admin.publicKey, fund };
+    const state = async () => (await program.account.fund.fetch(fund)).state;
+    const usdcVault = fundPda("usdc_vault");
+    const receiptVault = fundPda("receipt_vault");
+    // 前面有人直接转进主账户的 USDC 不是基金资产，始终不会被借出
+    const donated = (await tokenBalance(usdcVault)) - BigInt((await state()).usdc.toString());
+    expect(Number(donated)).to.be.greaterThan(0);
+
+    // 提高上限只能走时间锁；立即修改只能降低
+    expect(
+      await errorName(program.methods.lowerLendingCap(8_000).accountsPartial(asAdmin).rpc()),
+    ).to.equal("LendingCapNotLower");
+    const cfg0 = (await program.account.fund.fetch(fund)).config;
+    await program.methods.proposeConfig({ ...cfg0, lendingCapBps: 8_000 }).accountsPartial(asAdmin).rpc();
+    await warpTo(now + 2 * DAY);
+    await program.methods.applyConfig().accountsPartial(asAdmin).rpc();
+    expect((await program.account.fund.fetch(fund)).config.lendingCapBps).to.equal(8_000);
+    today = Math.floor(now / DAY);
+
+    // 跌破均线：卖完 cbBTC 之后把 80% 存入借贷池（存取不受交易间隔限制，也不经过交易所）
+    await fixDay(40_000);
+    let [, why] = await tradeUntilDone();
+    expect(why).to.equal("NothingToTrade");
+    let st = await state();
+    expect(st.btc.toNumber()).to.equal(0);
+    const receipts = st.receipts.toNumber();
+    expect(receipts).to.be.greaterThan(0);
+    // 刚存入时 1 份凭证约值 1 USDC 原始单位：借出的约占基金 USDC 的 80%
+    expect(receipts / (receipts + st.usdc.toNumber())).to.be.closeTo(0.8, 0.01);
+    expect(await tokenBalance(receiptVault)).to.equal(BigInt(receipts));
+    expect(await tokenBalance(usdcVault)).to.equal(BigInt(st.usdc.toString()) + donated);
+
+    // 借贷池付不出：高于均线后先花主账户里的 USDC，之后等待，不失败
+    await setPool(1_000, new BN(0));
+    await fixDay(70_000);
+    [, why] = await tradeUntilDone();
+    expect(why).to.equal("PoolIlliquid");
+    st = await state();
+    expect([st.usdc.toNumber(), st.receipts.toNumber()]).to.deep.equal([0, receipts]);
+
+    // 恢复之后每笔只取回这一笔要花的，买完时凭证全部取回
+    await setPool(1_000, new BN("18446744073709551615"));
+    const poolBefore = await tokenBalance(lendingAccounts().poolUsdc);
+    let buys = 0;
+    for (;;) {
+      await warpTo(now + TRADE_INTERVAL);
+      const err = await trade();
+      if (err) {
+        expect(err).to.equal("NothingToTrade");
+        break;
+      }
+      buys += 1;
+      const left = (await state()).receipts.toNumber();
+      if (left > 0) expect(left).to.be.lessThan(receipts); // 其余的继续借着
+    }
+    expect(buys).to.be.greaterThan(1);
+    st = await state();
+    expect([st.usdc.toNumber(), st.receipts.toNumber()]).to.deep.equal([0, 0]);
+    expect(await tokenBalance(receiptVault)).to.equal(0n);
+    // 取回的比存入的多：借出期间的利息
+    expect(Number(poolBefore - (await tokenBalance(lendingAccounts().poolUsdc)))).to.be.greaterThan(receipts);
+
+    // 再次跌破均线，存入之后管理员紧急把上限降到 0：下一步全部取回
+    await fixDay(45_000);
+    [, why] = await tradeUntilDone();
+    expect(why).to.equal("NothingToTrade");
+    expect((await state()).receipts.toNumber()).to.be.greaterThan(0);
+    expect(
+      await errorName(program.methods.lowerLendingCap(0).accountsPartial({ admin: alice.publicKey, fund }).signers([alice]).rpc()),
+    ).to.equal("ConstraintSeeds");
+    await program.methods.lowerLendingCap(0).accountsPartial(asAdmin).rpc();
+    expect(await trade()).to.equal(null);
+    st = await state();
+    expect(st.receipts.toNumber()).to.equal(0);
+    expect(await tokenBalance(receiptVault)).to.equal(0n);
+    expect(await tokenBalance(usdcVault)).to.equal(BigInt(st.usdc.toString()) + donated);
+    await warpTo(now + 1);
+    expect(await trade()).to.equal("NothingToTrade");
   });
 });

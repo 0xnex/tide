@@ -57,6 +57,7 @@ export function cancelDeadline(epoch: number, nowSec: number, offset: number): n
 export type Fund = Awaited<ReturnType<Program<Tide>["account"]["fund"]["fetch"]>>;
 export type EpochRecord = Awaited<ReturnType<Program<Tide>["account"]["epochRecord"]["fetch"]>>;
 export type Ticket = Awaited<ReturnType<Program<Tide>["account"]["ticket"]["fetch"]>> & { address: PublicKey };
+export type MockPool = Awaited<ReturnType<Program<Tide>["account"]["mockPool"]["fetch"]>>;
 
 export interface Snapshot {
   fund: Fund;
@@ -65,7 +66,25 @@ export interface Snapshot {
   usdcBalance: bigint;
   shareBalance: bigint;
   solBalance: number | null; // lamports，用来付交易费；没连钱包时为 null
+  lentUsdc: bigint; // 借出的 USDC 现在值多少（ADR 0008），只用来显示
+  lendingApyBps: number; // 借贷池的年化
 }
+
+/** 借贷池比率的单位（fund_logic::RATE_ONE） */
+const RATE_ONE = 1_000_000_000_000n;
+const YEAR = 31_536_000n;
+
+/** 借贷凭证按借贷池此刻的比率值多少 USDC：和程序一样单利计息到 nowSec、向下取整 */
+function lentValue(receipts: BN, pool: MockPool | null, nowSec: number): bigint {
+  if (!pool) return 0n;
+  const rate = BigInt(pool.rate.toString());
+  const dt = BigInt(Math.max(0, nowSec - pool.lastUpdate.toNumber()));
+  const accrued = rate + (rate * BigInt(pool.apyBps) * dt) / (10_000n * YEAR);
+  return (BigInt(receipts.toString()) * accrued) / RATE_ONE;
+}
+
+/** 基金的 USDC：主账户里的加上借出的 */
+export const fundUsdc = (snap: Snapshot): bigint => BigInt(snap.fund.state.usdc.toString()) + snap.lentUsdc;
 
 async function tokenBalance(connection: Connection, addr: PublicKey): Promise<bigint> {
   const info = await connection.getTokenAccountBalance(addr).catch(() => null);
@@ -85,7 +104,12 @@ export async function loadSnapshot(program: Program<Tide>, user: PublicKey | nul
   )
     .map((r) => r.account)
     .sort((a, b) => b.epoch.toNumber() - a.epoch.toNumber());
-  if (!user) return { fund, records, tickets: [], usdcBalance: 0n, shareBalance: 0n, solBalance: null };
+  const pool = await program.account.mockPool.fetch(fund.pool).catch(() => null);
+  const lending = {
+    lentUsdc: lentValue(fund.state.receipts, pool, Math.floor(Date.now() / 1000)),
+    lendingApyBps: pool?.apyBps ?? 0,
+  };
+  if (!user) return { fund, records, tickets: [], usdcBalance: 0n, shareBalance: 0n, solBalance: null, ...lending };
   const tickets = (
     await program.account.ticket.all([
       { memcmp: { offset: 8, bytes: FUND.toBase58() } },
@@ -99,7 +123,7 @@ export async function loadSnapshot(program: Program<Tide>, user: PublicKey | nul
     tokenBalance(connection, getAssociatedTokenAddressSync(SHARE_MINT, user, true)),
     connection.getBalance(user).catch(() => null),
   ]);
-  return { fund, records, tickets, usdcBalance, shareBalance, solBalance };
+  return { fund, records, tickets, usdcBalance, shareBalance, solBalance, ...lending };
 }
 
 /** 关闭这张排队记录那一期的定价记录：first_epoch ≤ 期号 ≤ epoch */

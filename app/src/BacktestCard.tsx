@@ -98,8 +98,8 @@ export function Backtest({ closes, error }: { closes: DailyClose[] | null; error
 
           <SummaryTable results={results!} />
           <p className="muted small note">
-            Coinbase daily closes · {SWITCH_COST_BPS / 100}% per switch · excludes the 1% withdrawal fee · Past results do
-            not predict future returns.
+            Coinbase daily closes · {SWITCH_COST_BPS / 100}% per switch · excludes the 1% withdrawal fee and interest on
+            lent USDC · Past results do not predict future returns.
           </p>
         </>
       )}

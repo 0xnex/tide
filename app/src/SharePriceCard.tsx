@@ -1,11 +1,12 @@
 // 每份价格：(USDC + cbBTC × BTC 价格) ÷ 份额，只用来显示（基金本身从不按美元估值）。
+// USDC 包括借出的（按借贷池的比率）。
 // 历史点用每次定价记录里定价时（当天申购赎回之前）的资产和份额，价格用那次定价的 Pyth 价格；
 // 最后一个点用现在的资产和实时 BTC 价格。
 // 开始之前的部分用回测模拟（虚线），缩放到开始那天正好 1 美元，和实际部分接上。
 import { useState } from "react";
 import { BN } from "@coral-xyz/anchor";
 import { LineChart } from "./LineChart";
-import type { Snapshot } from "./chain";
+import { fundUsdc, type Snapshot } from "./chain";
 import { simulatedSharePrice, type DailyClose } from "./backtest";
 
 const big = (x: BN) => BigInt(x.toString());
@@ -50,7 +51,7 @@ export function SharePriceCard({ snap, spot, closes }: { snap: Snapshot; spot: n
       btcUsd: Number(big(r.signalPrice)) / 1e6,
       now: false,
     }));
-  const current = basis ? sharePrice(big(s.usdc), big(s.btc), big(s.shareSupply), basis.btcUsd) : null;
+  const current = basis ? sharePrice(fundUsdc(snap), big(s.btc), big(s.shareSupply), basis.btcUsd) : null;
   const points: PricePoint[] =
     current !== null && basis
       ? [...history, { day: Math.floor(Date.now() / 86_400_000), price: current, btcUsd: basis.btcUsd, now: true }]
@@ -61,7 +62,7 @@ export function SharePriceCard({ snap, spot, closes }: { snap: Snapshot; spot: n
   // 预估的组成：每份对应的 cbBTC 和 USDC
   const supply = Number(big(s.shareSupply)) / 1e6;
   const btcPerShare = supply > 0 ? Number(big(s.btc)) / 1e8 / supply : 0;
-  const usdcPerShare = supply > 0 ? Number(big(s.usdc)) / 1e6 / supply : 0;
+  const usdcPerShare = supply > 0 ? Number(fundUsdc(snap)) / 1e6 / supply : 0;
 
   return (
     <section className="card viz-root">

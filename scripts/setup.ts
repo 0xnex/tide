@@ -2,7 +2,8 @@
 //
 // 步骤与 README 的 “Deploy to devnet” 一致：
 //   模拟 USDC（6 位）和 BTC（8 位）代币 -> init_mock_market + 注入流动性
-//   -> initialize -> init_vaults -> seed_prices（最近 49 天每天定价时刻的 Pyth 历史价格，价格源同信号）
+//   -> init_mock_pool + 注入付利息的 USDC -> initialize -> init_vaults -> init_receipt_vault
+//   -> seed_prices（最近 49 天每天定价时刻的 Pyth 历史价格，价格源同信号）
 // 可选：DEMO_USDC=<数量> 给钱包铸造模拟 USDC 并申购这么多，让第一次 crank 有事可做。
 //
 // 用法（钱包同时是管理员、清算地址和收费地址，程序已经 anchor deploy）：
@@ -15,6 +16,8 @@
 //   SETTLE_OFFSET_SECS   定价时刻在 UTC 0 点之后多少秒，默认 3600（01:00）；以后不能修改
 //   SIGNAL_FEED          btc（默认）或 cbbtc
 //   TRADE_CAP_USDC       单笔交易上限，默认 200000
+//   LENDING_CAP_BPS      借出上限（ADR 0008），默认 8000（80%）
+//   POOL_APY_BPS         模拟借贷池的年化，默认 500（5%）
 //   DEMO_USDC            演示申购的 USDC 数量，默认不申购
 import * as anchor from "@coral-xyz/anchor";
 import { BN, Program } from "@coral-xyz/anchor";
@@ -78,6 +81,8 @@ async function main() {
   const shareMint = pda([Buffer.from("share_mint"), fund.toBuffer()]);
   const marketUsdc = pda([Buffer.from("market_usdc"), market.toBuffer()]);
   const marketBtc = pda([Buffer.from("market_btc"), market.toBuffer()]);
+  const pool = pda([Buffer.from("pool"), admin.toBuffer()]);
+  const poolUsdc = pda([Buffer.from("pool_usdc"), pool.toBuffer()]);
 
   const usd = (x: number) => new BN(Math.round(x * USDC));
   const feed = process.env.SIGNAL_FEED ?? "btc";
@@ -134,7 +139,13 @@ async function main() {
     ),
   );
 
-  // 3. 基金：钱包同时是管理员、清算地址和收费地址
+  // 3. 模拟借贷池：利息从池子的 USDC 里付，先注入 10 万 USDC
+  const apy = Number(process.env.POOL_APY_BPS ?? 500);
+  await program.methods.initMockPool(apy).accounts({ authority: admin, usdcMint: usdcMint.publicKey }).rpc();
+  await send(new Transaction().add(createMintToInstruction(usdcMint.publicKey, poolUsdc, admin, 100_000 * USDC)));
+  console.log(`模拟借贷池：${pool.toBase58()}，年化 ${apy / 100}%`);
+
+  // 4. 基金：钱包同时是管理员、清算地址和收费地址
   await program.methods
     .initialize({
       window: 50,
@@ -151,6 +162,7 @@ async function main() {
       subscriptionCapUsdc: new BN(1_000_000 * USDC),
       signalFeed: btcFeed ? { btc: {} } : { cbBtc: {} },
       maxConfidenceBps: 100,
+      lendingCapBps: Number(process.env.LENDING_CAP_BPS ?? 8_000),
       maxStalenessSecs: new BN(120), // 交易用的 Pyth 价格最多 2 分钟
       keeper: admin,
       feeAddress: admin,
@@ -164,11 +176,16 @@ async function main() {
       btcMint: btcMint.publicKey,
       shareMint,
       market,
+      pool,
     })
     .rpc();
   await program.methods
     .initVaults()
     .accountsPartial({ admin, fund, usdcMint: usdcMint.publicKey, btcMint: btcMint.publicKey, shareMint })
+    .rpc();
+  await program.methods
+    .initReceiptVault()
+    .accountsPartial({ admin, fund, pool, receiptMint: pda([Buffer.from("pool_receipt"), pool.toBuffer()]) })
     .rpc();
   // 最近 49 天的历史价格（开头已经取好），均线从第一次定价就能计算
   await program.methods
@@ -179,7 +196,7 @@ async function main() {
   console.log(`份额元数据：${await initShareMetadata(program, admin)}`);
   console.log(`基金：${fund.toBase58()}（定价时刻 UTC 0 点后 ${settleOffset} 秒，信号 ${btcFeed ? "BTC/USD" : "cbBTC/USD"}）`);
 
-  // 4. 可选：演示申购
+  // 5. 可选：演示申购
   const demo = Number(process.env.DEMO_USDC ?? 0);
   if (demo > 0) {
     const userUsdc = getAssociatedTokenAddressSync(usdcMint.publicKey, admin);

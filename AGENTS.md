@@ -4,9 +4,9 @@ Guidance for AI coding agents (and human contributors) working on this repositor
 
 ## Project in one paragraph
 
-`tide` is a Solana (Anchor) program for a pooled BTC fund. Users queue USDC subscriptions and share redemptions; at 01:00 UTC each day the fixing price is recorded and compared with the 50-day moving average. Settlement then sets aside the redemption slice, nets subscriptions against it, and rebalances the fund toward all-cbBTC (above the average) or all-USDC (below) through capped trades. Shares follow actual execution, never a USD valuation. Users then `claim` their shares or USDC. It is a **devnet prototype**: prices come from Pyth, the exchange is a mock.
+`tide` is a Solana (Anchor) program for a pooled BTC fund. Users queue USDC subscriptions and share redemptions; at 01:00 UTC each day the fixing price is recorded and compared with the 50-day moving average. Settlement then sets aside the redemption slice, nets subscriptions against it, and rebalances the fund toward all-cbBTC (above the average) or all-USDC (below) through capped trades. Shares follow actual execution, never a USD valuation. Users then `claim` their shares or USDC. While the target is USDC, the fund lends part of its USDC to a lending pool, up to a lending cap (ADR 0008). It is a **devnet prototype**: prices come from Pyth, the exchange and the lending pool are mocks.
 
-The design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/` (decisions; 0005–0007 replace parts of 0002–0004). The invariants below describe the code as it is.
+The design is recorded in `CONTEXT.md` (vocabulary) and `docs/adr/` (decisions; 0005–0007 replace parts of 0002–0004, 0008 amends 0006). The invariants below describe the code as it is.
 
 ## Replies
 
@@ -54,15 +54,15 @@ Use the terms defined in `CONTEXT.md`. Where each invariant applies:
 ```mermaid
 flowchart LR
   Q["Queue<br/>never closes<br/>(2)"] --> FX["Fixing step<br/>signal · slice · netting<br/>(1, 2, 3, 11)"]
-  FX --> TR["Trade steps<br/>(6, 7, 10)"]
+  FX --> TR["Trade steps<br/>(6, 7, 10, 13)"]
   TR --> CL["Claim<br/>(4, 5)"]
   TR -. "unfinished at next fixing" .-> FX
   CL --> FE["Withdrawal fee<br/>(12)"]
 ```
 
-1. **Execution pricing.** Subscriptions and redemptions are only filled inside the settlement opened by the fixing time that closes their epoch, and only by actual execution (ADR 0002, 0006). A redemption receives what its redemption slice actually sells for. A subscription part becomes shares = fund asset it adds × share supply ÷ the fund's holding of that asset, counted only once the fund's own rebalance is complete. The fund is never valued in USD.
+1. **Execution pricing.** Subscriptions and redemptions are only filled inside the settlement opened by the fixing time that closes their epoch, and only by actual execution (ADR 0002, 0006). A redemption receives what its redemption slice actually sells for. A subscription part becomes shares = fund asset it adds × share supply ÷ the fund's holding of that asset, counted only once the fund's own rebalance is complete. The fund's USDC is the vault USDC plus the lent value (ADR 0008). The fund is never valued in USD.
 2. **Fixed pricing time.** The moving average, the signal and netting use fixing prices published in `[fix_time, fix_time + FIX_WINDOW_SECS)`, never the price when an instruction is called. A request submitted after a fixing time belongs to the next epoch, so the queue never closes. A request can be cancelled until the fixing time that closes its epoch; a pending subscription can be cancelled at any time.
-3. **Internal accounting.** Share issuance and redemption slices use `FundState.usdc`, `FundState.btc` and `FundState.share_supply`. Never derive them from token-account balances (prevents donation/inflation attacks). Redemption slices and pending subscriptions are tracked separately and are not fund assets.
+3. **Internal accounting.** Share issuance and redemption slices use `FundState.usdc`, `FundState.btc`, `FundState.receipts` and `FundState.share_supply`. Never derive them from token-account balances (prevents donation/inflation attacks). Redemption slices and pending subscriptions are tracked separately and are not fund assets.
 4. **Exact claims.** The last claimant of an epoch gets the exact remainder (`take_pro_rata` for redemption USDC and refunds; the remaining `unclaimed_shares` for subscription shares, which may be claimed in parts as they fill). After all tickets of an epoch are claimed, `unclaimed_*` fields are zero and the sum of claims equals the epoch totals. Redemptions become claimable only once that epoch's redemption slice is fully sold.
 5. **Share supply.** `FundState.share_supply` must always equal (shares held by users, including the manager) + (shares queued for redemption) + (shares issued to subscribers and still in the share escrow, `unclaimed_shares`). Tests assert this exactly.
 6. **No stuck states.** A settlement must never fail permanently. Work left at the next fixing time carries into the next settlement. Unsold redemption slices keep selling first, and pending subscriptions stay the user's until filled or cancelled. A depeg blocks buying cbBTC, never selling it or settling.
@@ -77,18 +77,20 @@ flowchart LR
 10. **Step atomicity.** Settlement is several instructions (ADR 0001). Within each instruction, all token movements and checks happen together, so a failure rolls that step back. The state between steps must always let the next step resume.
 11. **Price feeds.** One feed, named by the `signal_feed` config, drives the signal, the moving average, netting and `min_out`: BTC/USD by default, or Pyth cbBTC/USD where that feed exists (ADR 0005). It is set at `initialize` and changes only through the timelock. When the signal uses cbBTC/USD, a gap above the depeg threshold against BTC/USD blocks buys (ADR 0003), and so does a missing or stale BTC/USD reference, which never blocks sells or fixing. With only BTC/USD there is no depeg check and trades rely on the slippage bound. A missed day's fixing price may be backfilled only with a Pyth update published in that day's fixing window.
 12. **Withdrawal fee.** 1% of the USDC a redeemer claims goes to the fee address, set at `initialize` and changeable only through the 48-hour timelock. `claim` only records it in `FundState.fees_owed` (the USDC stays in the payout vault) and `collect_fees` pays it out, so a problem with the fee address's token account can never block a claim. The rate is capped at 1% in code. There is no performance fee and no redemption fee (ADR 0007).
+13. **Lending.** Only the fund's own USDC is lent, only while the target is USDC, and only up to `lending_cap_bps` of the vault USDC plus the lent value. Pending subscriptions, redemption slices, payouts and fees owed are never lent. Lending receipts are valued at the pool's exchange rate: rounded down for payouts and the cap, up when setting a subscriber's shares. A redemption slice takes its share of the receipts and swaps them with the buffer before waiting on the pool. Deposits and withdrawals happen inside `trade`, one per call, outside the trade cap, interval, slippage and depeg checks; a buy withdraws only its own chunk in the same instruction. A pool that cannot pay makes those steps wait (`PoolIlliquid`), never fail permanently. The admin may lower the cap immediately (also in a pending proposal); raising it goes through the timelock (ADR 0008).
 
 ## Keeping the two layers in sync
 
 These are easy to break when editing:
 
-- `StateData` (program) mirrors `fund_logic::FundState` field-for-field. Update `from_logic` / `to_logic` together.
+- `StateData` (program) mirrors `fund_logic::FundState` field-for-field, including `receipts`; `SliceData` mirrors `fund_logic::Slice`, including `receipts`. Update `from_logic` / `to_logic` together.
 - `StateData.prices` is `[u64; 64]` and `StateData.price_days` is `[i64; 64]`, both as **literals** (the IDL needs it). They must equal `fund_logic::MAX_WINDOW`; a compile-time assertion enforces this.
 - `StateData.slices` is `[SliceData; 8]` and `StateData.pending` is `[PendingData; 8]`, literals mirroring `fund_logic::Slice` and `fund_logic::Pending`; they must equal `MAX_SLICES` and `MAX_PENDING` (compile-time assertions).
 - `Ticket` (program) mirrors `fund_logic::Ticket`, including `shares_claimed`.
 - `EpochRecord` (program) mirrors `fund_logic::EpochRecord`, including the five `unclaimed_*` fields, the two `cancelled_*` fields and the display-only `fund_usdc` / `fund_btc` / `fund_shares` snapshot (the frontend's share price curve). Update `set_from_logic`, `set_unclaimed`, and `to_logic`.
 - Every `fund_logic::FundError` variant needs a matching `FundErrorCode` and an arm in `map_err`. The match is exhaustive, so the compiler will remind you.
-- `ConfigData.signal_feed` (`SignalFeedData`) mirrors `fund_logic::SignalFeed`; map it in `to_logic`.
+- `ConfigData.signal_feed` (`SignalFeedData`) mirrors `fund_logic::SignalFeed`; map it in `to_logic`. `ConfigData.lending_cap_bps` maps to the same field; `lower_lending_cap` writes it back to the config and the pending proposal.
+- `Fund.pool` is the lending pool, checked against the `pool` account in `fix` and `trade`. `trade`'s pool accounts sit in the nested `LendingAccounts` struct: one flat struct overflows the 4 KB SBF stack frame of `try_accounts`.
 - `ConfigData` has extra fields checked in the program, not in `fund-logic`: `max_staleness_secs`, `keeper` (mapped to `fund_logic::Caller`), `fee_address` (where `collect_fees` sends the withdrawal fee) and the Pyth feed IDs `btc_feed_id` / `cbbtc_feed_id`.
 - After changing the program's interface, run `yarn sync-idl` in `app/` so the frontend uses the new IDL.
 
@@ -101,6 +103,7 @@ These are easy to break when editing:
 | Shares | `u64`, 6 decimals; the first subscriber gets 1 share per USDC |
 | Price | `u64`, micro-USD per 1 BTC |
 | Basis points | `u16`, out of 10,000 |
+| Lending pool rate | `u64`, USDC base units per receipt × `RATE_ONE` (10^12) |
 
 `initialize` enforces USDC = 6 decimals and BTC = 8 decimals. Don't relax this without updating every conversion.
 
@@ -115,6 +118,9 @@ These are easy to break when editing:
 | Epoch record | `"epoch", fund, epoch.to_le_bytes()` |
 | Mock market | `"market", authority` |
 | Market vaults | `"market_usdc" / "market_btc", market` |
+| Mock lending pool | `"pool", authority` |
+| Pool USDC vault / receipt mint | `"pool_usdc" / "pool_receipt", pool` |
+| Fund receipt vault | `"receipt_vault", fund` |
 
 Changing seeds breaks existing deployments and the tests/scripts that derive these addresses. Update `tests/tide.ts` and `scripts/crank.ts` in the same change.
 
@@ -141,12 +147,14 @@ Changing seeds breaks existing deployments and the tests/scripts that derive the
 | 10 Step atomicity | `fill_below_min_out_reverts_that_trade_only`, `too_many_unsold_slices_delays_fixing_until_they_sell` (a failed fix leaves the state unchanged), e2e day 2 rollback |
 | 11 Price feeds | `the_moving_average_records_the_chosen_feeds_fixing_price`, `the_depeg_check_runs_only_when_both_feeds_exist`, `a_gap_then_backfill_restores_the_50_day_average`, `backfill_only_fills_a_missing_day_with_its_fixing_window_price` |
 | 12 Withdrawal fee | `redeemers_pay_the_withdrawal_fee_on_gains_and_losses`, `share_claims_and_refunds_pay_no_withdrawal_fee`, `config_validation` (cap at 1%), e2e day 2 |
+| 13 Lending | `idle_usdc_is_lent_up_to_the_cap_only_while_the_target_is_usdc`, `a_usdc_subscription_gets_shares_by_the_usdc_it_adds_including_the_lent_part`, `the_redemption_slice_swaps_its_receipts_with_the_buffer_first`, `a_slice_waits_for_an_illiquid_pool_while_settlement_carries_on`, `a_buy_withdraws_only_what_the_pool_can_pay_and_waits_for_the_rest`, `lowering_the_lending_cap_is_immediate_and_raising_needs_the_timelock`, `interest_and_losses_are_shared_by_all_shares`, `the_mock_pool_accrues_simple_interest_and_takes_haircuts`, both randomized simulations (random rate, losses, illiquid days, cap cuts), e2e "借贷" |
 
 ## Mock components
 
-The oracle is real Pyth: `read_pyth` in the program checks the account owner (Pyth receiver), full Wormhole verification and the feed ID; `fund_logic::pyth_to_micro_usd` converts the exponent (rounding down) and rejects wide confidence intervals; `trade` also checks `max_staleness_secs`. `MockMarket`, `init_mock_market` and `set_mock_market_fee` exist only for devnet. When replacing them:
+The oracle is real Pyth: `read_pyth` in the program checks the account owner (Pyth receiver), full Wormhole verification and the feed ID; `fund_logic::pyth_to_micro_usd` converts the exponent (rounding down) and rejects wide confidence intervals; `trade` also checks `max_staleness_secs`. `MockMarket`, `init_mock_market` and `set_mock_market_fee` exist only for devnet, and so do `MockPool`, `init_mock_pool` and `set_mock_pool` (a lending pool with an admin-set rate, a withdrawable limit and a loss haircut; its math is `mock_pool_accrue` / `mock_pool_haircut` in `fund-logic`). When replacing them:
 
 - **Exchange (Jupiter):** compute the route off-chain, pass route accounts into `trade`, and keep the on-chain `min_out` check against the oracle. Never trust a price supplied by the caller.
+- **Lending pool (e.g. Kamino, marginfi):** refresh the reserve, deposit and redeem through CPI, and read the exchange rate and withdrawable liquidity from the reserve account into `fund_logic::LendingPool`. Keep `fund-logic` deciding the amounts, and record what the pool actually returned.
 - Remove the mock instructions from mainnet builds (e.g. behind a cargo feature).
 
 ## Security checklist for any change
@@ -156,7 +164,7 @@ The oracle is real Pyth: `read_pyth` in the program checks the account owner (Py
 - [ ] No arithmetic that can overflow or underflow without a checked operation.
 - [ ] No path where a user can claim twice, claim another user's ticket, or claim before settlement.
 - [ ] No new instruction lets the admin take user funds. The admin cannot withdraw from vaults. The only value that goes to a non-user is the withdrawal fee, paid in USDC to the fee address (set at `initialize`, changed only through the timelock; ADR 0007).
-- [ ] The admin is a multisig. Config changes (trade cap, trade interval, slippage bounds, keeper window, depeg threshold, fee rate, keeper, fee address) go through a 48-hour timelock. The only immediate admin action is pausing subscriptions; redemptions can never be paused.
+- [ ] The admin is a multisig. Config changes (trade cap, trade interval, slippage bounds, keeper window, depeg threshold, fee rate, keeper, fee address, raising the lending cap) go through a 48-hour timelock. The only immediate admin actions are pausing subscriptions and lowering the lending cap; redemptions can never be paused.
 - [ ] The fund cannot end up in a state where `fix` or `trade` always fails.
 
 ## Things not to do

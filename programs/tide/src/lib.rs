@@ -12,7 +12,8 @@
 //!     trade：之后反复调用，每次一笔不超过 trade_cap_usdc 的交易，间隔至少
 //!          min_trade_interval_secs；先卖赎回资产，再把基金调向目标，最后为申购买入
 //!          （目标为 USDC 时申购款不交易直接成交），按带来的资产发份额（ADR 0006）；
-//!          没有可交易的时候返回 NothingToTrade / TradeTooSoon / DepegBlocksBuy
+//!          目标为 USDC 时把基金的 USDC 存入借贷池，最多到借出上限（ADR 0008）；
+//!          没有可交易的时候返回 NothingToTrade / TradeTooSoon / DepegBlocksBuy / PoolIlliquid
 //!   信号和轧差只取决于 1 点发布的价格，和调用 fix 的时间无关；某天没有 fix 时，
 //!   这一期的请求顺延到下一次 fix，一次 fix 可以关闭好几期
 //! - 用户调用 claim 领取份额（可以分几次领取已成交的部分）；赎回人要等这一期的赎回资产卖完才能领取 USDC，
@@ -21,7 +22,8 @@
 //!
 //! - 均线按日历日计算：某天没有定价时，任何人可以用那天定价窗口内发布的价格 backfill_price
 //! - 治理：管理员（应为外部多签，比如 Squads）提议一份完整的新配置，48 小时之后才能生效；
-//!   唯一立即生效的操作是暂停、恢复申购。赎回永远不能暂停，管理员也不能动基金资产
+//!   立即生效的只有暂停、恢复申购和降低借出上限（lower_lending_cap）。赎回永远不能暂停，
+//!   管理员也不能动基金资产
 //!
 //! - 价格源（ADR 0005）：config.signal_feed 为 CbBtc 时信号、均线、轧差和 min_out 都用 cbBTC/USD，
 //!   有 BTC/USD 时用它检查脱锚；为 Btc 时都用 BTC/USD，不检查脱锚
@@ -32,6 +34,7 @@
 //!
 //! 原型限制（上主网前必须替换）：
 //! - 兑换走 MockMarket（按 Pyth 价格成交、收固定手续费），主网应改为 Jupiter
+//! - 借贷走 MockPool（管理员设定年化、可取回额度和亏损），主网应改为真实的借贷协议
 //!
 //! 所有记账逻辑在 fund-logic crate 中（纯 Rust，有完整单元测试），本文件只负责
 //! 账户校验和代币转账。
@@ -69,6 +72,7 @@ pub mod tide {
         fund.btc_mint = ctx.accounts.btc_mint.key();
         fund.share_mint = ctx.accounts.share_mint.key();
         fund.market = ctx.accounts.market.key();
+        fund.pool = ctx.accounts.pool.key();
         fund.config = config;
         fund.state = StateData::from_logic(&logic::FundState::new());
         fund.pending_config = None;
@@ -78,6 +82,11 @@ pub mod tide {
 
     /// 第 2 步：创建基金的 5 个代币账户（分开做，避免单条指令账户过多）
     pub fn init_vaults(_ctx: Context<InitVaults>) -> Result<()> {
+        Ok(())
+    }
+
+    /// 第 3 步：创建基金存放借贷凭证的代币账户
+    pub fn init_receipt_vault(_ctx: Context<InitReceiptVault>) -> Result<()> {
         Ok(())
     }
 
@@ -164,6 +173,21 @@ pub mod tide {
         fund.config = pending.config;
         fund.pending_config = None;
         emit!(ConfigApplied {});
+        Ok(())
+    }
+
+    /// 立即降低借出上限（ADR 0008），比如借贷池出问题时降到 0：之后的 trade 把超出的 USDC 取回。
+    /// 提高只能通过 propose_config 的时间锁；还没生效的提议里的上限一起降低
+    pub fn lower_lending_cap(ctx: Context<AdminOnly>, bps: u16) -> Result<()> {
+        let fund = &mut ctx.accounts.fund;
+        let mut cfg = fund.config.to_logic();
+        let mut pending = fund.pending_config.map(|p| p.config.to_logic());
+        logic::lower_lending_cap(&mut cfg, pending.as_mut(), bps).map_err(map_err)?;
+        fund.config.lending_cap_bps = cfg.lending_cap_bps;
+        if let (Some(p), Some(c)) = (fund.pending_config.as_mut(), pending) {
+            p.config.lending_cap_bps = c.lending_cap_bps;
+        }
+        emit!(LendingCapLowered { bps });
         Ok(())
     }
 
@@ -428,8 +452,10 @@ pub mod tide {
         // 基金状态有 1.5KB，放在堆上：SBF 每个栈帧只有 4KB
         let mut st = Box::new(ctx.accounts.fund.state.to_logic());
         let caller = fund_cfg.caller(&ctx.accounts.cranker.key());
+        // 赎回资产里的借贷凭证按此刻的比率和备用金互换（只读：借贷池的计息在存取时写入）
+        let pool = ctx.accounts.pool.current(now, 0).map_err(map_err)?;
         let logic::FixOutcome { record, fee_usdc } =
-            logic::fix(&mut st, now, &prices, caller, &cfg).map_err(map_err)?;
+            logic::fix(&mut st, now, &prices, &pool, caller, &cfg).map_err(map_err)?;
         require!(record.epoch == epoch, FundErrorCode::WrongEpochRecord);
 
         let admin = ctx.accounts.fund.admin;
@@ -458,8 +484,8 @@ pub mod tide {
             payout.clone(),
             record.netted_usdc,
         )?;
-        // 2) 赎回资产里的 USDC 转入待领取账户；cbBTC 留在 BTC 账户里，之后卖出
-        //    （轧差换给申购人的那部分 cbBTC 已经算进基金）
+        // 2) 赎回资产里的 USDC（含和备用金互换的借贷凭证）转入待领取账户；cbBTC 留在 BTC 账户里、
+        //    换不完的凭证留在凭证账户里，之后卖出、取回（轧差换给申购人的那部分 cbBTC 已经算进基金）
         fund_transfer(&tp, &fund_ai, fund_signer, vault, payout, record.slice_usdc)?;
         // 3) 销毁本期赎回的份额（用户申请赎回时已转入份额托管账户）
         if record.redemption_shares > 0 {
@@ -509,9 +535,9 @@ pub mod tide {
         Ok(())
     }
 
-    /// 一笔交易（或一次不交易的申购成交）。epoch_record 传最早一期未卖完的赎回资产的记录
-    /// （fund.state.slices[0].epoch）；没有赎回资产时传最早一期待成交申购的记录
-    /// （fund.state.pending[0].epoch）；都没有时不传。基金调仓用不到它。
+    /// 一笔交易（或一次不交易的申购成交、一次借贷池存取）。epoch_record 传最早一期未卖完的
+    /// 赎回资产的记录（fund.state.slices[0].epoch）；没有赎回资产时传最早一期待成交申购的记录
+    /// （fund.state.pending[0].epoch）；都没有时不传。基金调仓和借贷池存取用不到它。
     pub fn trade(ctx: Context<Trade>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let fund_cfg = ctx.accounts.fund.config;
@@ -529,81 +555,34 @@ pub mod tide {
         // 基金状态有 1.5KB，放在堆上：SBF 每个栈帧只有 4KB
         let mut st = Box::new(ctx.accounts.fund.state.to_logic());
         let caller = fund_cfg.caller(&ctx.accounts.cranker.key());
-        let plan = logic::plan_trade(&st, now, &prices, caller, &cfg).map_err(map_err)?;
+        // 借贷池先计息到此刻，存取都按这个比率
+        let lending = &mut ctx.accounts.lending;
+        let pool = lending
+            .pool
+            .current(now, lending.pool_usdc.amount)
+            .map_err(map_err)?;
+        lending.pool.rate = pool.rate;
+        lending.pool.last_update = now;
+        let plan = logic::plan_trade(&st, now, &prices, &pool, caller, &cfg).map_err(map_err)?;
 
-        let admin = ctx.accounts.fund.admin;
-        let fund_bump = ctx.accounts.fund.bump;
-        let fund_seeds: &[&[u8]] = &[b"fund", admin.as_ref(), &[fund_bump]];
-        let fund_signer = &[fund_seeds];
-        let tp = ctx.accounts.token_program.to_account_info();
-        let fund_ai = ctx.accounts.fund.to_account_info();
-        // 买入用的 USDC：申购的从申购托管出，基金的从主账户出。
-        // 卖出所得：赎回资产的进待领取账户，基金的进主账户。
-        let usdc_source = match plan.bucket {
-            logic::TradeBucket::Subscription { .. } => {
-                ctx.accounts.subscription_escrow.to_account_info()
-            }
-            _ => ctx.accounts.usdc_vault.to_account_info(),
-        };
-        let usdc_dest = match plan.bucket {
-            logic::TradeBucket::Slice { .. } => ctx.accounts.payout_vault.to_account_info(),
-            _ => ctx.accounts.usdc_vault.to_account_info(),
-        };
         let got = match plan.side {
-            // 目标为 USDC：申购款直接进入基金，不经过交易所
-            logic::Side::WithoutTrade => {
-                fund_transfer(
-                    &tp,
-                    &fund_ai,
-                    fund_signer,
-                    usdc_source,
-                    ctx.accounts.usdc_vault.to_account_info(),
-                    plan.amount_in,
-                )?;
-                0
-            }
-            side => {
-                // 原型：模拟交易所按与 min_out 相同的最新估值价格成交并收手续费
-                let market = &ctx.accounts.market;
-                let m_auth = market.authority;
-                let m_seeds: &[&[u8]] = &[b"market", m_auth.as_ref(), &[market.bump]];
-                let (fund_from, mkt_to, mkt_from, fund_to) = if side == logic::Side::BuyBtc {
-                    (
-                        usdc_source,
-                        ctx.accounts.market_usdc.to_account_info(),
-                        ctx.accounts.market_btc.to_account_info(),
-                        ctx.accounts.btc_vault.to_account_info(),
-                    )
-                } else {
-                    (
-                        ctx.accounts.btc_vault.to_account_info(),
-                        ctx.accounts.market_btc.to_account_info(),
-                        ctx.accounts.market_usdc.to_account_info(),
-                        usdc_dest,
-                    )
+            logic::Side::Deposit => pool_deposit(&ctx.accounts, &plan)?,
+            logic::Side::Withdraw => {
+                // 赎回资产取回的进待领取账户，基金的进主账户
+                let dest = match plan.bucket {
+                    logic::TradeBucket::Slice { .. } => ctx.accounts.payout_vault.to_account_info(),
+                    _ => ctx.accounts.usdc_vault.to_account_info(),
                 };
-                let got = logic::market_fill(&plan, plan.price, market.fee_bps).map_err(map_err)?;
-                fund_transfer(
-                    &tp,
-                    &fund_ai,
-                    fund_signer,
-                    fund_from,
-                    mkt_to,
-                    plan.amount_in,
-                )?;
-                token::transfer(
-                    CpiContext::new_with_signer(
-                        tp.clone(),
-                        Transfer {
-                            from: mkt_from,
-                            to: fund_to,
-                            authority: market.to_account_info(),
-                        },
-                        &[m_seeds],
-                    ),
-                    got,
-                )?;
-                got
+                pool_withdraw(ctx.accounts, plan.amount_in, plan.rate, dest)?
+            }
+            _ => {
+                if plan.withdraw_receipts > 0 {
+                    // 买入之前先从借贷池取回这一笔要花的，同一条指令里：取回和买入一起成功或失败
+                    let dest = ctx.accounts.usdc_vault.to_account_info();
+                    let w = pool_withdraw(ctx.accounts, plan.withdraw_receipts, plan.rate, dest)?;
+                    require!(w >= plan.withdraw_usdc, FundErrorCode::SlippageExceeded);
+                }
+                swap(&ctx.accounts, &plan)?
             }
         };
 
@@ -616,15 +595,17 @@ pub mod tide {
         }
         // 申购成交发行的份额放在份额托管账户，等申购人领取
         if minted > 0 {
+            let admin = ctx.accounts.fund.admin;
+            let fund_seeds: &[&[u8]] = &[b"fund", admin.as_ref(), &[ctx.accounts.fund.bump]];
             token::mint_to(
                 CpiContext::new_with_signer(
-                    tp.clone(),
+                    ctx.accounts.token_program.to_account_info(),
                     MintTo {
                         mint: ctx.accounts.share_mint.to_account_info(),
                         to: ctx.accounts.share_escrow.to_account_info(),
-                        authority: fund_ai.clone(),
+                        authority: ctx.accounts.fund.to_account_info(),
                     },
-                    fund_signer,
+                    &[fund_seeds],
                 ),
                 minted,
             )?;
@@ -636,9 +617,12 @@ pub mod tide {
                 logic::Side::BuyBtc => TradeSide::BuyBtc,
                 logic::Side::SellBtc => TradeSide::SellBtc,
                 logic::Side::WithoutTrade => TradeSide::WithoutTrade,
+                logic::Side::Deposit => TradeSide::Deposit,
+                logic::Side::Withdraw => TradeSide::Withdraw,
             },
             amount_in: plan.amount_in,
             amount_out: got,
+            withdrawn_usdc: plan.withdraw_usdc,
             record_epoch: plan.bucket.record_epoch(),
             minted_shares: minted,
         });
@@ -707,6 +691,201 @@ pub mod tide {
         ctx.accounts.market.fee_bps = fee_bps;
         Ok(())
     }
+
+    // ------------------------------------------------------------------
+    // 原型专用：模拟借贷池（换成真实的借贷协议之后删除）
+    // ------------------------------------------------------------------
+
+    /// 创建模拟借贷池：1 份凭证起始值 1 USDC 原始单位，按 apy_bps 计息，取回不设限。
+    /// 利息由池子的 USDC 账户支付，管理员要先往里注入足够的 USDC
+    pub fn init_mock_pool(ctx: Context<InitMockPool>, apy_bps: u16) -> Result<()> {
+        let p = &mut ctx.accounts.pool;
+        p.authority = ctx.accounts.authority.key();
+        p.usdc_mint = ctx.accounts.usdc_mint.key();
+        p.receipt_mint = ctx.accounts.receipt_mint.key();
+        p.rate = logic::RATE_ONE as u64;
+        p.last_update = Clock::get()?.unix_timestamp;
+        p.apy_bps = apy_bps;
+        p.withdraw_limit = u64::MAX;
+        p.bump = ctx.bumps.pool;
+        Ok(())
+    }
+
+    /// 设定模拟借贷池：先按旧年化计息到此刻，再按 haircut_bps 亏损（比率立即下降），
+    /// 换成新的年化和可取回额度（之后每次取回从额度里扣，0 表示付不出）
+    pub fn set_mock_pool(
+        ctx: Context<SetMockPool>,
+        apy_bps: u16,
+        withdraw_limit: u64,
+        haircut_bps: u16,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let p = &mut ctx.accounts.pool;
+        let rate = logic::mock_pool_accrue(p.rate, p.apy_bps, now.saturating_sub(p.last_update))
+            .map_err(map_err)?;
+        p.rate = logic::mock_pool_haircut(rate, haircut_bps).map_err(map_err)?;
+        p.last_update = now;
+        p.apy_bps = apy_bps;
+        p.withdraw_limit = withdraw_limit;
+        Ok(())
+    }
+}
+
+/// 存入借贷池：USDC 从主账户进池子，池子按比率给凭证账户发凭证（向下取整）。返回收到的凭证
+// 不内联：trade 的栈帧已经接近 SBF 的 4KB 上限
+#[inline(never)]
+fn pool_deposit(a: &Trade, plan: &logic::TradePlan) -> Result<u64> {
+    let admin = a.fund.admin;
+    let fund_seeds: &[&[u8]] = &[b"fund", admin.as_ref(), &[a.fund.bump]];
+    let tp = a.token_program.to_account_info();
+    fund_transfer(
+        &tp,
+        &a.fund.to_account_info(),
+        &[fund_seeds],
+        a.usdc_vault.to_account_info(),
+        a.lending.pool_usdc.to_account_info(),
+        plan.amount_in,
+    )?;
+    let receipts = logic::receipts_for(plan.amount_in, plan.rate).map_err(map_err)?;
+    let p_auth = a.lending.pool.authority;
+    let p_seeds: &[&[u8]] = &[b"pool", p_auth.as_ref(), &[a.lending.pool.bump]];
+    token::mint_to(
+        CpiContext::new_with_signer(
+            tp,
+            MintTo {
+                mint: a.lending.receipt_mint.to_account_info(),
+                to: a.receipt_vault.to_account_info(),
+                authority: a.lending.pool.to_account_info(),
+            },
+            &[p_seeds],
+        ),
+        receipts,
+    )?;
+    Ok(receipts)
+}
+
+/// 从借贷池取回：销毁凭证账户里的 receipts 份凭证，池子按比率付 USDC 到 dest（向下取整），
+/// 从可取回额度里扣。池子付不出时失败（plan_trade 已按额度规划，正常不会发生）。返回收到的 USDC
+#[inline(never)]
+fn pool_withdraw<'info>(
+    a: &mut Trade<'info>,
+    receipts: u64,
+    rate: u64,
+    dest: AccountInfo<'info>,
+) -> Result<u64> {
+    let usdc = logic::lent_value(receipts, rate).map_err(map_err)?;
+    let available = a
+        .lending
+        .pool
+        .withdraw_limit
+        .min(a.lending.pool_usdc.amount);
+    require!(usdc <= available, FundErrorCode::PoolIlliquid);
+    a.lending.pool.withdraw_limit -= usdc;
+    let admin = a.fund.admin;
+    let fund_seeds: &[&[u8]] = &[b"fund", admin.as_ref(), &[a.fund.bump]];
+    let tp = a.token_program.to_account_info();
+    token::burn(
+        CpiContext::new_with_signer(
+            tp.clone(),
+            Burn {
+                mint: a.lending.receipt_mint.to_account_info(),
+                from: a.receipt_vault.to_account_info(),
+                authority: a.fund.to_account_info(),
+            },
+            &[fund_seeds],
+        ),
+        receipts,
+    )?;
+    let p_auth = a.lending.pool.authority;
+    let p_seeds: &[&[u8]] = &[b"pool", p_auth.as_ref(), &[a.lending.pool.bump]];
+    if usdc > 0 {
+        token::transfer(
+            CpiContext::new_with_signer(
+                tp,
+                Transfer {
+                    from: a.lending.pool_usdc.to_account_info(),
+                    to: dest,
+                    authority: a.lending.pool.to_account_info(),
+                },
+                &[p_seeds],
+            ),
+            usdc,
+        )?;
+    }
+    Ok(usdc)
+}
+
+/// 不交易的申购成交，或者经模拟交易所的一笔买卖。返回交易所付出的数量
+#[inline(never)]
+fn swap(a: &Trade, plan: &logic::TradePlan) -> Result<u64> {
+    let admin = a.fund.admin;
+    let fund_seeds: &[&[u8]] = &[b"fund", admin.as_ref(), &[a.fund.bump]];
+    let fund_signer = &[fund_seeds];
+    let tp = a.token_program.to_account_info();
+    let fund_ai = a.fund.to_account_info();
+    // 买入用的 USDC：申购的从申购托管出，基金的从主账户出。
+    // 卖出所得：赎回资产的进待领取账户，基金的进主账户。
+    let usdc_source = match plan.bucket {
+        logic::TradeBucket::Subscription { .. } => a.subscription_escrow.to_account_info(),
+        _ => a.usdc_vault.to_account_info(),
+    };
+    let usdc_dest = match plan.bucket {
+        logic::TradeBucket::Slice { .. } => a.payout_vault.to_account_info(),
+        _ => a.usdc_vault.to_account_info(),
+    };
+    if plan.side == logic::Side::WithoutTrade {
+        // 目标为 USDC：申购款直接进入基金，不经过交易所
+        fund_transfer(
+            &tp,
+            &fund_ai,
+            fund_signer,
+            usdc_source,
+            a.usdc_vault.to_account_info(),
+            plan.amount_in,
+        )?;
+        return Ok(0);
+    }
+    // 原型：模拟交易所按与 min_out 相同的最新估值价格成交并收手续费
+    let market = &a.market;
+    let m_auth = market.authority;
+    let m_seeds: &[&[u8]] = &[b"market", m_auth.as_ref(), &[market.bump]];
+    let (fund_from, mkt_to, mkt_from, fund_to) = if plan.side == logic::Side::BuyBtc {
+        (
+            usdc_source,
+            a.market_usdc.to_account_info(),
+            a.market_btc.to_account_info(),
+            a.btc_vault.to_account_info(),
+        )
+    } else {
+        (
+            a.btc_vault.to_account_info(),
+            a.market_btc.to_account_info(),
+            a.market_usdc.to_account_info(),
+            usdc_dest,
+        )
+    };
+    let got = logic::market_fill(plan, plan.price, market.fee_bps).map_err(map_err)?;
+    fund_transfer(
+        &tp,
+        &fund_ai,
+        fund_signer,
+        fund_from,
+        mkt_to,
+        plan.amount_in,
+    )?;
+    token::transfer(
+        CpiContext::new_with_signer(
+            tp,
+            Transfer {
+                from: mkt_from,
+                to: fund_to,
+                authority: market.to_account_info(),
+            },
+            &[m_seeds],
+        ),
+        got,
+    )?;
+    Ok(got)
 }
 
 /// fund-logic 看不到的配置项：价格最多多旧、清算地址、收费地址、Pyth 价格源 ID
@@ -867,8 +1046,9 @@ pub struct ConfigData {
     pub subscription_cap_usdc: u64,
     pub signal_feed: SignalFeedData,
     pub max_confidence_bps: u16,
+    pub lending_cap_bps: u16, // 借出上限（ADR 0008）：只有降低能立即生效（lower_lending_cap）
     pub max_staleness_secs: i64, // 交易用的 Pyth 价格最多允许多旧 // 预言机价格最多允许多旧
-    pub keeper: Pubkey,          // 清算地址：清算窗口内唯一能驱动结算的签名人
+    pub keeper: Pubkey,       // 清算地址：清算窗口内唯一能驱动结算的签名人
     pub fee_address: Pubkey,
     pub btc_feed_id: [u8; 32],   // Pyth BTC/USD 价格源 ID
     pub cbbtc_feed_id: [u8; 32], // Pyth cbBTC/USD 价格源 ID（signal_feed 为 Btc 时可以全 0） // 收费地址（管理人）：collect_fees 把取款费付到它的 USDC 关联代币账户
@@ -894,6 +1074,7 @@ impl ConfigData {
                 SignalFeedData::Btc => logic::SignalFeed::Btc,
             },
             max_confidence_bps: self.max_confidence_bps,
+            lending_cap_bps: self.lending_cap_bps,
         }
     }
 
@@ -912,6 +1093,7 @@ pub struct SliceData {
     pub epoch: u64,
     pub btc: u64,
     pub usdc: u64,
+    pub receipts: u64,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, Debug, Default)]
@@ -924,6 +1106,7 @@ pub struct PendingData {
 pub struct StateData {
     pub usdc: u64,
     pub btc: u64,
+    pub receipts: u64,
     pub share_supply: u64,
     pub queued_subscription_usdc: u64,
     pub queued_redemption_shares: u64,
@@ -948,6 +1131,7 @@ impl StateData {
         StateData {
             usdc: s.usdc,
             btc: s.btc,
+            receipts: s.receipts,
             share_supply: s.share_supply,
             queued_subscription_usdc: s.queued_subscription_usdc,
             queued_redemption_shares: s.queued_redemption_shares,
@@ -963,6 +1147,7 @@ impl StateData {
                 epoch: x.epoch,
                 btc: x.btc,
                 usdc: x.usdc,
+                receipts: x.receipts,
             }),
             slice_count: s.slice_count,
             pending: s.pending.map(|x| PendingData {
@@ -978,6 +1163,7 @@ impl StateData {
         logic::FundState {
             usdc: self.usdc,
             btc: self.btc,
+            receipts: self.receipts,
             share_supply: self.share_supply,
             queued_subscription_usdc: self.queued_subscription_usdc,
             queued_redemption_shares: self.queued_redemption_shares,
@@ -993,6 +1179,7 @@ impl StateData {
                 epoch: x.epoch,
                 btc: x.btc,
                 usdc: x.usdc,
+                receipts: x.receipts,
             }),
             slice_count: self.slice_count,
             pending: self.pending.map(|x| logic::Pending {
@@ -1021,6 +1208,7 @@ pub struct Fund {
     pub btc_mint: Pubkey,
     pub share_mint: Pubkey,
     pub market: Pubkey,
+    pub pool: Pubkey, // 借贷池（devnet 是 MockPool）
     pub config: ConfigData,
     pub state: StateData,
     pub bump: u8,
@@ -1168,6 +1356,39 @@ pub struct MockMarket {
     pub bump: u8,
 }
 
+/// 原型专用：模拟借贷池。1 份凭证值 rate ÷ RATE_ONE 个 USDC 原始单位，按 apy_bps 单利计息；
+/// withdraw_limit 是还能取回多少 USDC（模拟借贷池付不出），管理员还可以让比率下降（模拟亏损）
+#[account]
+#[derive(InitSpace)]
+pub struct MockPool {
+    pub authority: Pubkey,
+    pub usdc_mint: Pubkey,
+    pub receipt_mint: Pubkey,
+    pub rate: u64,
+    pub last_update: i64,
+    pub apy_bps: u16,
+    pub withdraw_limit: u64,
+    pub bump: u8,
+}
+
+impl MockPool {
+    /// 计息到 now 的比率和此刻能取回多少（额度和池子的 USDC 取小的）
+    fn current(
+        &self,
+        now: i64,
+        pool_usdc: u64,
+    ) -> core::result::Result<logic::LendingPool, logic::FundError> {
+        Ok(logic::LendingPool {
+            rate: logic::mock_pool_accrue(
+                self.rate,
+                self.apy_bps,
+                now.saturating_sub(self.last_update),
+            )?,
+            available: self.withdraw_limit.min(pool_usdc),
+        })
+    }
+}
+
 #[event]
 pub struct Fixed {
     pub epoch: u64,       // 定价当天的日期序号
@@ -1202,11 +1423,18 @@ pub struct SubscriptionPauseChanged {
     pub paused: bool,
 }
 
+#[event]
+pub struct LendingCapLowered {
+    pub bps: u16,
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug)]
 pub enum TradeSide {
     BuyBtc,
     SellBtc,
     WithoutTrade, // 目标为 USDC 时申购款直接进入基金
+    Deposit,      // 存入借贷池
+    Withdraw,     // 从借贷池取回
 }
 
 #[event]
@@ -1214,8 +1442,9 @@ pub struct Traded {
     pub side: TradeSide,
     pub amount_in: u64,
     pub amount_out: u64,
+    pub withdrawn_usdc: u64, // 买入之前从借贷池取回的 USDC（已算在 amount_in 里）
     pub record_epoch: Option<u64>, // 服务哪一期的赎回资产或申购；基金调仓为 None
-    pub minted_shares: u64,        // 申购成交发行的份额
+    pub minted_shares: u64,  // 申购成交发行的份额
 }
 
 // ----------------------------------------------------------------------
@@ -1246,6 +1475,8 @@ pub struct Initialize<'info> {
         constraint = market.btc_mint == btc_mint.key() @ FundErrorCode::WrongMint
     )]
     pub market: Box<Account<'info, MockMarket>>,
+    #[account(constraint = pool.usdc_mint == usdc_mint.key() @ FundErrorCode::WrongMint)]
+    pub pool: Box<Account<'info, MockPool>>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
@@ -1275,6 +1506,23 @@ pub struct InitVaults<'info> {
     #[account(init, payer = admin, seeds = [b"share_escrow", fund.key().as_ref()], bump,
               token::mint = share_mint, token::authority = fund)]
     pub share_escrow: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitReceiptVault<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    #[account(seeds = [b"fund", admin.key().as_ref()], bump = fund.bump, has_one = admin,
+              has_one = pool)]
+    pub fund: Box<Account<'info, Fund>>,
+    pub pool: Box<Account<'info, MockPool>>,
+    #[account(address = pool.receipt_mint)]
+    pub receipt_mint: Box<Account<'info, Mint>>,
+    #[account(init, payer = admin, seeds = [b"receipt_vault", fund.key().as_ref()], bump,
+              token::mint = receipt_mint, token::authority = fund)]
+    pub receipt_vault: Box<Account<'info, TokenAccount>>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
@@ -1457,8 +1705,9 @@ pub struct Fix<'info> {
     #[account(mut)]
     pub cranker: Signer<'info>,
     #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump,
-              has_one = share_mint)]
+              has_one = share_mint, has_one = pool)]
     pub fund: Box<Account<'info, Fund>>,
+    pub pool: Box<Account<'info, MockPool>>,
     /// 当天的定价记录。已经存在只可能是今天定价过了：这时由 fund-logic 回答 AlreadySettled，
     /// 不会改写它（所以用 init_if_needed，而不是让创建账户失败）
     #[account(
@@ -1488,8 +1737,8 @@ pub struct Fix<'info> {
 pub struct Trade<'info> {
     /// 清算窗口内只能是清算地址，之后任何人都可以（滑点上限更严）
     pub cranker: Signer<'info>,
-    #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump,
-              has_one = market)]
+    #[account(mut, seeds = [b"fund", fund.admin.as_ref()], bump = fund.bump, has_one = market,
+              constraint = fund.pool == lending.pool.key() @ FundErrorCode::WrongPool)]
     pub fund: Box<Account<'info, Fund>>,
     /// CHECK: Pyth BTC/USD 价格更新（PriceUpdateV2），由 read_pyth 校验所有者、验证级别和价格源 ID
     pub btc_price_update: Option<UncheckedAccount<'info>>,
@@ -1501,6 +1750,9 @@ pub struct Trade<'info> {
     pub market_usdc: Box<Account<'info, TokenAccount>>,
     #[account(mut, seeds = [b"market_btc", market.key().as_ref()], bump)]
     pub market_btc: Box<Account<'info, TokenAccount>>,
+    pub lending: LendingAccounts<'info>,
+    #[account(mut, seeds = [b"receipt_vault", fund.key().as_ref()], bump)]
+    pub receipt_vault: Box<Account<'info, TokenAccount>>,
     #[account(mut, seeds = [b"usdc_vault", fund.key().as_ref()], bump)]
     pub usdc_vault: Box<Account<'info, TokenAccount>>,
     #[account(mut, seeds = [b"btc_vault", fund.key().as_ref()], bump)]
@@ -1518,6 +1770,17 @@ pub struct Trade<'info> {
     #[account(mut, has_one = fund @ FundErrorCode::WrongEpochRecord)]
     pub epoch_record: Option<Box<Account<'info, EpochRecord>>>,
     pub token_program: Program<'info, Token>,
+}
+
+/// trade 用到的借贷池账户。单独一组：trade 的账户太多，一起校验会超出 SBF 4KB 的栈帧
+#[derive(Accounts)]
+pub struct LendingAccounts<'info> {
+    #[account(mut, seeds = [b"pool", pool.authority.as_ref()], bump = pool.bump)]
+    pub pool: Box<Account<'info, MockPool>>,
+    #[account(mut, seeds = [b"pool_usdc", pool.key().as_ref()], bump)]
+    pub pool_usdc: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = pool.receipt_mint)]
+    pub receipt_mint: Box<Account<'info, Mint>>,
 }
 
 #[derive(Accounts)]
@@ -1579,6 +1842,32 @@ pub struct SetMockMarketFee<'info> {
     #[account(mut, seeds = [b"market", authority.key().as_ref()], bump = market.bump,
               has_one = authority)]
     pub market: Box<Account<'info, MockMarket>>,
+}
+
+#[derive(Accounts)]
+pub struct InitMockPool<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(init, payer = authority, space = 8 + MockPool::INIT_SPACE,
+              seeds = [b"pool", authority.key().as_ref()], bump)]
+    pub pool: Box<Account<'info, MockPool>>,
+    pub usdc_mint: Box<Account<'info, Mint>>,
+    #[account(init, payer = authority, seeds = [b"pool_usdc", pool.key().as_ref()], bump,
+              token::mint = usdc_mint, token::authority = pool)]
+    pub pool_usdc: Box<Account<'info, TokenAccount>>,
+    #[account(init, payer = authority, seeds = [b"pool_receipt", pool.key().as_ref()], bump,
+              mint::decimals = 6, mint::authority = pool)]
+    pub receipt_mint: Box<Account<'info, Mint>>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SetMockPool<'info> {
+    pub authority: Signer<'info>,
+    #[account(mut, seeds = [b"pool", authority.key().as_ref()], bump = pool.bump,
+              has_one = authority)]
+    pub pool: Box<Account<'info, MockPool>>,
 }
 
 // ----------------------------------------------------------------------
@@ -1661,6 +1950,12 @@ pub enum FundErrorCode {
     PriceTooUncertain,
     #[msg("不是有效的 Pyth 价格更新账户（所有者、验证级别或价格源不对）")]
     WrongPriceAccount,
+    #[msg("借贷池暂时付不出要取回的 USDC，稍后重试")]
+    PoolIlliquid,
+    #[msg("立即修改只能降低借出上限，提高要走时间锁")]
+    LendingCapNotLower,
+    #[msg("借贷池不是这个基金的")]
+    WrongPool,
 }
 
 fn map_err(e: logic::FundError) -> Error {
@@ -1696,6 +1991,8 @@ fn map_err(e: logic::FundError) -> Error {
         E::BackfillOutOfRange => FundErrorCode::BackfillOutOfRange,
         E::SubscriptionCapExceeded => FundErrorCode::SubscriptionCapExceeded,
         E::PriceTooUncertain => FundErrorCode::PriceTooUncertain,
+        E::PoolIlliquid => FundErrorCode::PoolIlliquid,
+        E::LendingCapNotLower => FundErrorCode::LendingCapNotLower,
     };
     error!(code)
 }

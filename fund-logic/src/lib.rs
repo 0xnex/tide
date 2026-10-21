@@ -36,6 +36,10 @@
 //!   卖出和定价照常进行，持续脱锚也不会让基金卡住。
 //! - 资产用内部记账，不读取代币账户余额，别人直接转账进来不会影响份额计算
 //!   （防止“捐款抬高份额价格”攻击）。赎回资产和待成交申购单独记账，不算基金资产。
+//! - 借出闲置的 USDC（ADR 0008）：目标为 USDC 时，基金把自己的 USDC 存入借贷池，最多到
+//!   借出上限（默认 80%），其余留作备用金。借贷凭证是基金的第三种资产，按借贷池的比率算 USDC。
+//!   存取在交易步骤里做，每次一步，不受交易上限、间隔、滑点和脱锚检查限制；买入 cbBTC 时
+//!   每笔只取回自己要花的。借贷池付不出时等待重试，结算不会因此失败。
 
 pub const BTC_UNIT: u128 = 100_000_000; // 1e8，1 枚 BTC 的原始单位
 pub const BPS: u128 = 10_000;
@@ -55,6 +59,12 @@ pub const FIX_WINDOW_SECS: i64 = 60;
 pub const TIMELOCK_SECS: i64 = 172_800;
 /// 取款费率上限（ADR 0007），写死在代码里
 pub const MAX_WITHDRAWAL_FEE_BPS: u16 = 100;
+/// 借贷池比率的单位：比率等于 RATE_ONE 时 1 份借贷凭证值 1 USDC 原始单位
+pub const RATE_ONE: u128 = 1_000_000_000_000;
+/// 存入、或超出借出上限后取回，至少这么多 USDC 才做：借出的价值随利息一直在涨，
+/// 小额不值得来回搬（借出上限降到 0 时例外，全部取回）
+pub const MIN_LENDING_MOVE: u64 = 100_000_000; // 100 USDC
+const SECONDS_PER_YEAR: u128 = 31_536_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FundError {
@@ -88,6 +98,8 @@ pub enum FundError {
     PriceAlreadyRecorded,    // 这一天已经有信号价格
     BackfillOutOfRange,      // 只能回填过去、还在存储范围内（最近 MAX_WINDOW 天）的一天
     PriceTooUncertain,       // Pyth 价格的置信区间超过 max_confidence_bps
+    PoolIlliquid,            // 借贷池暂时付不出要取回的 USDC：等它有钱了再试
+    LendingCapNotLower,      // 立即修改只能降低借出上限，提高要走时间锁
 }
 
 /// 信号（以及均线、轧差、min_out）用哪个价格源
@@ -113,6 +125,7 @@ pub struct Config {
     pub subscription_cap_usdc: u64,   // 申购上限：还没买完的申购（排队的加待成交的）最多这么多
     pub signal_feed: SignalFeed,      // 信号价格源，默认 BTC/USD；创建时设定，只能通过时间锁修改
     pub max_confidence_bps: u16,      // Pyth 价格的置信区间最多是价格的多少（太宽的价格不用）
+    pub lending_cap_bps: u16, // 借出上限：基金的 USDC（含已借出的）最多借出多少；立即只能降低
 }
 
 impl Config {
@@ -133,6 +146,7 @@ impl Config {
             subscription_cap_usdc: 1_000_000_000_000, // 1,000,000 USDC
             signal_feed: SignalFeed::Btc,
             max_confidence_bps: 100,
+            lending_cap_bps: 8_000,
         }
     }
 
@@ -164,6 +178,7 @@ impl Config {
             || self.subscription_cap_usdc < self.min_subscription
             || self.max_confidence_bps == 0
             || self.max_confidence_bps as u128 >= BPS
+            || self.lending_cap_bps as u128 > BPS
         {
             return Err(FundError::InvalidConfig);
         }
@@ -171,13 +186,14 @@ impl Config {
     }
 }
 
-/// 一期赎回资产中还没卖完的部分。cbBTC 留在基金的 BTC 账户里，
-/// USDC（定价时划出的部分 + 卖出所得）在待领取账户里，都不算基金资产。
+/// 一期赎回资产中还没卖完的部分。cbBTC 留在基金的 BTC 账户里，借贷凭证留在基金的凭证账户里，
+/// USDC（定价时划出的部分 + 卖出、取回所得）在待领取账户里，都不算基金资产。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Slice {
     pub epoch: u64,
-    pub btc: u64,  // 还没卖出的 cbBTC
-    pub usdc: u64, // 已有的 USDC：定价时划出的 + 已卖出所得
+    pub btc: u64,      // 还没卖出的 cbBTC
+    pub usdc: u64,     // 已有的 USDC：定价时划出的 + 已卖出、取回所得
+    pub receipts: u64, // 还没取回的借贷凭证（定价时备用金不够换的部分）
 }
 
 /// 一期申购中还没成交的 USDC（待成交申购），留在申购托管账户里，不算基金资产。
@@ -191,6 +207,7 @@ pub struct Pending {
 pub struct FundState {
     pub usdc: u64,                     // 基金持有的 USDC（不含排队中的申购款、赎回资产）
     pub btc: u64,                      // 基金持有的 cbBTC（不含赎回资产）
+    pub receipts: u64,                 // 基金持有的借贷凭证（不含赎回资产里的）
     pub share_supply: u64,             // 已发行份额（含排队赎回、尚未销毁的份额）
     pub queued_subscription_usdc: u64, // 下一次定价要处理的排队申购款（可能包含好几期）
     pub queued_redemption_shares: u64, // 下一次定价要处理的排队赎回份额
@@ -221,6 +238,7 @@ impl FundState {
         FundState {
             usdc: 0,
             btc: 0,
+            receipts: 0,
             share_supply: 0,
             queued_subscription_usdc: 0,
             queued_redemption_shares: 0,
@@ -295,7 +313,7 @@ pub struct EpochRecord {
     pub netted_btc: u64,           // 定价时轧差：赎回资产换给申购人的 cbBTC
     pub refund_usdc: u64,          // 待成交申购已满、本期申购全额退款的 USDC
     pub redemption_shares: u64,    // 本期赎回（已销毁）的份额
-    pub slice_usdc: u64,           // 定价时划给赎回人的 USDC
+    pub slice_usdc: u64,           // 定价时划给赎回人的 USDC（含用备用金换走的借贷凭证）
     pub slice_btc: u64,            // 定价时划给赎回人、需要卖出的 cbBTC
     pub payout_usdc: u64,          // 赎回资产全部卖完后的 USDC 总额（按份额比例分给赎回人）
     pub slice_sold_out: bool,      // 赎回资产已全部卖完，赎回人可以领取
@@ -329,6 +347,15 @@ pub enum Side {
     BuyBtc,       // 用 USDC 买 cbBTC
     SellBtc,      // 卖 cbBTC 换 USDC
     WithoutTrade, // 不交易：目标为 USDC 时，申购款直接进入基金
+    Deposit,      // 把基金的 USDC 存入借贷池，换回借贷凭证（不是市场交易）
+    Withdraw,     // 交出借贷凭证，从借贷池取回 USDC（不是市场交易）
+}
+
+/// 借贷池此刻的状态，外层从借贷池账户读出（比率已计息到此刻）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LendingPool {
+    pub rate: u64,      // 1 份借贷凭证值多少 USDC 原始单位，乘以 RATE_ONE
+    pub available: u64, // 此刻最多能取回多少 USDC
 }
 
 /// 一个预言机价格及其发布时间（unix 秒）
@@ -476,13 +503,61 @@ fn is_dust_buy(usdc: u64, price: u64) -> Result<bool, FundError> {
 }
 
 /// 基金的调仓是否已经完成（只剩目标资产，另一种只剩零头）。
-/// 只有这时才能按数量给申购发份额，也才轧差。
-fn fund_rebalanced(s: &FundState, price: u64) -> Result<bool, FundError> {
+/// 只有这时才能按数量给申购发份额，也才轧差。借出的 USDC 也是 USDC，目标为 cbBTC 时要一起买完。
+fn fund_rebalanced(s: &FundState, price: u64, rate: u64) -> Result<bool, FundError> {
     if s.target_btc {
-        is_dust_buy(s.usdc, price)
+        let usdc = (s.usdc as u128) + lent_value(s.receipts, rate)? as u128;
+        is_dust_buy(to_u64(usdc)?, price)
     } else {
         Ok(s.btc == 0)
     }
+}
+
+/// 借贷凭证按比率值多少 USDC，向下取整：付给赎回人的、和借出上限比较的都按它算
+pub fn lent_value(receipts: u64, rate: u64) -> Result<u64, FundError> {
+    to_u64((receipts as u128) * (rate as u128) / RATE_ONE)
+}
+
+/// 基金的 USDC：主账户里的加上借出的。给申购发份额时用，借出的部分向上取整，
+/// 发的份额不会偏多（取整对留下的人有利）
+fn usdc_holding_up(s: &FundState, rate: u64) -> Result<u64, FundError> {
+    let lent = ((s.receipts as u128) * (rate as u128)).div_ceil(RATE_ONE);
+    to_u64(s.usdc as u128 + lent)
+}
+
+/// 价值不超过 usdc 的借贷凭证最多几份（向下取整）。比率为 0 时凭证一文不值，多少份都行
+fn receipts_within(usdc: u64, rate: u64) -> u64 {
+    if rate == 0 {
+        return u64::MAX;
+    }
+    u64::try_from((usdc as u128) * RATE_ONE / rate as u128).unwrap_or(u64::MAX)
+}
+
+/// 存入 usdc 换到多少借贷凭证，向下取整（模拟借贷池按它发凭证，也是存入的 min_out）
+pub fn receipts_for(usdc: u64, rate: u64) -> Result<u64, FundError> {
+    if rate == 0 {
+        return Err(FundError::BadPrice);
+    }
+    to_u64((usdc as u128) * RATE_ONE / rate as u128)
+}
+
+/// devnet 模拟借贷池：比率按年化 apy_bps 计息 elapsed_secs 秒（单利，每次存取时结算，向下取整）
+pub fn mock_pool_accrue(rate: u64, apy_bps: u16, elapsed_secs: i64) -> Result<u64, FundError> {
+    let dt = u128::try_from(elapsed_secs.max(0)).map_err(|_| FundError::Overflow)?;
+    let interest = (rate as u128)
+        .checked_mul(apy_bps as u128)
+        .and_then(|x| x.checked_mul(dt))
+        .ok_or(FundError::Overflow)?
+        / (BPS * SECONDS_PER_YEAR);
+    to_u64(rate as u128 + interest)
+}
+
+/// devnet 模拟借贷池的亏损：比率立即下降 haircut_bps（不到 100%，比率至少留 1）
+pub fn mock_pool_haircut(rate: u64, haircut_bps: u16) -> Result<u64, FundError> {
+    if haircut_bps as u128 >= BPS {
+        return Err(FundError::InvalidConfig);
+    }
+    Ok(apply_bps_down(rate, haircut_bps)?.max(1))
 }
 
 fn price_slot(day: i64) -> usize {
@@ -706,6 +781,24 @@ pub fn propose_config(current: &Config, new: &Config, now_unix: i64) -> Result<i
 pub fn check_timelock(effective_at: i64, now_unix: i64) -> Result<(), FundError> {
     if now_unix < effective_at {
         return Err(FundError::TimelockNotElapsed);
+    }
+    Ok(())
+}
+
+/// 管理员立即降低借出上限（ADR 0008）：借贷池出问题时降到 0，基金在之后的交易步骤里取回借出的 USDC。
+/// 降低只会让基金更保守，所以不等时间锁；提高要通过 propose_config。
+/// 还没生效的配置提议里的上限一起降低，否则提议生效时会悄悄把上限抬回去。
+pub fn lower_lending_cap(
+    cfg: &mut Config,
+    pending: Option<&mut Config>,
+    bps: u16,
+) -> Result<(), FundError> {
+    if bps > cfg.lending_cap_bps {
+        return Err(FundError::LendingCapNotLower);
+    }
+    cfg.lending_cap_bps = bps;
+    if let Some(p) = pending {
+        p.lending_cap_bps = p.lending_cap_bps.min(bps);
     }
     Ok(())
 }
@@ -1097,13 +1190,14 @@ fn claim_parts(
 /// 定价时刻之后才提交的请求属于下一期，留在排队里。
 /// 外层据此转账：销毁赎回份额（record.redemption_shares）；基金主账户的 slice_usdc 和
 /// 申购托管的 netted_usdc 转入待领取账户；申购费 fee_usdc 从申购托管转入主账户；
-/// 为轧差发行 record.minted_shares 份。赎回资产的 cbBTC、待成交申购和退款的 USDC 留在原处。
+/// 为轧差发行 record.minted_shares 份。赎回资产的 cbBTC 和借贷凭证、待成交申购和退款的 USDC 留在原处。
 ///
 /// 顺序：
 ///   1. 检查调用人和时间：清算窗口内只有清算地址；今天还没定价，且已过定价时刻；
 ///      两个定价价格都在定价窗口内发布
 ///   2. 记录信号价格，计算均线和目标
-///   3. 销毁赎回份额，按份额比例从基金划出实物赎回资产（都向下取整，对留下的人有利）
+///   3. 销毁赎回份额，按份额比例从基金划出实物赎回资产（都向下取整，对留下的人有利）；
+///      其中的借贷凭证先用备用金按比率换成 USDC，换不完的留给之后的交易步骤从借贷池取回
 ///   4. 轧差：基金调仓已完成、目标是 cbBTC、没有脱锚时，本期申购款按估值价格换走
 ///      本期赎回资产里的 cbBTC，换到的 cbBTC 立即按数量发份额
 ///   5. 其余申购款成为待成交申购，排在更早的之后；待成交申购已满时全额退款
@@ -1114,6 +1208,7 @@ pub fn fix(
     s: &mut FundState,
     now_unix: i64,
     prices: &FixPrices,
+    pool: &LendingPool,
     caller: Caller,
     cfg: &Config,
 ) -> Result<FixOutcome, FundError> {
@@ -1152,6 +1247,7 @@ pub fn fix(
     roll_queue(&mut n, now_unix)?;
     let epoch = epoch_of_day(day)?;
     let price = feeds.price;
+    let rate = pool.rate;
 
     // 2. 信号价格进均线，决定目标（信号价格就是选定价格源的定价价格）
     let signal = price;
@@ -1159,21 +1255,35 @@ pub fn fix(
     let ma = moving_average(&n, day, cfg.window);
     n.target_btc = matches!(ma, Some(m) if signal > m);
 
-    // 当天的资产和份额（这一期的申购赎回之前），记进记录供显示
-    let (fund_usdc, fund_btc, fund_shares) = (n.usdc, n.btc, n.share_supply);
+    // 当天的资产和份额（这一期的申购赎回之前），记进记录供显示；借出的 USDC 按比率算进 USDC
+    let fund_usdc = to_u64(n.usdc as u128 + lent_value(n.receipts, rate)? as u128)?;
+    let (fund_btc, fund_shares) = (n.btc, n.share_supply);
 
     // 3. 赎回资产：按份额比例划出实物，不需要价格
     let redemption_shares = n.queued_redemption_shares;
-    let (slice_usdc, slice_btc) = if redemption_shares == 0 {
-        (0, 0)
+    let (slice_usdc, slice_btc, slice_receipts) = if redemption_shares == 0 {
+        (0, 0, 0)
     } else {
         (
             pro_rata(n.usdc, redemption_shares, n.share_supply)?,
             pro_rata(n.btc, redemption_shares, n.share_supply)?,
+            pro_rata(n.receipts, redemption_shares, n.share_supply)?,
         )
     };
     n.usdc = n.usdc.checked_sub(slice_usdc).ok_or(FundError::Overflow)?;
     n.btc = n.btc.checked_sub(slice_btc).ok_or(FundError::Overflow)?;
+    // 赎回资产里的借贷凭证先和备用金按比率互换：赎回人不用等借贷池，基金的凭证继续生息。
+    // 赎回人拿到的 USDC 向下取整（对留下的人有利）；备用金不够时，剩下的凭证之后从借贷池取回
+    let swapped = slice_receipts.min(receipts_within(n.usdc, rate));
+    let swap_usdc = lent_value(swapped, rate)?;
+    n.usdc = n.usdc.checked_sub(swap_usdc).ok_or(FundError::Overflow)?;
+    n.receipts = n
+        .receipts
+        .checked_sub(slice_receipts - swapped)
+        .ok_or(FundError::Overflow)?;
+    let slice_usdc = slice_usdc
+        .checked_add(swap_usdc)
+        .ok_or(FundError::Overflow)?;
     n.share_supply = n
         .share_supply
         .checked_sub(redemption_shares)
@@ -1198,7 +1308,7 @@ pub fn fix(
                                       // 还有更早的待成交申购时不轧差：它们先成交
     let can_net = n.target_btc
         && n.pending_count == 0
-        && fund_rebalanced(&n, price)?
+        && fund_rebalanced(&n, price, rate)?
         && !feeds.blocks_buys(cfg);
     let (netted_usdc, netted_btc) = if can_net {
         let usdc = net_subscription.min(btc_value(slice_btc, price)?);
@@ -1228,8 +1338,9 @@ pub fn fix(
         usdc: slice_usdc
             .checked_add(netted_usdc)
             .ok_or(FundError::Overflow)?,
+        receipts: slice_receipts - swapped,
     };
-    let slice_sold_out = slice.btc == 0;
+    let slice_sold_out = slice.btc == 0 && slice.receipts == 0;
     if !slice_sold_out {
         if n.slice_count as usize >= MAX_SLICES {
             return Err(FundError::TooManySlices);
@@ -1322,6 +1433,8 @@ impl TradeBucket {
 /// 一笔交易。min_out 由执行时的估值价格和滑点上限算出，
 /// 外部兑换（模拟交易所或 Jupiter）实际成交少于 min_out 必须失败。
 /// side 为 WithoutTrade 时不兑换：amount_in 的申购款直接进入基金。
+/// side 为 Deposit / Withdraw 时和借贷池存取（ADR 0008）：amount_in 是存入的 USDC / 交出的凭证，
+/// min_out 是按比率应得的凭证 / USDC。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TradePlan {
     pub side: Side,
@@ -1329,24 +1442,33 @@ pub struct TradePlan {
     pub min_out: u64,
     pub bucket: TradeBucket,
     pub price: u64, // 算 min_out 用的估值价格（选定价格源的最新价格）；模拟交易所按它成交
+    pub rate: u64,  // 借贷池比率：目标为 USDC 时，申购按它给借出的 USDC 估值
+    // 买入 cbBTC 之前先从借贷池取回这笔要花的：交出 withdraw_receipts 份凭证，
+    // 借贷池至少付 withdraw_usdc（已经算在 amount_in 里），不够时整笔失败
+    pub withdraw_receipts: u64,
+    pub withdraw_usdc: u64,
 }
 
 /// 规划下一步。清算窗口内其他调用人得到 KeeperOnly。没有可做的时返回原因：
 /// - FixPending：已过今天的定价时刻、还没定价，基金调仓和申购要等定价
-/// - NothingToTrade：赎回资产都卖完了，基金也已经是目标持仓，申购都已成交
+/// - NothingToTrade：赎回资产都卖完了，基金也已经是目标持仓，申购都已成交，借出的 USDC 在上限附近
 /// - DepegBlocksBuy：下一笔是买入 cbBTC，但 cbBTC 脱锚
+/// - PoolIlliquid：剩下要做的都要从借贷池取回 USDC，但它暂时付不出
 /// - TradeTooSoon：距离上一笔交易不到最小间隔
 ///
-/// 前三个原因先于 TradeTooSoon 判断：它们表示等多久都没有交易（直到下一次定价或恢复锚定），
-/// 驱动交易的脚本据此停下；TradeTooSoon 表示稍后重试。
+/// 前四个原因先于 TradeTooSoon 判断：它们表示等多久都没有交易（直到下一次定价、恢复锚定或借贷池
+/// 有钱），驱动交易的脚本据此停下；TradeTooSoon 表示稍后重试。
 ///
-/// 优先级：最早一期未卖完的赎回资产，然后是基金调仓，最后是最早一期待成交申购。
+/// 优先级：最早一期未卖完的赎回资产，然后是基金调仓，然后是最早一期待成交申购，
+/// 最后（目标为 USDC 时）把借出的 USDC 调到借出上限。
 /// 基金调仓完成后才处理申购：那时基金只有一种资产，才能按数量发份额。
-/// 每笔按当前估值价格折算不超过 trade_cap_usdc。不交易的成交不受交易间隔限制。
+/// 每笔按当前估值价格折算不超过 trade_cap_usdc。不交易的成交和借贷池存取不是市场交易，
+/// 不受交易上限、间隔、滑点和脱锚检查限制。
 pub fn plan_trade(
     s: &FundState,
     now_unix: i64,
     prices: &MarketPrices,
+    pool: &LendingPool,
     caller: Caller,
     cfg: &Config,
 ) -> Result<TradePlan, FundError> {
@@ -1358,6 +1480,7 @@ pub fn plan_trade(
     }
     chosen.reference = chosen.reference.filter(|&p| p > 0);
     let price = chosen.price;
+    let rate = pool.rate;
     // 窗口之后的其他调用人用更严的滑点上限：能从一笔交易里挤出的价值更少
     let slip = match caller {
         Caller::Keeper => cfg.max_slippage_bps,
@@ -1366,62 +1489,109 @@ pub fn plan_trade(
     let depegged = chosen.blocks_buys(cfg);
     // 上限折算成 cbBTC 向下取整；至少 1 sat，保证价格再高也能卖完
     let cap_btc = usdc_to_btc(cfg.trade_cap_usdc, price)?.max(1);
+    // 借贷池此刻付得出的凭证：价值不超过 available
+    let payable = receipts_within(pool.available, rate);
+    let plan = |side, amount_in, min_out, bucket| TradePlan {
+        side,
+        amount_in,
+        min_out,
+        bucket,
+        price,
+        rate,
+        withdraw_receipts: 0,
+        withdraw_usdc: 0,
+    };
     let sell = |amount: u64, bucket| -> Result<TradePlan, FundError> {
-        Ok(TradePlan {
-            side: Side::SellBtc,
-            amount_in: amount,
-            min_out: apply_bps_down(btc_value(amount, price)?, slip)?,
-            bucket,
-            price,
-        })
+        let min_out = apply_bps_down(btc_value(amount, price)?, slip)?;
+        Ok(plan(Side::SellBtc, amount, min_out, bucket))
     };
     let buy = |amount: u64, bucket| -> Result<TradePlan, FundError> {
-        Ok(TradePlan {
-            side: Side::BuyBtc,
-            amount_in: amount,
-            min_out: apply_bps_down(usdc_to_btc(amount, price)?, slip)?,
-            bucket,
-            price,
-        })
+        let min_out = apply_bps_down(usdc_to_btc(amount, price)?, slip)?;
+        Ok(plan(Side::BuyBtc, amount, min_out, bucket))
     };
-    let plan = if let Some(slice) = s.oldest_slice() {
-        // 赎回资产无论多小都要卖完：min_out 为 0 时成交 0 也接受，赎回人承担这点尘埃
-        sell(
-            slice.btc.min(cap_btc),
-            TradeBucket::Slice { epoch: slice.epoch },
-        )?
-    } else if now_unix >= fix_time(day_of(now_unix), cfg) && s.last_fix_day < day_of(now_unix) {
-        // 新的定价时刻已到，目标可能会变：基金调仓和申购等定价之后按新目标进行
-        // （赎回资产不算基金资产，照常卖出）
-        return Err(FundError::FixPending);
-    } else if !fund_rebalanced(s, price)? {
-        if s.target_btc {
+    // 借贷池存取不是市场交易，直接返回，不看交易间隔
+    let withdraw = |receipts: u64, bucket| -> Result<TradePlan, FundError> {
+        Ok(plan(
+            Side::Withdraw,
+            receipts,
+            lent_value(receipts, rate)?,
+            bucket,
+        ))
+    };
+    // 最早一期赎回资产里只剩借贷池暂时付不出的凭证时，先做后面的
+    let mut waits_for_pool = false;
+    let trade = 'next: {
+        if let Some(slice) = s.oldest_slice() {
+            let bucket = TradeBucket::Slice { epoch: slice.epoch };
+            if slice.receipts > 0 {
+                match slice.receipts.min(payable) {
+                    0 => waits_for_pool = true,
+                    r => return withdraw(r, bucket),
+                }
+            }
+            if slice.btc > 0 {
+                // 赎回资产无论多小都要卖完：min_out 为 0 时成交 0 也接受，赎回人承担这点尘埃
+                break 'next sell(slice.btc.min(cap_btc), bucket)?;
+            }
+        }
+        if now_unix >= fix_time(day_of(now_unix), cfg) && s.last_fix_day < day_of(now_unix) {
+            // 新的定价时刻已到，目标可能会变：基金调仓、申购和借贷池存取等定价之后按新目标进行
+            // （赎回资产不算基金资产，照常卖出、取回）
+            return Err(FundError::FixPending);
+        }
+        if !fund_rebalanced(s, price, rate)? {
+            if !s.target_btc {
+                break 'next sell(s.btc.min(cap_btc), TradeBucket::Fund)?;
+            }
             if depegged {
                 return Err(FundError::DepegBlocksBuy);
             }
-            buy(s.usdc.min(cfg.trade_cap_usdc), TradeBucket::Fund)?
-        } else {
-            sell(s.btc.min(cap_btc), TradeBucket::Fund)?
+            break 'next buy_from_fund(s, pool, payable, cfg, &buy)?;
         }
-    } else if let Some(p) = s.oldest_pending() {
-        let bucket = TradeBucket::Subscription { epoch: p.epoch };
+        if let Some(p) = s.oldest_pending() {
+            let bucket = TradeBucket::Subscription { epoch: p.epoch };
+            if !s.target_btc {
+                // 目标是 USDC：申购款直接进入基金，不交易
+                return Ok(plan(Side::WithoutTrade, p.usdc, 0, bucket));
+            }
+            if depegged {
+                return Err(FundError::DepegBlocksBuy);
+            }
+            // 申购款无论多少都要买完：min_out 为 0 时成交 0 也接受，申购人承担这点尘埃
+            break 'next buy(p.usdc.min(cfg.trade_cap_usdc), bucket)?;
+        }
         if !s.target_btc {
-            // 目标是 USDC：申购款直接进入基金，不交易
-            return Ok(TradePlan {
-                side: Side::WithoutTrade,
-                amount_in: p.usdc,
-                min_out: 0,
-                bucket,
-                price,
-            });
+            let lent = lent_value(s.receipts, rate)?;
+            let total = s.usdc as u128 + lent as u128;
+            // 上限向下取整；它不超过 total，所以要存入的不超过主账户里的 USDC
+            let cap = to_u64(total * cfg.lending_cap_bps as u128 / BPS)?;
+            let excess = lent.saturating_sub(cap);
+            if excess >= MIN_LENDING_MOVE || (cfg.lending_cap_bps == 0 && s.receipts > 0) {
+                // 超出上限（比如管理员降低了上限）：取回超出的部分，上限为 0 时全部取回
+                let want = if cfg.lending_cap_bps == 0 {
+                    s.receipts
+                } else {
+                    receipts_within(excess, rate).min(s.receipts)
+                };
+                match want.min(payable) {
+                    0 => return Err(FundError::PoolIlliquid),
+                    r => return withdraw(r, TradeBucket::Fund),
+                }
+            }
+            let gap = cap.saturating_sub(lent);
+            // 赎回人还在等借贷池付款时不再存入
+            if gap >= MIN_LENDING_MOVE && !waits_for_pool && rate > 0 {
+                let receipts = receipts_for(gap, rate)?;
+                if receipts > 0 {
+                    return Ok(plan(Side::Deposit, gap, receipts, TradeBucket::Fund));
+                }
+            }
         }
-        if depegged {
-            return Err(FundError::DepegBlocksBuy);
-        }
-        // 申购款无论多少都要买完：min_out 为 0 时成交 0 也接受，申购人承担这点尘埃
-        buy(p.usdc.min(cfg.trade_cap_usdc), bucket)?
-    } else {
-        return Err(FundError::NothingToTrade);
+        return Err(if waits_for_pool {
+            FundError::PoolIlliquid
+        } else {
+            FundError::NothingToTrade
+        });
     };
     if now_unix
         < s.last_trade_time
@@ -1429,6 +1599,42 @@ pub fn plan_trade(
     {
         return Err(FundError::TradeTooSoon);
     }
+    Ok(trade)
+}
+
+/// 基金调向 cbBTC 的一笔买入：先花主账户里的 USDC，不够一笔上限时从借贷池取回差额，
+/// 同一条指令里先取回再买入。借贷池付不出时只用主账户里的；两边加起来不到 2 sat 时等借贷池
+fn buy_from_fund(
+    s: &FundState,
+    pool: &LendingPool,
+    payable: u64,
+    cfg: &Config,
+    buy: &dyn Fn(u64, TradeBucket) -> Result<TradePlan, FundError>,
+) -> Result<TradePlan, FundError> {
+    let rate = pool.rate;
+    let lent = lent_value(s.receipts, rate)?;
+    let chunk = to_u64((s.usdc as u128 + lent as u128).min(cfg.trade_cap_usdc as u128))?;
+    let from_vault = s.usdc.min(chunk);
+    let need = chunk - from_vault;
+    // 只取回这笔要花的，其余继续生息；全部凭证都不够时全部取回
+    let receipts = if need == 0 {
+        0
+    } else if lent <= need {
+        s.receipts
+    } else {
+        receipts_within(need, rate)
+    }
+    .min(payable);
+    let withdraw_usdc = lent_value(receipts, rate)?;
+    let amount = from_vault
+        .checked_add(withdraw_usdc)
+        .ok_or(FundError::Overflow)?;
+    let mut plan = buy(amount, TradeBucket::Fund)?;
+    if is_dust_buy(amount, plan.price)? {
+        return Err(FundError::PoolIlliquid);
+    }
+    plan.withdraw_receipts = receipts;
+    plan.withdraw_usdc = withdraw_usdc;
     Ok(plan)
 }
 
@@ -1441,7 +1647,8 @@ pub fn market_fill(plan: &TradePlan, price: u64, fee_bps: u16) -> Result<u64, Fu
     let raw = match plan.side {
         Side::BuyBtc => usdc_to_btc(plan.amount_in, price)?,
         Side::SellBtc => btc_value(plan.amount_in, price)?,
-        Side::WithoutTrade => return Ok(0),
+        // 不经过交易所
+        Side::WithoutTrade | Side::Deposit | Side::Withdraw => return Ok(0),
     };
     apply_bps_down(raw, fee_bps)
 }
@@ -1450,10 +1657,12 @@ pub fn market_fill(plan: &TradePlan, price: u64, fee_bps: u16) -> Result<u64, Fu
 /// 成交少于 min_out 返回 SlippageExceeded，状态不变（外层整笔交易回滚）。
 ///
 /// 卖出赎回资产或为申购买入时，必须传入那一期的记录：
-/// - 赎回资产卖完的那一笔把全部 USDC 写入记录的应付款，赎回人从此可以领取。
-///   所得 USDC 由外层转入待领取账户，不进入基金。
+/// - 赎回资产卖完（cbBTC 卖完、借贷凭证取回完）的那一笔把全部 USDC 写入记录的应付款，
+///   赎回人从此可以领取。所得 USDC 由外层转入待领取账户，不进入基金。
 /// - 申购买到的 cbBTC（目标为 USDC 时是申购款本身）进入基金，按数量发份额，写入记录；
 ///   全部成交后记录标记为已成交。外层把新份额发到份额托管账户。
+///
+/// 存入借贷池时 actual_out 是收到的凭证，取回时是收到的 USDC。
 pub fn fill_trade(
     s: &mut FundState,
     plan: &TradePlan,
@@ -1464,59 +1673,65 @@ pub fn fill_trade(
     if actual_out < plan.min_out {
         return Err(FundError::SlippageExceeded);
     }
+    let mut n = s.clone();
     let mut minted = 0;
     match plan.bucket {
         TradeBucket::Slice { epoch } => {
             let r = record.ok_or(FundError::WrongEpochRecord)?;
-            let slice = match s.oldest_slice().copied() {
+            let mut slice = match n.oldest_slice().copied() {
                 Some(sl) if sl.epoch == epoch && r.epoch == epoch => sl,
                 _ => return Err(FundError::WrongEpochRecord),
             };
-            if plan.side != Side::SellBtc {
-                return Err(FundError::WrongEpochRecord);
-            }
-            let usdc = slice
+            let left = match plan.side {
+                Side::SellBtc => &mut slice.btc,
+                Side::Withdraw => &mut slice.receipts,
+                _ => return Err(FundError::WrongEpochRecord),
+            };
+            *left = left
+                .checked_sub(plan.amount_in)
+                .ok_or(FundError::WrongEpochRecord)?;
+            slice.usdc = slice
                 .usdc
                 .checked_add(actual_out)
                 .ok_or(FundError::Overflow)?;
-            let btc = slice
-                .btc
-                .checked_sub(plan.amount_in)
-                .ok_or(FundError::WrongEpochRecord)?;
-            if btc > 0 {
-                s.slices[0] = Slice { epoch, btc, usdc };
+            if slice.btc > 0 || slice.receipts > 0 {
+                n.slices[0] = slice;
             } else {
-                r.payout_usdc = usdc;
-                r.unclaimed_payout_usdc = usdc;
+                r.payout_usdc = slice.usdc;
+                r.unclaimed_payout_usdc = slice.usdc;
                 r.slice_sold_out = true;
-                let n = s.slice_count as usize;
-                s.slices.copy_within(1..n, 0);
-                s.slices[n - 1] = Slice::default();
-                s.slice_count = (n - 1) as u8; // 有最早的一期，n ≥ 1
+                let k = n.slice_count as usize;
+                n.slices.copy_within(1..k, 0);
+                n.slices[k - 1] = Slice::default();
+                n.slice_count = (k - 1) as u8; // 有最早的一期，k ≥ 1
             }
         }
-        TradeBucket::Fund => match plan.side {
-            Side::BuyBtc => {
-                let usdc = s
-                    .usdc
-                    .checked_sub(plan.amount_in)
-                    .ok_or(FundError::Overflow)?;
-                s.btc = s.btc.checked_add(actual_out).ok_or(FundError::Overflow)?;
-                s.usdc = usdc;
-            }
-            Side::SellBtc => {
-                let btc = s
-                    .btc
-                    .checked_sub(plan.amount_in)
-                    .ok_or(FundError::Overflow)?;
-                s.usdc = s.usdc.checked_add(actual_out).ok_or(FundError::Overflow)?;
-                s.btc = btc;
-            }
-            Side::WithoutTrade => return Err(FundError::WrongEpochRecord),
-        },
+        TradeBucket::Fund => {
+            let (usdc, btc, receipts) = (&mut n.usdc, &mut n.btc, &mut n.receipts);
+            let (spent, got): (&mut u64, &mut u64) = match plan.side {
+                Side::BuyBtc => {
+                    // 先从借贷池取回这笔要花的（外层已确认收到至少 withdraw_usdc）
+                    *receipts = receipts
+                        .checked_sub(plan.withdraw_receipts)
+                        .ok_or(FundError::Overflow)?;
+                    *usdc = usdc
+                        .checked_add(plan.withdraw_usdc)
+                        .ok_or(FundError::Overflow)?;
+                    (usdc, btc)
+                }
+                Side::SellBtc => (btc, usdc),
+                Side::Deposit => (usdc, receipts),
+                Side::Withdraw => (receipts, usdc),
+                Side::WithoutTrade => return Err(FundError::WrongEpochRecord),
+            };
+            *spent = spent
+                .checked_sub(plan.amount_in)
+                .ok_or(FundError::Overflow)?;
+            *got = got.checked_add(actual_out).ok_or(FundError::Overflow)?;
+        }
         TradeBucket::Subscription { epoch } => {
             let r = record.ok_or(FundError::WrongEpochRecord)?;
-            let p = match s.oldest_pending().copied() {
+            let p = match n.oldest_pending().copied() {
                 Some(p) if p.epoch == epoch && r.epoch == epoch => p,
                 _ => return Err(FundError::WrongEpochRecord),
             };
@@ -1527,19 +1742,21 @@ pub fn fill_trade(
             // 发份额用加入之前的基金资产：新份额 = 带来的资产 × 已发行份额 ÷ 基金同种资产
             match plan.side {
                 Side::BuyBtc => {
-                    minted = shares_for(actual_out, s.btc, s.share_supply, plan.amount_in)?;
-                    s.btc = s.btc.checked_add(actual_out).ok_or(FundError::Overflow)?;
+                    minted = shares_for(actual_out, n.btc, n.share_supply, plan.amount_in)?;
+                    n.btc = n.btc.checked_add(actual_out).ok_or(FundError::Overflow)?;
                 }
                 Side::WithoutTrade => {
-                    minted = shares_for(plan.amount_in, s.usdc, s.share_supply, plan.amount_in)?;
-                    s.usdc = s
+                    // 基金的 USDC 包括借出的（ADR 0008）
+                    let holding = usdc_holding_up(&n, plan.rate)?;
+                    minted = shares_for(plan.amount_in, holding, n.share_supply, plan.amount_in)?;
+                    n.usdc = n
                         .usdc
                         .checked_add(plan.amount_in)
                         .ok_or(FundError::Overflow)?;
                 }
-                Side::SellBtc => return Err(FundError::WrongEpochRecord),
+                _ => return Err(FundError::WrongEpochRecord),
             }
-            s.share_supply = s
+            n.share_supply = n
                 .share_supply
                 .checked_add(minted)
                 .ok_or(FundError::Overflow)?;
@@ -1552,17 +1769,18 @@ pub fn fill_trade(
                 .checked_add(minted)
                 .ok_or(FundError::Overflow)?;
             if usdc_left > 0 {
-                s.pending[0].usdc = usdc_left;
+                n.pending[0].usdc = usdc_left;
             } else {
                 r.subscription_filled = true;
-                s.remove_pending(0); // 有最早的一期
+                n.remove_pending(0); // 有最早的一期
             }
         }
     }
-    // 不交易的成交不算一笔交易，不占用交易间隔
-    if plan.side != Side::WithoutTrade {
-        s.last_trade_time = now_unix;
+    // 只有市场交易占用交易间隔：不交易的成交和借贷池存取都不算
+    if matches!(plan.side, Side::BuyBtc | Side::SellBtc) {
+        n.last_trade_time = now_unix;
     }
+    *s = n;
     Ok(minted)
 }
 
@@ -1578,8 +1796,12 @@ mod tests {
     const DAY: i64 = SECONDS_PER_DAY;
     const ONE_AM: i64 = 3_600;
 
+    /// 默认配置，但不借出：其他规则的场景测试不受借贷影响，借贷的测试和随机模拟自己设上限
     fn cfg() -> Config {
-        Config::default_config()
+        Config {
+            lending_cap_bps: 0,
+            ..Config::default_config()
+        }
     }
 
     /// 两个价格源都在定价时刻发布：BTC/USD 和 cbBTC/USD
@@ -1620,6 +1842,7 @@ mod tests {
     /// 基金状态加上每次定价的记录（按期号递增），模拟链上的账户。
     /// usdc_tokens / btc_tokens 按程序的转账记录基金名下的代币（托管、主账户、待领取账户），
     /// 用来核对内部记账：不能凭空多出或少掉资产。
+    /// receipt_tokens 是基金凭证账户里的借贷凭证；pool 是借贷池（比率和此刻还能取回多少）。
     #[derive(Clone)]
     struct Harness {
         s: FundState,
@@ -1627,7 +1850,17 @@ mod tests {
         c: Config,
         usdc_tokens: u64,
         btc_tokens: u64,
+        receipt_tokens: u64,
+        pool: LendingPool,
         fees: u64, // 付给管理人的取款费
+    }
+
+    /// 1 份凭证值 1 USDC 原始单位、随时都能取回的借贷池
+    fn liquid_pool() -> LendingPool {
+        LendingPool {
+            rate: RATE_ONE as u64,
+            available: u64::MAX,
+        }
     }
 
     impl Harness {
@@ -1638,8 +1871,15 @@ mod tests {
                 c: cfg(),
                 usdc_tokens: 0,
                 btc_tokens: 0,
+                receipt_tokens: 0,
+                pool: liquid_pool(),
                 fees: 0,
             }
+        }
+
+        /// 借贷池计息 secs 秒（年化 apy_bps）
+        fn accrue(&mut self, apy_bps: u16, secs: i64) {
+            self.pool.rate = mock_pool_accrue(self.pool.rate, apy_bps, secs).unwrap();
         }
 
         fn seeded(price: u64) -> Self {
@@ -1687,7 +1927,7 @@ mod tests {
             caller: Caller,
         ) -> Result<EpochRecord, FundError> {
             let before = self.s.clone();
-            let out = fix(&mut self.s, now, p, caller, &self.c)?;
+            let out = fix(&mut self.s, now, p, &self.pool, caller, &self.c)?;
             let r = out.record;
             // 每次定价接着上一次，关闭中间所有的期
             let first = self.records.last().map_or(0, |p| p.epoch + 1);
@@ -1698,9 +1938,10 @@ mod tests {
             // 轧差发的份额向下取整，每份 cbBTC 不减少（USDC 只剩零头，允许被摊薄）。
             // 所有份额都赎回时没有留下的人，不用比较。
             if r.redemption_shares < before.share_supply {
-                assert_asset_per_share_kept(&before, &self.s, true);
+                let rate = self.pool.rate;
+                assert_asset_per_share_kept(&before, &self.s, true, rate);
                 if r.minted_shares == 0 {
-                    assert_asset_per_share_kept(&before, &self.s, false);
+                    assert_asset_per_share_kept(&before, &self.s, false, rate);
                 }
             }
             self.assert_ledger();
@@ -1738,6 +1979,10 @@ mod tests {
             assert_eq!(
                 self.btc_tokens,
                 self.s.btc + slices.iter().map(|x| x.btc).sum::<u64>()
+            );
+            assert_eq!(
+                self.receipt_tokens,
+                self.s.receipts + slices.iter().map(|x| x.receipts).sum::<u64>()
             );
         }
 
@@ -1803,8 +2048,18 @@ mod tests {
             fill_trade(&mut self.s, plan, got, now, r)?;
             // 申购发份额按数量向下取整：已有持有人每份对应的基金资产不减少
             if let TradeBucket::Subscription { .. } = plan.bucket {
-                assert_asset_per_share_kept(&before, &self.s, plan.side == Side::BuyBtc);
+                let btc = plan.side == Side::BuyBtc;
+                assert_asset_per_share_kept(&before, &self.s, btc, plan.rate);
             }
+            // 借贷池付出的 USDC 不能超过它此刻付得出的
+            let withdrawn = match plan.side {
+                Side::Withdraw => got,
+                _ => plan.withdraw_usdc,
+            };
+            assert!(withdrawn <= self.pool.available, "借贷池付不出");
+            self.pool.available -= withdrawn;
+            self.receipt_tokens -= plan.withdraw_receipts;
+            self.usdc_tokens += plan.withdraw_usdc;
             match plan.side {
                 Side::BuyBtc => {
                     self.usdc_tokens -= plan.amount_in;
@@ -1815,6 +2070,20 @@ mod tests {
                     self.usdc_tokens += got;
                 }
                 Side::WithoutTrade => {} // 申购托管 → 基金主账户
+                Side::Deposit => {
+                    self.usdc_tokens -= plan.amount_in;
+                    self.receipt_tokens += got;
+                }
+                Side::Withdraw => {
+                    self.receipt_tokens -= plan.amount_in;
+                    self.usdc_tokens += got;
+                }
+            }
+            if plan.side == Side::Deposit {
+                // 存入之后借出的不超过上限
+                let lent = lent_value(self.s.receipts, plan.rate).unwrap() as u128;
+                let total = self.s.usdc as u128 + lent;
+                assert!(!self.s.target_btc && lent * BPS <= total * self.c.lending_cap_bps as u128);
             }
             self.assert_ledger();
             Ok(())
@@ -1838,7 +2107,7 @@ mod tests {
             caller: Caller,
             fee_bps: u16,
         ) -> Result<TradePlan, FundError> {
-            let plan = plan_trade(&self.s, now, &p, caller, &self.c)?;
+            let plan = plan_trade(&self.s, now, &p, &self.pool, caller, &self.c)?;
             // 交易所按算 min_out 的那个价格成交
             self.fill(now, &plan, exec(&plan, plan.price, fee_bps))?;
             Ok(plan)
@@ -1876,29 +2145,36 @@ mod tests {
         mp(price, price)
     }
 
-    /// 基金资产按价格折算的总值（只在测试里用来检查，基金本身从不按美元估值）
-    fn fund_value(s: &FundState, price: u64) -> u128 {
-        s.usdc as u128 + btc_value(s.btc, price).unwrap() as u128
+    /// 基金资产按价格（和借贷池比率）折算的总值（只在测试里用来检查，基金本身从不按美元估值）
+    fn fund_value(s: &FundState, price: u64, rate: u64) -> u128 {
+        s.usdc as u128
+            + lent_value(s.receipts, rate).unwrap() as u128
+            + btc_value(s.btc, price).unwrap() as u128
     }
 
-    /// 别人的申购赎回不减少已有持有人每份对应的基金资产（btc 为 true 时看 cbBTC，否则看 USDC）。
-    /// 按数量比较，与价格无关：价格不变时，留下的人的价值只随基金自己的调仓变化。
-    fn assert_asset_per_share_kept(before: &FundState, after: &FundState, btc: bool) {
+    /// 别人的申购赎回不减少已有持有人每份对应的基金资产（btc 为 true 时看 cbBTC，否则看 USDC，
+    /// 含按比率精确折算、不取整的借出部分）。按数量比较，与价格无关：价格不变时，
+    /// 留下的人的价值只随基金自己的调仓变化。
+    fn assert_asset_per_share_kept(before: &FundState, after: &FundState, btc: bool, rate: u64) {
         let (s0, s1) = (before.share_supply as u128, after.share_supply as u128);
         if s0 == 0 || s1 == 0 {
             return;
         }
+        let usdc = |s: &FundState| s.usdc as u128 * RATE_ONE + s.receipts as u128 * rate as u128;
         let (h0, h1) = if btc {
             (before.btc as u128, after.btc as u128)
         } else {
-            (before.usdc as u128, after.usdc as u128)
+            (usdc(before), usdc(after))
         };
         assert!(h1 * s0 >= h0 * s1, "每份资产 {h0}/{s0} -> {h1}/{s1}");
     }
 
-    /// 测试用的模拟交易所：按价格成交，收取 fee_bps
+    /// 测试用的模拟交易所：按价格成交，收取 fee_bps；借贷池按比率精确存取
     fn exec(plan: &TradePlan, price: u64, fee_bps: u16) -> u64 {
-        market_fill(plan, price, fee_bps).unwrap()
+        match plan.side {
+            Side::Deposit | Side::Withdraw => plan.min_out,
+            _ => market_fill(plan, price, fee_bps).unwrap(),
+        }
     }
 
     #[test]
@@ -2143,7 +2419,7 @@ mod tests {
         let p11 = at_fix(11, 52_000 * USDC);
 
         // 不回填：第 10 天跳过，均线用更早的一天补足 50 个
-        let r = fix(&mut h.s.clone(), fix11, &p11, Caller::Keeper, &h.c).unwrap();
+        let r = fix(&mut h.s.clone(), fix11, &p11, &h.pool, Caller::Keeper, &h.c).unwrap();
         assert_eq!(r.record.moving_average, (49 * 50_000 + 52_000) * USDC / 50);
 
         // 任何人用第 10 天定价窗口内发布的价格回填，均线恢复成最近 50 个日历日
@@ -2230,7 +2506,15 @@ mod tests {
             }),
         };
         let run_both = |now: i64, ts: i64, tv: i64| {
-            fix(&mut s.clone(), now, &at(ts, tv), Caller::Keeper, &c).map(|_| ())
+            fix(
+                &mut s.clone(),
+                now,
+                &at(ts, tv),
+                &liquid_pool(),
+                Caller::Keeper,
+                &c,
+            )
+            .map(|_| ())
         };
         let run = |now: i64, t: i64| run_both(now, t, t);
         assert_eq!(run(now, fix_at), Ok(()));
@@ -2245,7 +2529,15 @@ mod tests {
         assert_eq!(run(fix_at + 10, fix_at + 20), bad);
         // 选定的 cbBTC/USD 必须在窗口内；BTC/USD 参照不在窗口内时不用它（只是不轧差），定价照常
         assert_eq!(run_both(now, fix_at, now), bad);
-        let r = fix(&mut s.clone(), now, &at(now, fix_at), Caller::Keeper, &c).unwrap();
+        let r = fix(
+            &mut s.clone(),
+            now,
+            &at(now, fix_at),
+            &liquid_pool(),
+            Caller::Keeper,
+            &c,
+        )
+        .unwrap();
         assert_eq!(r.record.reference_price, 0);
     }
 
@@ -2725,6 +3017,11 @@ mod tests {
                 subscription_cap_usdc: USDC - 1,
                 ..cfg()
             },
+            // 借出上限最多 100%
+            Config {
+                lending_cap_bps: 10_001,
+                ..cfg()
+            },
         ];
         for c in bad {
             assert_eq!(c.validate(), Err(FundError::InvalidConfig), "{c:?}");
@@ -2737,6 +3034,7 @@ mod tests {
         assert_eq!(cfg().withdrawal_fee_bps, 100);
         assert_eq!(cfg().subscription_cap_usdc, 1_000_000 * USDC);
         assert_eq!(cfg().signal_feed, SignalFeed::Btc);
+        assert_eq!(Config::default_config().lending_cap_bps, 8_000);
     }
 
     #[test]
@@ -2782,7 +3080,8 @@ mod tests {
         h.subscribe(&mut t, 1_000 * USDC, 10 * DAY);
         h.fix_day(10, 51_000 * USDC);
         let now = 10 * DAY + 2 * ONE_AM;
-        let plan = |h: &Harness, m: MarketPrices| plan_trade(&h.s, now, &m, Caller::Keeper, &h.c);
+        let plan =
+            |h: &Harness, m: MarketPrices| plan_trade(&h.s, now, &m, &h.pool, Caller::Keeper, &h.c);
         let min_out_at =
             |price: u64| apply_bps_down(usdc_to_btc(1_000 * USDC, price).unwrap(), 30).unwrap();
         // 用 cbBTC/USD：两个价格源都有、相差 3% 时不买入；不脱锚时按 cbBTC 的价格买入
@@ -2846,6 +3145,7 @@ mod tests {
                     cbbtc: Some(cb),
                     btc,
                 },
+                &h.pool,
                 Caller::Keeper,
                 &h.c,
             )
@@ -2860,7 +3160,14 @@ mod tests {
             btc: Some(cb),
         };
         assert_eq!(
-            fix(&mut h.s.clone(), fix11 + 120, &no_cb, Caller::Keeper, &h.c),
+            fix(
+                &mut h.s.clone(),
+                fix11 + 120,
+                &no_cb,
+                &h.pool,
+                Caller::Keeper,
+                &h.c
+            ),
             Err(FundError::BadPrice)
         );
         let late_cb = FixPrices {
@@ -2872,6 +3179,7 @@ mod tests {
                 &mut h.s.clone(),
                 fix11 + 120,
                 &late_cb,
+                &h.pool,
                 Caller::Keeper,
                 &h.c
             ),
@@ -2967,7 +3275,7 @@ mod tests {
         let ratio = b_shares as f64 / a_shares as f64;
         assert!((ratio - 1.0 / 1.2).abs() < 1e-4, "ratio {ratio}");
         // A 的价值不被稀释：A 那部分基金资产 ≈ 1000 × 1.2
-        let a_value = (a_shares as u128 * fund_value(&h.s, 61_200 * USDC)
+        let a_value = (a_shares as u128 * fund_value(&h.s, 61_200 * USDC, h.pool.rate)
             / h.s.share_supply as u128) as f64
             / USDC as f64;
         assert!((a_value - 1_200.0).abs() < 0.05, "a_value {a_value}");
@@ -3041,7 +3349,8 @@ mod tests {
             Some(&Slice {
                 epoch: 11,
                 btc: 403_469,
-                usdc: 300 * USDC
+                usdc: 300 * USDC,
+                receipts: 0
             })
         );
         assert_eq!(h.claim(&mut tb).unwrap(), (294_230_777, 0));
@@ -3277,15 +3586,37 @@ mod tests {
         let p = at_fix(10, 51_000 * USDC);
         // 窗口内（01:00–01:30）其他人不能定价
         assert_eq!(
-            fix(&mut h.s.clone(), fix_at + 10, &p, Caller::Public, &h.c),
+            fix(
+                &mut h.s.clone(),
+                fix_at + 10,
+                &p,
+                &h.pool,
+                Caller::Public,
+                &h.c
+            ),
             Err(FundError::KeeperOnly)
         );
         assert_eq!(
-            fix(&mut h.s.clone(), window_end - 1, &p, Caller::Public, &h.c),
+            fix(
+                &mut h.s.clone(),
+                window_end - 1,
+                &p,
+                &h.pool,
+                Caller::Public,
+                &h.c
+            ),
             Err(FundError::KeeperOnly)
         );
         // 窗口之后谁都可以（定价价格仍然是 1 点发布的）
-        assert!(fix(&mut h.s.clone(), window_end, &p, Caller::Public, &h.c).is_ok());
+        assert!(fix(
+            &mut h.s.clone(),
+            window_end,
+            &p,
+            &h.pool,
+            Caller::Public,
+            &h.c
+        )
+        .is_ok());
         h.fix_with(fix_at + 10, &p).unwrap(); // 清算地址
 
         // 交易同理
@@ -3309,8 +3640,8 @@ mod tests {
         let now = 10 * DAY + 2 * ONE_AM; // 窗口之后
         let p = same(50_000 * USDC);
         // 1000 USDC @ 50,000 = 2,000,000 sat；清算地址减 0.3%，其他人减 0.1%
-        let keeper = plan_trade(&h.s, now, &p, Caller::Keeper, &h.c).unwrap();
-        let public = plan_trade(&h.s, now, &p, Caller::Public, &h.c).unwrap();
+        let keeper = plan_trade(&h.s, now, &p, &h.pool, Caller::Keeper, &h.c).unwrap();
+        let public = plan_trade(&h.s, now, &p, &h.pool, Caller::Public, &h.c).unwrap();
         assert_eq!((keeper.min_out, public.min_out), (1_994_000, 1_998_000));
         // 交易所收 0.18%：清算地址能成交，其他人的这一笔回滚
         assert_eq!(
@@ -3330,7 +3661,7 @@ mod tests {
         // 晚上 9 点才交易，这时 cbBTC 是 52,500（BTC/USD 52,600，未脱锚）
         let now = 10 * DAY + 21 * 3600;
         let p = mp(52_600 * USDC, 52_500 * USDC);
-        let plan = plan_trade(&h.s, now, &p, Caller::Keeper, &h.c).unwrap();
+        let plan = plan_trade(&h.s, now, &p, &h.pool, Caller::Keeper, &h.c).unwrap();
         // 1000 USDC @ 52,500 = 1,904,761 sat，减 0.3% = 1,899,046
         assert_eq!(plan.min_out, 1_899_046);
     }
@@ -3343,7 +3674,7 @@ mod tests {
         h.fix_day(10, 51_000 * USDC);
         let t0 = 10 * DAY + ONE_AM;
         let p = same(51_000 * USDC);
-        let plan = plan_trade(&h.s, t0, &p, Caller::Keeper, &h.c).unwrap();
+        let plan = plan_trade(&h.s, t0, &p, &h.pool, Caller::Keeper, &h.c).unwrap();
         let before = h.s.clone();
         assert_eq!(
             h.fill(t0, &plan, plan.min_out - 1),
@@ -3696,11 +4027,20 @@ mod tests {
             }),
         };
         // 晚上 9 点才定价：信号、轧差、赎回资产都只取决于定价价格
-        let a = fix(&mut h.s.clone(), fix_at, &on_time, Caller::Keeper, &h.c).unwrap();
+        let a = fix(
+            &mut h.s.clone(),
+            fix_at,
+            &on_time,
+            &h.pool,
+            Caller::Keeper,
+            &h.c,
+        )
+        .unwrap();
         let b = fix(
             &mut h.s.clone(),
             11 * DAY + 21 * 3600,
             &late,
+            &h.pool,
             Caller::Keeper,
             &h.c,
         )
@@ -3750,6 +4090,259 @@ mod tests {
         assert_eq!(h.s.slice_count, 0);
     }
 
+    /// 借贷的场景：第 10 天几个人申购（目标 USDC），领取份额（1 USDC 1 份），基金按上限 cap_bps 借出
+    fn lending_fund(cap_bps: u16, amounts: &[u64]) -> (Harness, Vec<Ticket>) {
+        let mut h = Harness::seeded(50_000 * USDC);
+        h.c.lending_cap_bps = cap_bps;
+        let mut t = vec![Ticket::default(); amounts.len()];
+        for (i, &a) in amounts.iter().enumerate() {
+            h.subscribe(&mut t[i], a * USDC, 10 * DAY);
+        }
+        h.settle_day(10, 50_000 * USDC, 0);
+        for x in t.iter_mut() {
+            h.claim(x).unwrap();
+        }
+        (h, t)
+    }
+
+    #[test]
+    fn idle_usdc_is_lent_up_to_the_cap_only_while_the_target_is_usdc() {
+        let mut h = Harness::seeded(50_000 * USDC);
+        h.c.lending_cap_bps = 8_000;
+        h.c.trade_cap_usdc = 1_000 * USDC;
+        let mut t = Ticket::default();
+        h.subscribe(&mut t, 10_000 * USDC, 10 * DAY);
+        h.fix_day(10, 50_000 * USDC); // 不高于均线：目标 USDC
+                                      // 同一时刻：申购先进入基金，再把 80% 存入借贷池。存取不是市场交易，不占用交易间隔
+        let t0 = 10 * DAY + ONE_AM;
+        let p = same(50_000 * USDC);
+        assert_eq!(h.trade_at(t0, p, 0).unwrap().side, Side::WithoutTrade);
+        let plan = h.trade_at(t0, p, 0).unwrap();
+        assert_eq!(
+            (plan.side, plan.amount_in, plan.min_out, plan.bucket),
+            (Side::Deposit, 8_000 * USDC, 8_000 * USDC, TradeBucket::Fund)
+        );
+        assert_eq!(
+            (h.s.usdc, h.s.receipts, h.s.last_trade_time),
+            (2_000 * USDC, 8_000 * USDC, 0)
+        );
+        assert_eq!(h.trade_at(t0, p, 0), Err(FundError::NothingToTrade));
+        // 一个月的利息让借出的超出上限一点（不到 100 USDC）：不来回搬
+        h.accrue(1_000, 30 * DAY);
+        assert!(lent_value(h.s.receipts, h.pool.rate).unwrap() > 8_050 * USDC);
+        assert_eq!(h.trade_at(t0 + 600, p, 0), Err(FundError::NothingToTrade));
+
+        // 高于均线：目标 cbBTC。先花主账户里的 2,000 USDC，之后每笔只从借贷池取回这一笔要花的，
+        // 其余的继续生息
+        h.fix_day(11, 55_000 * USDC);
+        let (plans, why, _) = h.trade_until_done(11 * DAY + ONE_AM, same(55_000 * USDC), 0);
+        assert_eq!(why, FundError::NothingToTrade);
+        assert!(plans
+            .iter()
+            .all(|p| p.side == Side::BuyBtc && p.amount_in <= 1_000 * USDC));
+        assert_eq!(
+            (plans[0].withdraw_receipts, plans[1].withdraw_receipts),
+            (0, 0)
+        );
+        let third = plans[2];
+        assert_eq!(third.withdraw_usdc, third.amount_in);
+        assert!(third.withdraw_receipts > 0 && third.withdraw_receipts < 1_000 * USDC);
+        assert_eq!((h.s.usdc, h.s.receipts), (0, 0));
+    }
+
+    #[test]
+    fn a_usdc_subscription_gets_shares_by_the_usdc_it_adds_including_the_lent_part() {
+        let (mut h, _) = lending_fund(8_000, &[10_000]);
+        assert_eq!((h.s.usdc, h.s.receipts), (2_000 * USDC, 8_000 * USDC));
+        // 借出的 8,000 一年赚 10%：基金的 USDC 是 2,000 + 8,800
+        h.accrue(1_000, 365 * DAY);
+        let mut tb = Ticket::default();
+        h.subscribe(&mut tb, 1_080 * USDC, 11 * DAY);
+        h.settle_day(11, 50_000 * USDC, 0);
+        // 1,080 × 10,000 ÷ 10,800
+        assert_eq!(h.claim(&mut tb).unwrap(), (1_000 * USDC, 0));
+    }
+
+    #[test]
+    fn the_redemption_slice_swaps_its_receipts_with_the_buffer_first() {
+        let (mut h, mut t) = lending_fund(8_000, &[1_000, 9_000]);
+        h.accrue(1_000, 365 * DAY); // 借出的 8,000 变成 8,800
+        h.redeem(&mut t[0], 1_000 * USDC, 11 * DAY);
+        let r = h.fix_day(11, 50_000 * USDC);
+        // 赎回资产：10% 的 USDC（200）和 10% 的凭证（800 份，值 880）。凭证和备用金互换，
+        // 定价时就卖完，不用等借贷池
+        assert!(r.slice_sold_out);
+        assert_eq!((r.slice_usdc, r.payout_usdc), (1_080 * USDC, 1_080 * USDC));
+        assert_eq!((h.s.usdc, h.s.receipts), (920 * USDC, 8_000 * USDC));
+        assert_eq!(h.pool.available, u64::MAX, "没有从借贷池取回");
+        assert_eq!(h.claim(&mut t[0]).unwrap(), (0, 1_080 * USDC));
+        // 留下的人每份还是 1.08 USDC：920 + 8,800 = 9,720，9,000 份
+        assert_eq!(
+            fund_value(&h.s, 50_000 * USDC, h.pool.rate),
+            9_720 * USDC as u128
+        );
+    }
+
+    #[test]
+    fn a_slice_waits_for_an_illiquid_pool_while_settlement_carries_on() {
+        // 上限 100%：没有备用金，赎回资产里的凭证只能从借贷池取回
+        let (mut h, mut t) = lending_fund(10_000, &[1_000, 9_000]);
+        assert_eq!((h.s.usdc, h.s.receipts), (0, 10_000 * USDC));
+        h.pool.available = 0;
+        h.redeem(&mut t[0], 1_000 * USDC, 11 * DAY);
+        let r = h.fix_day(11, 50_000 * USDC);
+        assert!(!r.slice_sold_out);
+        assert_eq!(
+            h.s.oldest_slice(),
+            Some(&Slice {
+                epoch: 11,
+                btc: 0,
+                usdc: 0,
+                receipts: 1_000 * USDC
+            })
+        );
+        let p = same(50_000 * USDC);
+        assert_eq!(
+            h.trade_at(11 * DAY + ONE_AM, p, 0),
+            Err(FundError::PoolIlliquid)
+        );
+        assert_eq!(h.claim(&mut t[0]), Err(FundError::SliceNotSold));
+
+        // 第二天定价照常，新申购照常成交；赎回人还在等借贷池，不再存入
+        let mut tc = Ticket::default();
+        h.subscribe(&mut tc, 500 * USDC, 12 * DAY);
+        h.fix_day(12, 50_000 * USDC);
+        let t2 = 12 * DAY + ONE_AM;
+        assert_eq!(h.trade_at(t2, p, 0).unwrap().side, Side::WithoutTrade);
+        assert_eq!(h.claim(&mut tc).unwrap(), (500 * USDC, 0));
+        assert_eq!(h.trade_at(t2, p, 0), Err(FundError::PoolIlliquid));
+        assert_eq!(h.s.usdc, 500 * USDC);
+
+        // 借贷池付得出 400：先取回 400 给赎回人，剩下的接着等
+        h.pool.available = 400 * USDC;
+        let plan = h.trade_at(t2, p, 0).unwrap();
+        assert_eq!(
+            (plan.side, plan.amount_in, plan.bucket),
+            (Side::Withdraw, 400 * USDC, TradeBucket::Slice { epoch: 11 })
+        );
+        assert_eq!(h.trade_at(t2, p, 0), Err(FundError::PoolIlliquid));
+        // 恢复之后取回剩下的 600，赎回人领取全部 1,000（其中 1% 是取款费）
+        h.pool.available = u64::MAX;
+        h.trade_at(t2, p, 0).unwrap();
+        assert!(h.rec(11).slice_sold_out);
+        let out = h.claim_split(&mut t[0]).unwrap();
+        assert_eq!((out.redeemer_usdc, out.fee_usdc), (990 * USDC, 10 * USDC));
+        // 然后才把新申购的 500 存进去
+        let plan = h.trade_at(t2, p, 0).unwrap();
+        assert_eq!((plan.side, plan.amount_in), (Side::Deposit, 500 * USDC));
+    }
+
+    #[test]
+    fn a_buy_withdraws_only_what_the_pool_can_pay_and_waits_for_the_rest() {
+        let (mut h, _) = lending_fund(10_000, &[3_000]);
+        h.c.trade_cap_usdc = 1_000 * USDC;
+        h.pool.available = 0;
+        h.fix_day(11, 55_000 * USDC); // 高于均线：目标 cbBTC，基金的 USDC 都借出了
+        let t1 = 11 * DAY + ONE_AM;
+        let p = same(55_000 * USDC);
+        assert_eq!(h.trade_at(t1, p, 0), Err(FundError::PoolIlliquid));
+        // 付得出 300：这一笔只买 300
+        h.pool.available = 300 * USDC;
+        let plan = h.trade_at(t1, p, 0).unwrap();
+        assert_eq!(
+            (
+                plan.side,
+                plan.amount_in,
+                plan.withdraw_receipts,
+                plan.withdraw_usdc
+            ),
+            (Side::BuyBtc, 300 * USDC, 300 * USDC, 300 * USDC)
+        );
+        assert_eq!(h.trade_at(t1 + 60, p, 0), Err(FundError::PoolIlliquid));
+        // 第二天还没买完：定价照常，恢复之后买完
+        h.pool.available = u64::MAX;
+        h.fix_day(12, 56_000 * USDC);
+        let (plans, why, _) = h.trade_until_done(12 * DAY + ONE_AM, same(56_000 * USDC), 0);
+        assert_eq!(why, FundError::NothingToTrade);
+        assert_eq!(plans.len(), 3); // 2,700 USDC，每笔最多 1,000
+        assert_eq!((h.s.usdc, h.s.receipts), (0, 0));
+    }
+
+    #[test]
+    fn lowering_the_lending_cap_is_immediate_and_raising_needs_the_timelock() {
+        let (mut h, _) = lending_fund(8_000, &[10_000]);
+        // 还没生效的提议里更高的上限也一起降低，生效时不会把上限悄悄抬回去
+        let mut pending = Config {
+            lending_cap_bps: 9_000,
+            ..h.c
+        };
+        assert_eq!(
+            lower_lending_cap(&mut h.c, Some(&mut pending), 9_000),
+            Err(FundError::LendingCapNotLower)
+        );
+        lower_lending_cap(&mut h.c, Some(&mut pending), 5_000).unwrap();
+        assert_eq!(
+            (h.c.lending_cap_bps, pending.lending_cap_bps),
+            (5_000, 5_000)
+        );
+        // 下一步就取回超出的 3,000
+        let t1 = 10 * DAY + ONE_AM + 600;
+        let p = same(50_000 * USDC);
+        let plan = h.trade_at(t1, p, 0).unwrap();
+        assert_eq!(
+            (plan.side, plan.amount_in, plan.min_out),
+            (Side::Withdraw, 3_000 * USDC, 3_000 * USDC)
+        );
+        // 紧急情况降到 0：剩下的全部取回
+        lower_lending_cap(&mut h.c, None, 0).unwrap();
+        let plan = h.trade_at(t1, p, 0).unwrap();
+        assert_eq!((plan.side, plan.amount_in), (Side::Withdraw, 5_000 * USDC));
+        assert_eq!((h.s.usdc, h.s.receipts), (10_000 * USDC, 0));
+        assert_eq!(h.trade_at(t1, p, 0), Err(FundError::NothingToTrade));
+        // 提高要走时间锁
+        assert_eq!(
+            lower_lending_cap(&mut h.c, None, 8_000),
+            Err(FundError::LendingCapNotLower)
+        );
+        let up = Config {
+            lending_cap_bps: 8_000,
+            ..h.c
+        };
+        assert_eq!(propose_config(&h.c, &up, t1), Ok(t1 + TIMELOCK_SECS));
+    }
+
+    #[test]
+    fn interest_and_losses_are_shared_by_all_shares() {
+        let (mut h, mut t) = lending_fund(8_000, &[1_000, 3_000]);
+        // 借出 3,200：一年 10% 之后 3,520，再亏损一半，剩 1,760
+        h.accrue(1_000, 365 * DAY);
+        h.pool.rate = mock_pool_haircut(h.pool.rate, 5_000).unwrap();
+        assert_eq!(lent_value(h.s.receipts, h.pool.rate), Ok(1_760 * USDC));
+        // 赎回 1/4 的份额拿到 1/4 的基金：(800 + 1,760) ÷ 4 = 640，留下 3/4
+        h.redeem(&mut t[0], 1_000 * USDC, 11 * DAY);
+        let r = h.fix_day(11, 50_000 * USDC);
+        assert_eq!((r.slice_sold_out, r.payout_usdc), (true, 640 * USDC));
+        assert_eq!(
+            fund_value(&h.s, 50_000 * USDC, h.pool.rate),
+            1_920 * USDC as u128
+        );
+    }
+
+    #[test]
+    fn the_mock_pool_accrues_simple_interest_and_takes_haircuts() {
+        let one = RATE_ONE as u64;
+        assert_eq!(mock_pool_accrue(one, 1_000, 365 * DAY), Ok(one / 10 * 11));
+        assert_eq!(mock_pool_accrue(one, 1_000, 0), Ok(one));
+        assert_eq!(mock_pool_accrue(one, 1_000, -5), Ok(one)); // 时钟倒退不计息
+        assert_eq!(mock_pool_haircut(one, 2_500), Ok(one / 4 * 3));
+        assert_eq!(
+            mock_pool_haircut(one, 10_000),
+            Err(FundError::InvalidConfig)
+        );
+        assert_eq!(receipts_for(1_100 * USDC, one / 10 * 11), Ok(1_000 * USDC));
+        assert_eq!(lent_value(1_000 * USDC, one / 10 * 11), Ok(1_100 * USDC));
+    }
+
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -3783,6 +4376,63 @@ mod tests {
         netted: usize,
         keeper_only: u32,
         public_plans: u32,
+        deposits: u32,
+        withdrawals: u32,
+        slice_withdrawals: u32,
+        buy_withdrawals: u32,
+        pool_waits: u32,
+        pool_losses: u32,
+        cap_cuts: u32,
+    }
+
+    /// 借贷池的一天：按随机年化计息，偶尔亏损；有时一整天付不出，或者只付得出一点。
+    /// 管理员偶尔紧急把借出上限降到 0，之后（通过时间锁）恢复。
+    fn random_pool_day(h: &mut Harness, rng: &mut Rng, tally: &mut Tally) {
+        h.accrue(rng.below(2_001) as u16, DAY);
+        if rng.below(40) == 0 {
+            h.pool.rate = mock_pool_haircut(h.pool.rate, 1 + rng.below(300) as u16).unwrap();
+            tally.pool_losses += 1;
+        }
+        h.pool.available = match rng.below(10) {
+            0 => 0,
+            1 => rng.below(3_000) * USDC,
+            _ => u64::MAX,
+        };
+        if h.c.lending_cap_bps == 0 {
+            if rng.below(5) == 0 {
+                h.c.lending_cap_bps = [5_000, 8_000, 10_000][rng.below(3) as usize];
+            }
+        } else if rng.below(50) == 0 {
+            lower_lending_cap(&mut h.c, None, 0).unwrap();
+            tally.cap_cuts += 1;
+        }
+    }
+
+    impl Tally {
+        /// 累计另一次模拟的借贷次数
+        fn add_lending(&mut self, t: &Tally) {
+            self.deposits += t.deposits;
+            self.withdrawals += t.withdrawals;
+            self.slice_withdrawals += t.slice_withdrawals;
+            self.buy_withdrawals += t.buy_withdrawals;
+            self.pool_waits += t.pool_waits;
+            self.pool_losses += t.pool_losses;
+            self.cap_cuts += t.cap_cuts;
+        }
+    }
+
+    /// 借贷都被覆盖到：存入、超出上限取回、赎回资产取回、买入前取回、等借贷池、亏损、紧急降上限
+    fn assert_lending_covered(tally: &Tally) {
+        assert!(
+            tally.deposits > 0
+                && tally.withdrawals > 0
+                && tally.slice_withdrawals > 0
+                && tally.buy_withdrawals > 0
+                && tally.pool_waits > 0
+                && tally.pool_losses > 0
+                && tally.cap_cuts > 0,
+            "{tally:?}"
+        );
     }
 
     /// 在 [from, until) 之间随机时刻尝试交易：每次价格在 p 附近小幅波动，
@@ -3818,7 +4468,7 @@ mod tests {
             };
             let fix_at = fix_time(day_of(now), &h.c);
             let in_window = (fix_at..fix_at + h.c.keeper_window_secs).contains(&now);
-            let plan = match plan_trade(&h.s, now, &m, caller, &h.c) {
+            let plan = match plan_trade(&h.s, now, &m, &h.pool, caller, &h.c) {
                 Ok(plan) => plan,
                 // 都做完了，或者基金调仓要等今天的定价
                 Err(FundError::NothingToTrade | FundError::FixPending) => return,
@@ -3828,9 +4478,17 @@ mod tests {
                     continue;
                 }
                 Err(FundError::DepegBlocksBuy) => {
-                    assert!(depegged && h.s.oldest_slice().is_none() && h.s.target_btc);
+                    // 没有要卖的赎回资产（最多只剩等借贷池的凭证）
+                    let no_slice_btc = h.s.oldest_slice().map_or(true, |sl| sl.btc == 0);
+                    assert!(depegged && no_slice_btc && h.s.target_btc);
                     tally.depeg_blocked += 1;
                     continue;
+                }
+                // 剩下的都要从借贷池取回，它暂时付不出：等它有钱了再试
+                Err(FundError::PoolIlliquid) => {
+                    assert!(h.pool.available < u64::MAX);
+                    tally.pool_waits += 1;
+                    return;
                 }
                 Err(FundError::KeeperOnly) => {
                     assert!(caller == Caller::Public && in_window);
@@ -3873,6 +4531,12 @@ mod tests {
                 (Side::SellBtc, TradeBucket::Fund) => tally.fund_sells += 1,
                 (Side::SellBtc, TradeBucket::Subscription { .. }) => panic!("申购不会卖出"),
                 (Side::WithoutTrade, _) => tally.without_trade += 1,
+                (Side::Deposit, _) => tally.deposits += 1,
+                (Side::Withdraw, TradeBucket::Slice { .. }) => tally.slice_withdrawals += 1,
+                (Side::Withdraw, _) => tally.withdrawals += 1,
+            }
+            if plan.withdraw_receipts > 0 {
+                tally.buy_withdrawals += 1;
             }
             if depegged && plan.side == Side::SellBtc {
                 tally.depeg_sells += 1;
@@ -3885,7 +4549,7 @@ mod tests {
         match plan.side {
             Side::BuyBtc => plan.amount_in,
             Side::SellBtc => btc_value(plan.amount_in, price).unwrap(),
-            Side::WithoutTrade => 0,
+            Side::WithoutTrade | Side::Deposit | Side::Withdraw => 0,
         }
     }
 
@@ -4064,6 +4728,7 @@ mod tests {
         /// 不再有新请求、流动性恢复、不脱锚：剩下的赎回资产都能卖完，每张记录都能领取。
         /// 之后每一期领取之和精确等于本期总额，没有尘埃。
         fn drain(&mut self, h: &mut Harness, day: i64, price: u64) {
+            h.pool.available = u64::MAX;
             for d in day..day + 3 {
                 match h.fix_with(d * DAY + ONE_AM, &at_fix(d, price)) {
                     Ok(_) | Err(FundError::TooManySlices) => {}
@@ -4107,6 +4772,7 @@ mod tests {
     #[test]
     fn random_simulation_invariants() {
         let mut pending_cancels = 0;
+        let mut lending = Tally::default();
         for seed in 1..=20u64 {
             let mut rng = Rng(seed);
             let mut h = Harness::seeded(50_000 * USDC);
@@ -4115,11 +4781,14 @@ mod tests {
             if seed % 2 == 1 {
                 h.c.signal_feed = SignalFeed::CbBtc;
             }
+            // 借出上限各不相同，100% 时没有备用金
+            h.c.lending_cap_bps = [8_000, 5_000, 10_000][seed as usize % 3];
             let mut users = Users::new(8);
             let mut tally = Tally::default();
             let mut price = 50_000 * USDC;
             let mut valuation = price;
             for day in 10..400i64 {
+                random_pool_day(&mut h, &mut rng, &mut tally);
                 // 0 点和当晚（定价之后，属于下一期）随机申购赎回，再随机撤销
                 let random_requests = |users: &mut Users, h: &mut Harness, rng: &mut Rng, now| {
                     for u in 0..users.tickets.len() {
@@ -4179,10 +4848,11 @@ mod tests {
             assert!(tally.failed_fills > 0 && tally.too_soon > 0, "{tally:?}");
             assert!(tally.keeper_only > 0 && tally.public_plans > 0, "{tally:?}");
             assert!(users.cancels > 0, "seed {seed}: 没有撤销");
+            lending.add_lending(&tally);
             assert!(h.fees > 0, "seed {seed}: 没有收到取款费");
             pending_cancels += users.pending_cancels;
             // 价值守恒：基金总资产 ≈ 用户份额价值之和（误差为取整尘埃），按估值价格计
-            let assets = fund_value(&h.s, valuation);
+            let assets = fund_value(&h.s, valuation, h.pool.rate);
             let supply = h.s.share_supply as u128;
             let user_value: u128 = users
                 .held
@@ -4197,6 +4867,7 @@ mod tests {
             );
         }
         assert!(pending_cancels > 0, "没有撤销待成交申购");
+        assert_lending_covered(&lending);
     }
 
     /// 随机模拟：交易所收 0.25%（接近 0.3% 滑点上限），随机晚定价、随机脱锚、
@@ -4221,9 +4892,11 @@ mod tests {
             let mut users = Users::new(6);
             let mut price = 50_000 * USDC;
             let mut valuation = price;
+            h.c.lending_cap_bps = [8_000, 10_000][seed as usize % 2];
             let mut fail_pct = 30;
             let mut skipped: Option<(i64, FixPrices)> = None;
             for day in 10..300i64 {
+                random_pool_day(&mut h, &mut rng, &mut tally);
                 // 昨天没人定价：一半的时候有人用昨天定价窗口内的价格回填，只能回填一次
                 if let Some((d, prices)) = skipped.take() {
                     if rng.below(2) == 0 {
@@ -4386,6 +5059,7 @@ mod tests {
             "{tally:?}"
         );
         assert!(tally.keeper_only > 0 && tally.public_plans > 0, "{tally:?}");
+        assert_lending_covered(&tally);
         assert!(
             public_fixes > 0 && public_fixes_rejected > 0,
             "{public_fixes} {public_fixes_rejected}"
