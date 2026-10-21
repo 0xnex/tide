@@ -30,6 +30,7 @@ import { Backtest } from "./BacktestCard";
 import { SharePriceCard, pricingBasis, sharePrice } from "./SharePriceCard";
 import { fetchSpot, type Spot } from "./backtest";
 import { buyThreshold, nextFixTime } from "./signal";
+import { Icon, type IconName } from "./icons";
 
 type Toast = { kind: "ok" | "error" | "busy"; text: string; sig?: string };
 
@@ -107,7 +108,6 @@ export function App() {
                 <Faucet snap={snap} run={run} />
                 <ActionPanel snap={snap} now={now} spot={spot} run={run} program={program} />
                 <Position snap={snap} now={now} spot={spot} run={run} program={program} />
-                <Guide snap={snap} />
               </div>
             </div>
           </>
@@ -159,19 +159,13 @@ function Header({ spot }: { spot: Spot | null }) {
 
 function VaultHero({ snap }: { snap: Snapshot }) {
   const cfg = snap.fund.config;
-  const feed = "cbBtc" in cfg.signalFeed ? "cbBTC/USD" : "BTC/USD";
   return (
     <section className="hero">
       <div className="hero-title">
         <div className="token-icon">₿</div>
-        <div>
-          <h1>Tide BTC Trend</h1>
-          <p className="muted">Holds cbBTC when BTC is above its {cfg.window}-day moving average and USDC when it is below. One fixing a day; shares follow actual fills.</p>
-        </div>
+        <h1>Tide BTC Trend</h1>
       </div>
       <div className="tags">
-        <span className="tag">Signal {feed} (Pyth)</span>
-        <span className="tag">{cfg.window}-day average</span>
         <span className="tag">Withdrawal fee {cfg.withdrawalFeeBps / 100}%</span>
         <a className="tag link" href={fmt.explorerAddress(FUND.toBase58())} target="_blank" rel="noreferrer">
           Vault {fmt.short(FUND.toBase58())} ↗
@@ -183,7 +177,6 @@ function VaultHero({ snap }: { snap: Snapshot }) {
 
 function Overview({ snap, spot }: { snap: Snapshot; spot: number | null }) {
   const s = snap.fund.state;
-  const threshold = buyThreshold(snap.fund, Math.floor(nextFixTime(snap.fund, Date.now() / 1000) / DAY));
   const basis = pricingBasis(snap, spot);
   // display only: the fund itself is never valued in USD
   const total = basis ? Number(big(s.usdc)) / 1e6 + (Number(big(s.btc)) / 1e8) * basis.btcUsd : null;
@@ -196,38 +189,21 @@ function Overview({ snap, spot }: { snap: Snapshot; spot: number | null }) {
   return (
     <section className="card">
       <div className="stats five">
-        <Stat label="Share price" value={price !== null ? `$${price.toFixed(4)}` : "$1.0000"} />
-        <Stat label="Total value" value={total !== null ? `$${total.toLocaleString("en-US", { maximumFractionDigits: 2 })}` : "—"} />
-        <Stat label="cbBTC held" value={fmt.btc(s.btc)} />
-        <Stat label="USDC held" value={fmt.usdc(s.usdc)} />
+        <Stat icon="tag" label="Share price" value={price !== null ? `$${price.toFixed(4)}` : "$1.0000"} sub="estimate" />
         <Stat
-          label="Target"
+          icon="wallet"
+          label="Total value"
+          value={total !== null ? `$${total.toLocaleString("en-US", { maximumFractionDigits: 2 })}` : "—"}
+          sub={`${fmt.shares(s.shareSupply)} shares`}
+        />
+        <Stat icon="btc" label="cbBTC" value={fmt.btc(s.btc)} />
+        <Stat icon="usd" label="USDC" value={fmt.usdc(s.usdc)} sub={waiting > 0n ? `+${fmt.usdc(waiting)} queued` : undefined} />
+        <Stat
+          icon="target"
+          label="Holds"
           value={<span className={`pill ${s.targetBtc ? "pill-blue" : "pill-gray"}`}>{s.targetBtc ? "cbBTC" : "USDC"}</span>}
         />
       </div>
-      <p className="muted small">
-        {fmt.shares(s.shareSupply)} shares outstanding.
-        {basis && ` Valued at BTC $${basis.btcUsd.toLocaleString("en-US", { maximumFractionDigits: 0 })} (${basis.source}).`}{" "}
-        Indicative only: the fund is not valued in USD.
-      </p>
-      {!s.targetBtc && s.btc.isZero() && !s.shareSupply.isZero() && (
-        <p className="muted small waiting">
-          The last fixing price was below the {snap.fund.config.window}-day average, so the fund holds only USDC and the
-          share price does not move with BTC.{" "}
-          {threshold !== null && (
-            <>
-              It buys cbBTC if the next fixing price is above <strong>{fmt.price(threshold)}</strong>
-              {spot && <> (BTC now {spotVs(spot, threshold)})</>}.
-            </>
-          )}
-        </p>
-      )}
-      {waiting > 0n && (
-        <p className="muted small waiting">
-          <strong>{fmt.usdc(waiting)} USDC</strong> of subscriptions wait for a fixing. They count as fund
-          assets, and become shares, only once the fund buys with them.
-        </p>
-      )}
     </section>
   );
 }
@@ -235,7 +211,7 @@ function Overview({ snap, spot }: { snap: Snapshot; spot: number | null }) {
 /** 实时价格和门槛比较，比如 "$83,340, 0.3% below" */
 function spotVs(spot: number, threshold: bigint): string {
   const gap = (spot * 1e6) / Number(threshold) - 1;
-  return `$${spot.toLocaleString("en-US", { maximumFractionDigits: 0 })}, ${(Math.abs(gap) * 100).toFixed(1)}% ${gap > 0 ? "above" : "below"}`;
+  return `BTC $${spot.toLocaleString("en-US", { maximumFractionDigits: 0 })} (${gap > 0 ? "+" : "−"}${(Math.abs(gap) * 100).toFixed(1)}%)`;
 }
 
 function Strategy({ snap, now, spot }: { snap: Snapshot; now: number; spot: number | null }) {
@@ -259,72 +235,65 @@ function Strategy({ snap, now, spot }: { snap: Snapshot; now: number; spot: numb
   const capPct = cap > 0n ? Number((outstanding * 10_000n) / cap) / 100 : 0;
   const signal = last ? Number(big(last.signalPrice)) : 0;
   const ma = last ? Number(big(last.movingAverage)) : 0;
+  const settlement = overdue ? (
+    <span className="pill pill-amber">Not fixed yet</span>
+  ) : rebalancing ? (
+    <span className="pill pill-amber">Trading</span>
+  ) : (
+    <span className="pill pill-green">Done</span>
+  );
+  const left = rebalancing
+    ? [
+        s.sliceCount > 0 && `${s.sliceCount} slice${s.sliceCount > 1 ? "s" : ""} selling`,
+        toBuy > 0n ? `${fmt.usdc(toBuy)} USDC to buy` : toSell > 0n ? `${fmt.btc(toSell)} cbBTC to sell` : "",
+      ]
+        .filter(Boolean)
+        .join(", ")
+    : undefined;
   return (
     <section className="card">
       <h2>Fund status</h2>
-      <div className="rows">
-        <Row label="Last fixing">{last ? `${fmt.dayLabel(last.epoch.toNumber())} (epoch ${last.epoch.toNumber()})` : "None yet"}</Row>
-        <Row label="Signal / moving average">
-          {last ? (
-            <span>
-              {fmt.price(last.signalPrice)} / {ma > 0 ? fmt.price(last.movingAverage) : "not enough prices"}
-              {ma > 0 && (
-                <span className={`delta ${signal > ma ? "up" : "down"}`}>
-                  {signal > ma ? "▲" : "▼"} {(((signal - ma) / ma) * 100).toFixed(2)}%
-                </span>
-              )}
-            </span>
-          ) : (
-            "—"
-          )}
-        </Row>
-        <Row label="Settlement">
-          {overdue ? (
-            <span className="pill pill-amber">Today's fixing has not run yet</span>
-          ) : rebalancing ? (
-            <span>
-              <span className="pill pill-amber">Trading</span>{" "}
-              {s.sliceCount > 0 && `selling ${s.sliceCount} redemption slice${s.sliceCount > 1 ? "s" : ""}, `}
-              {toBuy > 0n ? `${fmt.usdc(toBuy)} USDC left to buy cbBTC with` : toSell > 0n ? `${fmt.btc(toSell)} cbBTC left to sell` : ""}
-            </span>
-          ) : (
-            <span className="pill pill-green">Fund fully in {s.targetBtc ? "cbBTC" : "USDC"}</span>
-          )}
-        </Row>
-        <Row label="Trades">
-          Up to {fmt.usdc(cfg.tradeCapUsdc)} USDC each, at least {cfg.minTradeIntervalSecs.toNumber()} s apart, at most{" "}
-          {cfg.maxSlippageBps / 100}% slippage
-        </Row>
-        <Row label="Next fixing">
-          {fmt.timeLabel(nextFix)}
-          <span className="muted"> (in {fmt.countdown(nextFix - now)})</span>
-        </Row>
-        <Row label="Holds cbBTC after it if">
-          {threshold !== null ? (
-            <span>
-              the fixing price is above {fmt.price(threshold)}
-              {spot && <span className="muted"> (BTC now {spotVs(spot, threshold)})</span>}
-            </span>
-          ) : (
-            "not enough prices"
-          )}
-        </Row>
-        <Row label="Subscriptions">
-          {s.subscriptionsPaused ? <span className="pill pill-amber">Paused</span> : <span className="pill pill-green">Open</span>}
-        </Row>
-        <Row label="Subscription cap used">
-          <span>
-            {fmt.usdc(outstanding)} / {fmt.usdc(cap)} USDC
-          </span>
-        </Row>
-      </div>
-      <div className="bar">
-        <div className="bar-fill" style={{ width: `${Math.min(capPct, 100)}%` }} />
+      <div className="stats three">
+        <Stat
+          icon="chart"
+          label={last ? `Fixing ${fmt.dayLabel(last.epoch.toNumber()).slice(5)}` : "Last fixing"}
+          value={last ? fmt.price(last.signalPrice) : "—"}
+          sub={
+            ma > 0 && (
+              <span className={`delta ${signal > ma ? "up" : "down"}`}>
+                {signal > ma ? "▲" : "▼"} {Math.abs(((signal - ma) / ma) * 100).toFixed(2)}% vs average
+              </span>
+            )
+          }
+        />
+        <Stat icon="average" label={`${cfg.window}-day average`} value={ma > 0 ? fmt.price(last!.movingAverage) : "—"} />
+        <Stat
+          icon="target"
+          label="Buys cbBTC above"
+          value={threshold !== null ? fmt.price(threshold) : "—"}
+          sub={spot !== null && threshold !== null ? spotVs(spot, threshold) : undefined}
+        />
+        <Stat icon="clock" label="Next fixing" value={fmt.countdown(nextFix - now)} sub={fmt.timeLabel(nextFix)} />
+        <Stat icon="sync" label="Settlement" value={settlement} sub={left} />
+        <Stat
+          icon="gauge"
+          label="Subscription cap"
+          value={`${capPct.toFixed(1)}%`}
+          sub={
+            <>
+              {fmt.usdc(outstanding)} / {fmt.usdc(cap)} USDC
+              <div className="bar">
+                <div className="bar-fill" style={{ width: `${Math.min(capPct, 100)}%` }} />
+              </div>
+            </>
+          }
+        />
       </div>
       <div className="mini-stats">
-        <span>Unsold redemption slices: {s.sliceCount}</span>
-        <span>Pending subscriptions: {s.pendingCount}</span>
-        <span>Fees owed to the manager: {fmt.usdc(s.feesOwed)} USDC</span>
+        {s.subscriptionsPaused && <span className="pill pill-amber">Subscriptions paused</span>}
+        <span>Unsold slices {s.sliceCount}</span>
+        <span>Pending subscriptions {s.pendingCount}</span>
+        <span>Fees owed {fmt.usdc(s.feesOwed)} USDC</span>
       </div>
     </section>
   );
@@ -334,67 +303,73 @@ function Records({ records, window }: { records: EpochRecord[]; window: number }
   return (
     <section className="card">
       <h2>Fixings</h2>
-      <p className="muted small">
-        Each day at the fixing time the BTC price is compared with its {window}-day average: above it the fund holds
-        cbBTC, otherwise USDC. That day's subscriptions and redemptions are filled after it.
-      </p>
       {records.length === 0 ? (
         <p className="muted">No fixings yet.</p>
       ) : (
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Date (UTC)</th>
-                <th className="num">BTC price</th>
-                <th className="num">{window}-day average</th>
-                <th>Fund holds</th>
-                <th className="num">Subscriptions</th>
-                <th className="num">Redemptions</th>
-                <th>Requests</th>
-              </tr>
-            </thead>
-            <tbody>
-              {records.slice(0, 20).map((r, i) => {
-                const prev = records[i + 1]; // 新的在前，下一行是前一次定价
-                const gap = r.movingAverage.isZero() ? null : r.signalPrice.toNumber() / r.movingAverage.toNumber() - 1;
-                const idle = r.subscriptionUsdc.isZero() && r.redemptionShares.isZero();
-                return (
-                  <tr key={r.epoch.toString()}>
-                    <td>{fmt.dayLabel(r.epoch.toNumber())}</td>
-                    <td className="num">
-                      {fmt.price(r.signalPrice)}
-                      {gap !== null && (
-                        <span className={`delta ${gap > 0 ? "up" : "down"}`}>
-                          {gap > 0 ? "+" : "−"}
-                          {(Math.abs(gap) * 100).toFixed(1)}%
-                        </span>
-                      )}
-                    </td>
-                    <td className="num">{r.movingAverage.isZero() ? "—" : fmt.price(r.movingAverage)}</td>
-                    <td>
-                      <span className={`pill ${r.targetBtc ? "pill-blue" : "pill-gray"}`}>{r.targetBtc ? "cbBTC" : "USDC"}</span>
-                      {prev && prev.targetBtc !== r.targetBtc && <span className="muted small"> switched</span>}
-                    </td>
-                    <td className="num">{r.subscriptionUsdc.isZero() ? "—" : `${fmt.usdc(r.subscriptionUsdc)} USDC`}</td>
-                    <td className="num">{r.redemptionShares.isZero() ? "—" : `${fmt.shares(r.redemptionShares)} shares`}</td>
-                    <td>
-                      {idle ? (
-                        <span className="muted">None</span>
-                      ) : !r.subscriptionFilled ? (
-                        <span className="pill pill-amber">Buying</span>
-                      ) : !r.sliceSoldOut ? (
-                        <span className="pill pill-amber">Selling</span>
-                      ) : (
-                        <span className="pill pill-green">Filled</span>
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+        <table className="fit-table">
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th className="num">Price</th>
+              <th className="num hide-sm">{window}d avg</th>
+              <th>Holds</th>
+              <th className="num">Flows</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {records.slice(0, 20).map((r, i) => {
+              const prev = records[i + 1]; // 新的在前，下一行是前一次定价
+              const gap = r.movingAverage.isZero() ? null : r.signalPrice.toNumber() / r.movingAverage.toNumber() - 1;
+              const idle = r.subscriptionUsdc.isZero() && r.redemptionShares.isZero();
+              const date = fmt.dayLabel(r.epoch.toNumber());
+              return (
+                <tr key={r.epoch.toString()}>
+                  <td title={date}>{date.slice(5)}</td>
+                  <td className="num">
+                    {fmt.price(r.signalPrice)}
+                    {gap !== null && (
+                      <span className={`delta ${gap > 0 ? "up" : "down"}`}>
+                        {gap > 0 ? "+" : "−"}
+                        {(Math.abs(gap) * 100).toFixed(1)}%
+                      </span>
+                    )}
+                  </td>
+                  <td className="num hide-sm">{r.movingAverage.isZero() ? "—" : fmt.price(r.movingAverage)}</td>
+                  <td>
+                    <span className={`pill ${r.targetBtc ? "pill-blue" : "pill-gray"}`}>{r.targetBtc ? "cbBTC" : "USDC"}</span>
+                    {prev && prev.targetBtc !== r.targetBtc && (
+                      <span className="switch" title="Switched at this fixing">
+                        ⇄
+                      </span>
+                    )}
+                  </td>
+                  <td className="num">
+                    {idle ? (
+                      <span className="muted">—</span>
+                    ) : (
+                      <>
+                        {!r.subscriptionUsdc.isZero() && <div className="up">+{fmt.usdc(r.subscriptionUsdc)} USDC</div>}
+                        {!r.redemptionShares.isZero() && <div className="down">−{fmt.shares(r.redemptionShares)} sh</div>}
+                      </>
+                    )}
+                  </td>
+                  <td>
+                    {idle ? (
+                      <span className="muted">—</span>
+                    ) : !r.subscriptionFilled ? (
+                      <span className="pill pill-amber">Buying</span>
+                    ) : !r.sliceSoldOut ? (
+                      <span className="pill pill-amber">Selling</span>
+                    ) : (
+                      <span className="pill pill-green">Filled</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       )}
     </section>
   );
@@ -433,7 +408,6 @@ function ActionPanel({
   const toClaim = snap.tickets.some((t) => !t.subscriptionUsdc.isZero() && viewTicket(t, snap.fund, snap.records, now).canClaim);
   const noShares = tab === "red" && !!wallet && snap.shareBalance === 0n;
   const fixAt = epoch * DAY + offset;
-  const threshold = buyThreshold(snap.fund, epoch);
   // 只是参考：真正的份额和赎回款按实际成交计算
   const basis = pricingBasis(snap, spot);
   const s = snap.fund.state;
@@ -441,8 +415,8 @@ function ActionPanel({
   const estimate =
     amount && amount > 0n && price && !noShares
       ? tab === "sub"
-        ? `About ${fmt.shares(BigInt(Math.floor((Number(amount) * (1 - cfg.subscriptionFeeBps / 10_000)) / price)))} shares at $${price.toFixed(4)} per share (the real number follows the fill)`
-        : `About ${fmt.usdc(BigInt(Math.floor(Number(amount) * price * (1 - cfg.withdrawalFeeBps / 10_000))))} USDC after the fee, at $${price.toFixed(4)} per share (you get what your slice sells for)`
+        ? `≈ ${fmt.shares(BigInt(Math.floor((Number(amount) * (1 - cfg.subscriptionFeeBps / 10_000)) / price)))} shares @ $${price.toFixed(4)}`
+        : `≈ ${fmt.usdc(BigInt(Math.floor(Number(amount) * price * (1 - cfg.withdrawalFeeBps / 10_000))))} USDC after fee`
       : null;
   const problem = !wallet
     ? "Connect a wallet"
@@ -497,23 +471,16 @@ function ActionPanel({
       </div>
       <div className="rows compact">
         {estimate && <Row label="Estimate">{estimate}</Row>}
-        <Row label="Joins epoch">
-          {epoch} (fixing {fmt.timeLabel(fixAt)})
+        <Row label="Fixing">
+          {fmt.timeLabel(fixAt)} · in {fmt.countdown(fixAt - now)}
         </Row>
-        <Row label="Cancel">In full until the fixing, {fmt.countdown(fixAt - now)} from now</Row>
         {tab === "sub" ? (
           <>
-            <Row label="At the fixing">
-              {threshold !== null
-                ? `Buys cbBTC if the price is above ${fmt.price(threshold)}, otherwise stays in USDC`
-                : "Holds cbBTC above the moving average, USDC below"}
-            </Row>
-            <Row label="Fill">Shares by the cbBTC (or USDC) actually added, possibly in parts</Row>
             <Row label="Minimum">{fmt.usdc(min)} USDC</Row>
-            {cfg.subscriptionFeeBps > 0 && <Row label="Subscription fee">{cfg.subscriptionFeeBps / 100}%, kept by the fund</Row>}
+            {cfg.subscriptionFeeBps > 0 && <Row label="Subscription fee">{cfg.subscriptionFeeBps / 100}%</Row>}
           </>
         ) : (
-          <Row label="Payout">What your slice sells for, claimable once sold; {cfg.withdrawalFeeBps / 100}% withdrawal fee</Row>
+          <Row label="Withdrawal fee">{cfg.withdrawalFeeBps / 100}%</Row>
         )}
       </div>
       {noShares && (
@@ -677,8 +644,16 @@ function Position({
     <section className="card">
       <h2>Your position</h2>
       <div className="stats two">
-        <Stat label="Shares in wallet" value={fmt.shares(snap.shareBalance)} />
-        <Stat label="USDC balance" value={fmt.usdc(snap.usdcBalance)} />
+        <Stat icon="shares" label="Shares in wallet" value={fmt.shares(snap.shareBalance)} />
+        <Stat icon="usd" label="USDC balance" value={fmt.usdc(snap.usdcBalance)} />
+        {value !== null && owned > 0n && (
+          <Stat
+            icon="wallet"
+            label="Your value"
+            value={`≈ $${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
+            sub={`${fmt.shares(owned)} shares`}
+          />
+        )}
         {(toClaimShares > 0n || toClaimUsdc > 0n) && (
           <Stat
             label="Ready to claim"
@@ -705,26 +680,10 @@ function Position({
       {toClaimShares > 0n && snap.shareBalance === 0n && (
         <p className="hint">Your shares are ready. Press Claim below to move them to your wallet.</p>
       )}
-      {value !== null && owned > 0n && (
-        <p className="muted small">
-          {fmt.shares(owned)} shares
-          {owned !== snap.shareBalance &&
-            ` (${[
-              snap.shareBalance > 0n && `${fmt.shares(snap.shareBalance)} in the wallet`,
-              toClaimShares > 0n && `${fmt.shares(toClaimShares)} to claim`,
-              queuedShares > 0n && `${fmt.shares(queuedShares)} being redeemed`,
-            ]
-              .filter(Boolean)
-              .join(", ")})`}
-          , about $
-          {value.toLocaleString("en-US", { maximumFractionDigits: 2 })} at ${price!.toFixed(4)} per share, before the{" "}
-          {snap.fund.config.withdrawalFeeBps / 100}% withdrawal fee. Indicative only.
-        </p>
-      )}
       {snap.solBalance !== null && (
         <p className={`small ${lowSol ? "hint" : "muted"}`}>
-          {(snap.solBalance / 1e9).toLocaleString("en-US", { maximumFractionDigits: 4 })} SOL for transaction fees
-          {lowSol && ": low, transactions may fail. Get devnet SOL from faucet.solana.com."}
+          {(snap.solBalance / 1e9).toLocaleString("en-US", { maximumFractionDigits: 4 })} SOL
+          {lowSol && " · low, get devnet SOL from faucet.solana.com"}
         </p>
       )}
       <TransferShares balance={snap.shareBalance} run={run} program={program} />
@@ -781,8 +740,7 @@ function Faucet({ snap, run }: { snap: Snapshot; run: RunFn }) {
   if (snap.usdcBalance > 0n || snap.shareBalance > 0n || snap.tickets.length > 0) return null;
   return (
     <section className="card highlight">
-      <h3>Get test USDC</h3>
-      <p className="muted small">Each address can claim 10,000 test USDC once. If the wallet has too little SOL for fees, it also gets 0.02 devnet SOL.</p>
+      <h3>Test USDC</h3>
       <button
         className="btn primary"
         onClick={() =>
@@ -791,23 +749,6 @@ function Faucet({ snap, run }: { snap: Snapshot; run: RunFn }) {
       >
         Claim 10,000 test USDC
       </button>
-    </section>
-  );
-}
-
-function Guide({ snap }: { snap: Snapshot }) {
-  const offset = snap.fund.config.settleOffsetSecs.toNumber();
-  const at = new Date(offset * 1000).toISOString().slice(11, 16);
-  return (
-    <section className="card subtle">
-      <h3>How to test the full flow</h3>
-      <ol className="steps">
-        <li>Connect a wallet (Phantom on devnet) and claim 10,000 test USDC.</li>
-        <li>Subscribe. The request joins the epoch of the next fixing (daily at {at} UTC) and can be cancelled until then.</li>
-        <li>A few minutes after {at} UTC, the daily settlement fixes the epoch and fills it at the real Pyth price.</li>
-        <li>Claim your shares under "Your position". Shares are ordinary tokens you can send to another wallet.</li>
-        <li>Redeem shares. After the next fixing sells your slice, claim the USDC (1% withdrawal fee).</li>
-      </ol>
     </section>
   );
 }
@@ -879,11 +820,15 @@ function ToastView({ toast, onClose }: { toast: Toast; onClose: () => void }) {
   );
 }
 
-function Stat({ label, value }: { label: string; value: React.ReactNode }) {
+function Stat({ icon, label, value, sub }: { icon?: IconName; label: string; value: React.ReactNode; sub?: React.ReactNode }) {
   return (
     <div className="stat">
-      <div className="stat-label">{label}</div>
+      <div className="stat-label">
+        {icon && <Icon name={icon} />}
+        {label}
+      </div>
       <div className="stat-value">{value}</div>
+      {sub && <div className="stat-sub">{sub}</div>}
     </div>
   );
 }

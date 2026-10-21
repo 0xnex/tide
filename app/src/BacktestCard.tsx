@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { LineChart } from "./LineChart";
 import {
-  MA_DAYS,
   SWITCH_COST_BPS,
   WINDOWS,
   backtest,
@@ -35,7 +34,6 @@ export function Backtest() {
       <div className="card-head">
         <div>
           <h2>Backtest</h2>
-          <p className="muted small">The fund's rule on daily BTC/USD closes, compared with holding BTC.</p>
         </div>
         <div className="segmented" role="tablist" aria-label="Time range">
           {WINDOWS.map((w) => (
@@ -90,10 +88,8 @@ export function Backtest() {
           />
           <SummaryTable results={results!} />
           <p className="muted small note">
-            Each day's close stands in for the 01:00 UTC fixing. Above the {MA_DAYS}-day average the strategy holds BTC for
-            the next day, otherwise USDC. Each switch costs {SWITCH_COST_BPS / 100}% for fees and slippage; the 1%
-            withdrawal fee is not included. Data: Coinbase BTC-USD daily candles. Past results do not predict future
-            returns.
+            Coinbase daily closes · {SWITCH_COST_BPS / 100}% per switch · excludes the 1% withdrawal fee · Past results do
+            not predict future returns.
           </p>
         </>
       )}
@@ -112,16 +108,15 @@ function Stat({ label, value, tone, small }: { label: string; value: string; ton
 
 function SummaryTable({ results }: { results: Record<WindowKey, Result | null> }) {
   return (
-    <div className="table-wrap summary">
-      <table>
+    <table className="fit-table summary">
         <thead>
           <tr>
             <th>Period</th>
             <th className="num">Strategy</th>
             <th className="num">Buy & hold</th>
-            <th className="num">Max drawdown (strategy / hold)</th>
-            <th className="num">Switches</th>
-            <th className="num">Time in BTC</th>
+            <th className="num">Drawdown</th>
+            <th className="num hide-sm">Switches</th>
+            <th className="num hide-sm">In BTC</th>
           </tr>
         </thead>
         <tbody>
@@ -136,13 +131,12 @@ function SummaryTable({ results }: { results: Record<WindowKey, Result | null> }
                 <td className="num">
                   {pct(r.strategyDrawdown)} / {pct(r.holdDrawdown)}
                 </td>
-                <td className="num">{r.switches}</td>
-                <td className="num">{Math.round(r.timeInBtc * 100)}%</td>
+                <td className="num hide-sm">{r.switches}</td>
+                <td className="num hide-sm">{Math.round(r.timeInBtc * 100)}%</td>
               </tr>
             );
           })}
         </tbody>
-      </table>
-    </div>
+    </table>
   );
 }

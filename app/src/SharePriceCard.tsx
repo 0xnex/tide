@@ -62,10 +62,7 @@ export function SharePriceCard({ snap, spot }: { snap: Snapshot; spot: number | 
       <div className="card-head">
         <div>
           <h2>Share price</h2>
-          <p className="muted small">
-            Estimated as (USDC + cbBTC × BTC price) ÷ shares. Indicative: the fund is not valued in USD, and the 1%
-            withdrawal fee is not deducted.
-          </p>
+          <p className="muted small">Estimate: (USDC + cbBTC × BTC) ÷ shares</p>
         </div>
         <div className="headline">
           <div className="muted small">Estimated now</div>
@@ -105,11 +102,7 @@ export function SharePriceCard({ snap, spot }: { snap: Snapshot; spot: number | 
               : `At the fixing price, BTC ${usd(points[i].btcUsd, 0)}`
           }
         />
-      ) : (
-        <p className="muted small">
-          The curve starts once shares exist: each daily fixing adds a point, and the last point is the live estimate.
-        </p>
-      )}
+      ) : null}
 
       {points.length > 0 && <History points={points} />}
     </section>
