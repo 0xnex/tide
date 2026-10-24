@@ -416,6 +416,16 @@ h3 {
   overflow-x: auto;
 }
 
+.trade-error {
+  color: var(--red);
+}
+
+.trade-purpose {
+  display: block;
+  font-size: 11px;
+  margin-top: 3px;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

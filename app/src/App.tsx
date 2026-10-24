@@ -30,6 +30,7 @@ import * as fmt from "./format";
 import { Backtest } from "./BacktestCard";
 import { SharePriceCard, pricingBasis, sharePrice } from "./SharePriceCard";
 import { SignalCard } from "./SignalCard";
+import { TradeHistory } from "./TradeHistory";
 import { fetchDailyCloses, fetchSpot, type DailyClose, type Spot } from "./backtest";
 import { nextFixTime } from "./signal";
 import { Icon, Logo, type IconName } from "./icons";
@@ -112,6 +113,7 @@ export function App() {
                 <SignalCard snap={snap} spot={spot} now={now} />
                 <SharePriceCard snap={snap} spot={spot} closes={closes} />
                 <Backtest closes={closes} error={closesError} />
+                <TradeHistory />
                 <Records records={snap.records} window={snap.fund.config.window} />
               </div>
               <div className="col-side">
@@ -189,6 +191,7 @@ function Overview({ snap, spot, now }: { snap: Snapshot; spot: number | null; no
   const basis = pricingBasis(snap, spot);
   // display only: the fund itself is never valued in USD
   const usdc = fundUsdc(snap); // 含借出的
+  const lentPct = usdc > 0n ? Number((snap.lentUsdc * 10_000n) / usdc) / 100 : 0;
   const total = basis ? Number(usdc) / 1e6 + (Number(big(s.btc)) / 1e8) * basis.btcUsd : null;
   const price = basis ? sharePrice(usdc, big(s.btc), big(s.shareSupply), basis.btcUsd) : null;
   // queued and partly filled subscriptions: still the subscribers' USDC, not fund assets
@@ -233,11 +236,11 @@ function Overview({ snap, spot, now }: { snap: Snapshot; spot: number | null; no
         <Stat icon="btc" label="cbBTC" value={fmt.btc(s.btc)} />
         <Stat
           icon="usd"
-          label="USDC"
+          label="USDC assets"
           value={fmt.usdc(usdc)}
           sub={
             [
-              snap.lentUsdc > 0n && `${fmt.usdc(snap.lentUsdc)} lent · ${(snap.lendingApyBps / 100).toFixed(1)}% APY`,
+              !s.targetBtc && `${fmt.usdc(s.usdc)} buffer · ${fmt.usdc(snap.lentUsdc)} lent (${lentPct.toFixed(2)}%; cap ${(cfg.lendingCapBps / 100).toFixed(0)}%) · ${(snap.lendingApyBps / 100).toFixed(1)}% APY`,
               waiting > 0n && `+${fmt.usdc(waiting)} queued`,
             ]
               .filter(Boolean)
